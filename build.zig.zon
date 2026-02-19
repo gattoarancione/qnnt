@@ -1,0 +1,12 @@
+.{
+    .name = .qnnt,
+    .version = "0.0.1",
+    .fingerprint = 0x14a3e10e78eefb7a,
+    .minimum_zig_version = "0.15.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
