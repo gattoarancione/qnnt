@@ -1,0 +1,7 @@
+build/
+.qtc_clangd/
+.qtcreator/
+
+.zig-cache/
+zig-out/
+*.o
