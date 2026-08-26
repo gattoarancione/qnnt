@@ -2,16 +2,23 @@ const std = @import("std");
 const qnnt = @import("qnnt").Qnnt;
 
 pub fn main() !void {
-    try qnnt.run();
+    if (! qnnt.run()) {
+        std.debug.print("failed to run QNNT\n", .{});
+    }
     defer qnnt.deinit();
 
-    try qnnt.runPublisher("test/topic-a");
-    try qnnt.runPublisher("test/topic-b");
+    if (! qnnt.runPublisher("test/topic-a")) {
+        std.debug.print("failed to run test/topic-a publisher\n", .{});
+        return;
+    } else if (! qnnt.runPublisher("test/topic-b")) {
+        std.debug.print("failed to run test/topic-b publisher\n", .{});
+        return;
+    }
 
     while (true) {
         try qnnt.publish("test/topic-a", "ciao!\n");
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        qnnt.sleepMs(1);
         try qnnt.publish("test/topic-b", "!oaic\n");
-        std.Thread.sleep(5 * std.time.ns_per_ms);
+        qnnt.sleepMs(1);
     }
 }

@@ -39,7 +39,7 @@ pub fn build(b: *Build) void {
         .root_module = exe_mod,
     });
 
-    exe.linkLibrary(qnnt_lib);
+    exe.root_module.linkLibrary(qnnt_lib);
 
     exe.root_module.addImport("qnnt", qnnt_lib_mod);
 
