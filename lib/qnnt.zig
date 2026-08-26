@@ -94,19 +94,45 @@ fn handleRegistryClient(client: Stream) !void {
     }
 }
 
-fn registryRun() !void {
-    // listen on 127.0.0.1:2222
-    const addr: net.IpAddress = try .parse("127.0.0.1", 2222);
+// The registry lives on a well-known port. Every node contends for it; whoever
+// binds first plays the registry role, the rest stand by. `reuse_address` stays
+// false on purpose so the bind is mutually exclusive (SO_REUSEPORT would let
+// several nodes bind at once and defeat the election).
+const registry_port = 2222;
 
-    var server = try addr.listen(io, .{ .reuse_address = false });
-    defer server.deinit(io);
+// How often a standby node re-checks whether the port has freed up, so it can
+// take over if the node currently holding the registry role dies.
+const registry_probe_interval_ms = 2000;
 
-    std.debug.print("registry listening on port {}\n", .{addr.getPort()});
-
+fn registryRun() void {
     while (true) {
-        const client = try server.accept(io);
-        // handle in a thread; drop spawn if you want single-threaded
-        _ = try std.Thread.spawn(.{}, handleRegistryClient, .{client});
+        const addr: net.IpAddress = net.IpAddress.parse("127.0.0.1", registry_port) catch |err| {
+            std.debug.print("registry address parse failed: {}\n", .{err});
+            return;
+        };
+
+        var server = addr.listen(io, .{ .reuse_address = false }) catch {
+            // Another node already holds the registry role; stand by and re-probe.
+            sleepMsFn(registry_probe_interval_ms);
+            continue;
+        };
+        defer server.deinit(io); // released before we re-contend for the role
+
+        std.debug.print("registry role acquired, listening on port {}\n", .{addr.getPort()});
+
+        // Serve until the listener fails, then fall through to release the port
+        // and re-enter contention.
+        while (true) {
+            const client = server.accept(io) catch |err| {
+                std.debug.print("registry accept failed ({}); releasing role\n", .{err});
+                break;
+            };
+            // handle in a thread; drop spawn if you want single-threaded
+            _ = std.Thread.spawn(.{}, handleRegistryClient, .{client}) catch |err| {
+                std.debug.print("error spawning registry client handler: {}\n", .{err});
+                client.close(io);
+            };
+        }
     }
 }
 
