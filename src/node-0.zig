@@ -18,13 +18,13 @@ pub fn main() !void {
     }
     defer qnnt.deinit();
 
-    // Each publisher paces itself: the library calls the source callback at the given
-    // frequency on its own thread, so nothing here drives the publishing. The two
-    // rates differ so subscribers can tell the topics apart by their timing alone.
-    if (! qnnt.runPublisher("test/topic-a", topicASource, 100)) {
+    // Each publisher paces itself: the library calls the source callback once per
+    // period on its own thread, so nothing here drives the publishing. The two rates
+    // differ so subscribers can tell the topics apart by their timing alone.
+    if (! qnnt.runPublisher("test/topic-a", topicASource, 10_000)) { // 10 ms, 100 Hz
         std.debug.print("failed to run test/topic-a publisher\n", .{});
         return;
-    } else if (! qnnt.runPublisher("test/topic-b", topicBSource, 20)) {
+    } else if (! qnnt.runPublisher("test/topic-b", topicBSource, 50_000)) { // 50 ms, 20 Hz
         std.debug.print("failed to run test/topic-b publisher\n", .{});
         return;
     }

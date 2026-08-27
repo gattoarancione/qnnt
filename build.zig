@@ -18,22 +18,30 @@ pub fn build(b: *Build) void {
 
     b.installArtifact(qnnt_lib);
 
-//    const lib_tests = b.addTest(.{
-//        .root_module = lib_mod,
-//    });
+    // `zig build test`. The TLD module is standalone and tested on its own; qnnt.zig
+    // pulls in the network stack, so its tests run as a separate module.
+    const test_step = b.step("test", "Run unit tests");
 
-//    const run_lib_tests = b.addRunArtifact(lib_tests);
-
-//    const test_step = b.step("test", "Run unit tests");
-//    test_step.dependOn(&run_lib_tests.step);
+    for ([_][]const u8{ "lib/tld.zig", "lib/qnnt.zig" }) |src| {
+        const tests = b.addTest(.{
+            .root_module = b.createModule(.{
+                .root_source_file = b.path(src),
+                .target = target,
+                .optimize = optimize,
+            }),
+        });
+        test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
 
 
     // Each node is its own executable sharing the qnnt module, with a matching
-    // `run` step: `zig build run-0`, `zig build run-1`, `zig build run-2`.
+    // `run` step: `zig build run-0` ... `zig build run-4`.
     const nodes = [_]struct { name: []const u8, src: []const u8, step: []const u8 }{
         .{ .name = "qnnt-node-0", .src = "src/node-0.zig", .step = "run-0" },
         .{ .name = "qnnt-node-1", .src = "src/node-1.zig", .step = "run-1" },
         .{ .name = "qnnt-node-2", .src = "src/node-2.zig", .step = "run-2" },
+        .{ .name = "qnnt-node-3", .src = "src/node-3.zig", .step = "run-3" },
+        .{ .name = "qnnt-node-4", .src = "src/node-4.zig", .step = "run-4" },
     };
 
     for (nodes) |node| {

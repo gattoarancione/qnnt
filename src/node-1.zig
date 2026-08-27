@@ -26,9 +26,9 @@ pub fn main() !void {
     }
     defer qnnt.deinit();
 
-    // This node publishes its own topic, paced by the library's scheduler at the
-    // 1 kHz the old hand-rolled `sleepMs(1)` loop was reaching for...
-    if (! qnnt.runPublisher("test/topic-c", topicCSource, 1000)) {
+    // This node publishes its own topic, paced by the library's scheduler at the 1 ms
+    // period the old hand-rolled `sleepMs(1)` loop was reaching for...
+    if (! qnnt.runPublisher("test/topic-c", topicCSource, 1_000)) { // 1 ms, 1 kHz
         std.debug.print("failed to run test/topic-c publisher\n", .{});
         return;
     }

@@ -3,6 +3,10 @@ const Io = std.Io;
 const net = std.Io.net;
 const Stream = net.Stream;
 
+/// The TLD binary framing, re-exported so users get the encoder and decoder without a
+/// second import. See `subscribeFrames` for how it meets the pub/sub data path.
+pub const Tld = @import("tld.zig");
+
 const allocator = std.heap.page_allocator;
 
 // The 0.16 std.Io interface: a concrete implementation (`Threaded`) provides the
@@ -83,10 +87,16 @@ pub const Qnnt = struct {
     // heap memory the callback keeps alive — never a buffer on the callback's frame.
     pub const SourceHandler = *const fn (topic: []const u8) ?[]const u8;
 
+    /// Callback for a TLD-framed subscription. `frame` borrows a buffer owned by the
+    /// subscriber thread and is only valid for the duration of the call — copy
+    /// anything you keep, including the slices its accessors return.
+    pub const FrameHandler = *const fn (topic: []const u8, frame: Tld.Frame) void;
+
     pub const run = &nodeRun;
     pub const runPublisher = &publisherRun;
     pub const publish = &publishAll;
     pub const subscribe = &subscribeRun;
+    pub const subscribeFrames = &subscribeFramesRun;
     pub const deinit = &nodeDeinit;
     pub const sleepMs = &sleepMsFn;
     pub const nowMicros = &nowMicrosFn;
@@ -661,21 +671,25 @@ pub fn publishAll(topic: []const u8, data: []const u8) !void {
 
 // Drive `source` at a fixed rate, publishing whatever it returns. Paced against an
 // absolute deadline rather than "sleep(period) after the work", so the callback's own
-// cost and wake-up jitter don't accumulate into drift.
+// cost and wake-up jitter don't accumulate into drift. A period of 0 is unpaced.
 fn publisherSchedule(topic: []const u8, source: Qnnt.SourceHandler, period_us: u64) void {
     var next_us: u64 = @intCast(nowMicrosFn());
 
     while (true) {
-        next_us += period_us;
-        const now_us: u64 = @intCast(nowMicrosFn());
+        // Unpaced has no deadline to wait for, so it skips the clock read as well as
+        // the sleep — the read is the only remaining per-tick overhead at that point.
+        if (period_us != 0) {
+            next_us += period_us;
+            const now_us: u64 = @intCast(nowMicrosFn());
 
-        if (next_us > now_us) {
-            sleepUsFn(next_us - now_us);
-        } else if (now_us - next_us >= period_us) {
-            // More than a full period behind (slow callback, scheduling hiccup): give
-            // up on the missed ticks and resynchronize, rather than firing a burst to
-            // catch up on a backlog that only grows.
-            next_us = now_us;
+            if (next_us > now_us) {
+                sleepUsFn(next_us - now_us);
+            } else if (now_us - next_us >= period_us) {
+                // More than a full period behind (slow callback, scheduling hiccup):
+                // give up on the missed ticks and resynchronize, rather than firing a
+                // burst to catch up on a backlog that only grows.
+                next_us = now_us;
+            }
         }
 
         if (source(topic)) |payload| {
@@ -872,6 +886,63 @@ pub fn subscribeRun(topic: []const u8, handler: Qnnt.MessageHandler) bool {
     return true;
 }
 
+// A declared TLD length is 8 attacker-controlled bytes, so cap what one frame may ask
+// this process to buffer.
+const max_frame_bytes = 1 << 20;
+
+// As `subscribeLoop`, but the stream carries TLD frames instead of newline-delimited
+// text. TLD frames are self-delimiting, so this needs no delimiter and imposes no
+// restriction on payload bytes.
+//
+// A topic is one or the other, not both: the framing is a property of the stream, so a
+// producer publishing TLD must be read with `subscribeFrames`, and a producer
+// publishing text lines with `subscribe`.
+fn subscribeFramesLoop(topic: []const u8, handler: Qnnt.FrameHandler) void {
+    // One buffer per subscription, reused for every frame, holding at most a frame.
+    var frame_buf: std.ArrayList(u8) = .empty;
+    defer frame_buf.deinit(allocator);
+
+    while (true) {
+        const endpoint = resolveTopic(topic) catch {
+            sleepMsFn(registry_probe_interval_ms);
+            continue;
+        };
+
+        var stream = endpoint.connect(io, .{ .mode = .stream }) catch {
+            sleepMsFn(registry_probe_interval_ms);
+            continue;
+        };
+        defer stream.close(io);
+
+        std.debug.print("subscribed to {s} @ tcp://{f} (tld)\n", .{ topic, endpoint });
+
+        var rbuf: [4096]u8 = undefined;
+        var reader = stream.reader(io, &rbuf);
+        while (true) {
+            const frame = Tld.readFrame(&reader.interface, allocator, &frame_buf, max_frame_bytes) catch |err| {
+                // EndOfStream is the publisher going away, which is routine. Anything
+                // else means the stream is not what we think it is, and silence there
+                // would leave a mismatched producer looking like a dead one.
+                if (err != error.EndOfStream) {
+                    std.debug.print("tld read error on {s}: {}\n", .{ topic, err });
+                }
+                break;
+            };
+            handler(topic, frame);
+        }
+
+        sleepMsFn(registry_probe_interval_ms);
+    }
+}
+
+pub fn subscribeFramesRun(topic: []const u8, handler: Qnnt.FrameHandler) bool {
+    _ = std.Thread.spawn(.{}, subscribeFramesLoop, .{ topic, handler }) catch |err| {
+        std.debug.print("error spawning tld subscriber thread for {s}: {}\n", .{ topic, err });
+        return false;
+    };
+    return true;
+}
+
 fn sleepMsFn(ms: u64) void {
     io.sleep(Io.Duration.fromMilliseconds(@intCast(ms)), .awake) catch {};
 }
@@ -920,26 +991,32 @@ pub fn nodeRun() bool {
     return true;
 }
 
-// Start publishing `topic`. `source` and `frequency_hz` are optional and go together:
+// Start publishing `topic`. `source` and `period_us` are optional and go together:
 // pass both to have the library drive the topic from its own scheduler thread, or both
 // null to publish manually via `publish()`. Supplying only one of the two is a caller
 // mistake and is reported rather than silently ignored.
-pub fn publisherRun(topic: []const u8, source: ?Qnnt.SourceHandler, frequency_hz: ?u32) bool {
-    if ((source == null) != (frequency_hz == null)) {
-        std.debug.print("publisher {s}: source and frequency must be given together\n", .{topic});
+//
+// The interval is given as a period in microseconds rather than a frequency, so it is
+// the same unit the scheduler paces to: every rate the clock can express is reachable,
+// and there is no rounding step between what the caller asks for and what it gets.
+//
+// A period of 0 means unpaced — publish as fast as the machine manages, with no sleep
+// between ticks. That is a real mode rather than a degenerate one: the smallest
+// non-zero period still sleeps every tick, and a 1 us sleep costs several microseconds
+// of syscall, so 0 is measurably faster than 1. It also busies a core, hence the
+// notice at startup.
+pub fn publisherRun(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: ?u64) bool {
+    if ((source == null) != (period_us == null)) {
+        std.debug.print("publisher {s}: source and period must be given together\n", .{topic});
         return false;
     }
 
-    var period_us: u64 = 0;
-    if (frequency_hz) |hz| {
-        if (hz == 0) {
-            std.debug.print("publisher {s}: frequency must be > 0 Hz\n", .{topic});
-            return false;
-        }
-        period_us = 1_000_000 / hz;
+    const period = period_us orelse 0;
+    if (source != null and period == 0) {
+        std.debug.print("publisher {s}: unpaced (period 0), will busy one core\n", .{topic});
     }
 
-    _ = std.Thread.spawn(.{}, nodePublish, .{ topic, source, period_us }) catch |err| {
+    _ = std.Thread.spawn(.{}, nodePublish, .{ topic, source, period }) catch |err| {
         std.debug.print("error spawning publisher thread for {s}: {}\n", .{topic, err});
         return false;
     };
