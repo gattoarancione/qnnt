@@ -1,24 +1,36 @@
 const std = @import("std");
 const qnnt = @import("qnnt").Qnnt;
 
+// Called by each topic's scheduler thread to produce that tick's payload. Returning
+// null would skip the tick; these two always have something to say. Messages are
+// newline-delimited on the wire, hence the trailing "\n".
+fn topicASource(_: []const u8) ?[]const u8 {
+    return "ciao!\n";
+}
+
+fn topicBSource(_: []const u8) ?[]const u8 {
+    return "!oaic\n";
+}
+
 pub fn main() !void {
     if (! qnnt.run()) {
         std.debug.print("failed to run QNNT\n", .{});
     }
     defer qnnt.deinit();
 
-    if (! qnnt.runPublisher("test/topic-a")) {
+    // Each publisher paces itself: the library calls the source callback at the given
+    // frequency on its own thread, so nothing here drives the publishing. The two
+    // rates differ so subscribers can tell the topics apart by their timing alone.
+    if (! qnnt.runPublisher("test/topic-a", topicASource, 100)) {
         std.debug.print("failed to run test/topic-a publisher\n", .{});
         return;
-    } else if (! qnnt.runPublisher("test/topic-b")) {
+    } else if (! qnnt.runPublisher("test/topic-b", topicBSource, 20)) {
         std.debug.print("failed to run test/topic-b publisher\n", .{});
         return;
     }
 
+    // Nothing left for the main thread to do but stay alive.
     while (true) {
-        try qnnt.publish("test/topic-a", "ciao!\n");
-        qnnt.sleepMs(1);
-        try qnnt.publish("test/topic-b", "!oaic\n");
-        qnnt.sleepMs(1);
+        qnnt.sleepMs(1000);
     }
 }
