@@ -28,33 +28,36 @@ pub fn build(b: *Build) void {
 //    test_step.dependOn(&run_lib_tests.step);
 
 
-    const exe_mod = b.createModule(.{
-        .root_source_file = b.path("src/node.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
+    // Each node is its own executable sharing the qnnt module, with a matching
+    // `run` step: `zig build run-0`, `zig build run-1`, `zig build run-2`.
+    const nodes = [_]struct { name: []const u8, src: []const u8, step: []const u8 }{
+        .{ .name = "qnnt-node-0", .src = "src/node-0.zig", .step = "run-0" },
+        .{ .name = "qnnt-node-1", .src = "src/node-1.zig", .step = "run-1" },
+        .{ .name = "qnnt-node-2", .src = "src/node-2.zig", .step = "run-2" },
+    };
 
-    const exe = b.addExecutable(.{
-        .name = "qnnt-node",
-        .root_module = exe_mod,
-    });
+    for (nodes) |node| {
+        const exe_mod = b.createModule(.{
+            .root_source_file = b.path(node.src),
+            .target = target,
+            .optimize = optimize,
+        });
 
-    exe.root_module.linkLibrary(qnnt_lib);
+        const exe = b.addExecutable(.{
+            .name = node.name,
+            .root_module = exe_mod,
+        });
 
-    exe.root_module.addImport("qnnt", qnnt_lib_mod);
+        exe.root_module.linkLibrary(qnnt_lib);
+        exe.root_module.addImport("qnnt", qnnt_lib_mod);
 
-//    const pkg = b.dependency("qnnt", .{
-//        .target = target,
-//        .optimize = optimize,
-//    });
-//    exe.root_module.addImport("qnnt", pkg.module("qnnt"));
+        b.installArtifact(exe);
 
-    b.installArtifact(exe);
+        const run_exe = b.addRunArtifact(exe);
+        run_exe.step.dependOn(b.getInstallStep());
+        if (b.args) |args| run_exe.addArgs(args);
 
-    const run_exe = b.addRunArtifact(exe);
-    run_exe.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_exe.addArgs(args);
-
-    const run_exe_step = b.step("run", "Run a QNNT node");
-    run_exe_step.dependOn(&run_exe.step);
+        const run_exe_step = b.step(node.step, b.fmt("Run {s}", .{node.name}));
+        run_exe_step.dependOn(&run_exe.step);
+    }
 }
