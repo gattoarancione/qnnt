@@ -7,7 +7,7 @@ const Stream = net.Stream;
 /// second import. See `subscribeFrames` for how it meets the pub/sub data path.
 pub const Tld = @import("tld.zig");
 
-const allocator = std.heap.page_allocator;
+const allocator = @import("alloc.zig").allocator;
 
 // The 0.16 std.Io interface: a concrete implementation (`Threaded`) provides the
 // `Io` fat pointer that every net/sleep call is threaded through. Both are process
@@ -69,15 +69,184 @@ var directory_mutex: Io.Mutex = .init;
 // thread and read by client handlers, hence atomic.
 var registry_since_us: std.atomic.Value(u64) = .init(0);
 
+// ---------------------------------------------------------------- shutdown
+//
+// Every worker here is a loop around a blocking socket call or a sleep, so stopping
+// them needs three things: a flag they check, a way to break whatever they are blocked
+// in, and their handles so they can be joined. Without the last two, `nodeDeinit` tears
+// down `io` and the maps while threads are still using them.
+//
+// The bookkeeping below is guarded by `Io.Mutex` like everything else. That is safe
+// because every use of it happens while `io` is still live: nodeDeinit does all of its
+// signalling, breaking and joining *before* it tears `io` down, and touches none of
+// these afterwards.
+
+var shutting_down: std.atomic.Value(bool) = .init(false);
+
+var workers: std.ArrayList(std.Thread) = .empty;
+var workers_mutex: Io.Mutex = .init;
+
+// Sockets a worker may be blocked on, and how to wake it. The two kinds need different
+// treatment, which is the trap here: `shutdown` wakes a blocking read, but a listening
+// socket is not connected, so on BSD/macOS shutdown fails with ENOTCONN and leaves
+// `accept` blocked forever. Waking an accept portably takes a real connection.
+const TrackedSocket = struct {
+    socket: net.Socket,
+    kind: enum { listener, stream },
+};
+
+var live_sockets: std.ArrayList(TrackedSocket) = .empty;
+var live_sockets_mutex: Io.Mutex = .init;
+
+// Longest a worker sleeps before re-checking the shutdown flag. Sleeps shorter than
+// this are taken in one go, so ordinary publish pacing is untouched.
+const shutdown_poll_ms = 50;
+
+fn isShuttingDown() bool {
+    // A plain flag with no data published through it, so monotonic is enough — and it
+    // is read once per published frame on the unpaced path.
+    return shutting_down.load(.monotonic);
+}
+
+// Spawn a worker and record it so shutdown can join it, returning false if it must not
+// be started. Capacity is reserved before the thread starts, because a thread that
+// starts but fails to be recorded is a thread that can never be joined — the exact leak
+// this machinery exists to prevent.
+//
+// Like `trackSocket`, the shutdown check belongs inside this critical section. Without
+// it, a worker spawned between `joinWorkers` moving the list out and the caller noticing
+// the flag lands in the fresh list, is never joined, and outlives `io` — which shows up
+// as the process failing at exit long after every visible operation succeeded.
+fn spawnWorker(comptime function: anytype, args: anytype) bool {
+    workers_mutex.lockUncancelable(io);
+    defer workers_mutex.unlock(io);
+
+    if (isShuttingDown()) return false;
+
+    workers.ensureUnusedCapacity(allocator, 1) catch return false;
+    const thread = std.Thread.spawn(.{}, function, args) catch return false;
+    workers.appendAssumeCapacity(thread);
+    return true;
+}
+
+// Register a socket a worker is about to block on, returning false if the caller must
+// not block after all. Callers must untrack *before* closing, so a listed handle is
+// always still open: shutdown holds the lock while it breaks them, so an entry it sees
+// cannot have been closed and its fd reused.
+//
+// The shutdown check has to happen *inside* this critical section, and that is the whole
+// reason this returns a value. `breakLiveSockets` runs once, so a worker that starts
+// blocking after it has passed would never be interrupted. Testing the flag under the
+// same lock leaves no gap: register before the break and the break sees you, register
+// after it and you are told to stop instead.
+fn trackSocket(socket: net.Socket, kind: @FieldType(TrackedSocket, "kind")) bool {
+    live_sockets_mutex.lockUncancelable(io);
+    defer live_sockets_mutex.unlock(io);
+
+    if (isShuttingDown()) return false;
+
+    // A failed append would leave shutdown unable to interrupt this socket, so treat it
+    // as a refusal rather than blocking un-interruptibly.
+    live_sockets.append(allocator, .{ .socket = socket, .kind = kind }) catch return false;
+    return true;
+}
+
+fn untrackSocket(socket: net.Socket) void {
+    live_sockets_mutex.lockUncancelable(io);
+    defer live_sockets_mutex.unlock(io);
+    for (live_sockets.items, 0..) |tracked, i| {
+        if (tracked.socket.handle == socket.handle) {
+            _ = live_sockets.swapRemove(i);
+            return;
+        }
+    }
+}
+
+// Break every blocking call in progress. Shutdown only, and it closes nothing: each
+// socket's owner still closes it on the way out.
+//
+// The connects below happen with the lock held. That is deliberate and safe: they are
+// loopback connects taking microseconds, and a worker woken by one only needs this lock
+// to untrack itself, which it can do once we are done — nothing here waits on a worker.
+fn breakLiveSockets() void {
+    live_sockets_mutex.lockUncancelable(io);
+    defer live_sockets_mutex.unlock(io);
+
+    for (live_sockets.items) |tracked| switch (tracked.kind) {
+        // Connected, so shutting it down makes the pending read return.
+        .stream => {
+            const stream: Stream = .{ .socket = tracked.socket };
+            stream.shutdown(io, .both) catch {};
+        },
+        // Not connected, so shutdown is a no-op on BSD. Hand it the one thing `accept`
+        // does return for — a connection — and the worker wakes, sees the flag and
+        // closes what it just accepted.
+        .listener => {
+            var waker = tracked.socket.address.connect(io, .{ .mode = .stream }) catch continue;
+            waker.close(io);
+        },
+    };
+}
+
+// Shut down the connections this node delivers on. They are owned by the `subscribers`
+// table rather than tracked as blocking reads, but `publishAll` can be parked in a write
+// to one of them if a subscriber has stopped draining — and that would stall the join.
+fn breakSubscriberStreams() void {
+    subscribers_mutex.lockUncancelable(io);
+    defer subscribers_mutex.unlock(io);
+
+    var it = subscribers.iterator();
+    while (it.next()) |entry| {
+        for (entry.value_ptr.items) |node| node.client.shutdown(io, .both) catch {};
+    }
+}
+
+fn joinWorkers() void {
+    // Move the list out under the lock and join outside it: an exiting worker may still
+    // call untrackSocket or (for the registry) try to spawn, and joining while holding
+    // its lock would deadlock.
+    workers_mutex.lockUncancelable(io);
+    var pending = workers;
+    workers = .empty;
+    workers_mutex.unlock(io);
+
+    for (pending.items) |thread| thread.join();
+    pending.deinit(allocator);
+}
+
+// Sleep, but wake early when a shutdown starts. Returns false if the caller should stop.
+// Sleeps up to `shutdown_poll_ms` are one call, so the publish scheduler's pacing is
+// unaffected at any period a caller is likely to use.
+fn sleepUsInterruptible(us: u64) bool {
+    var remaining = us;
+    while (remaining > 0) {
+        if (isShuttingDown()) return false;
+        const slice = @min(remaining, shutdown_poll_ms * 1000);
+        sleepUsFn(slice);
+        remaining -= slice;
+    }
+    return !isShuttingDown();
+}
+
+fn sleepMsInterruptible(ms: u64) bool {
+    return sleepUsInterruptible(ms * 1000);
+}
+
 var subscribers: std.StringHashMap(std.ArrayList(QnntNode)) = .init(allocator);
 var subscribers_mutex: Io.Mutex = .init;
 
 pub const Qnnt = struct {
+    // Every callback takes the `context` pointer given at registration and hands it
+    // back untouched. Without it a callback can only reach module-level state, which
+    // means one handler cannot serve two subscriptions, and no closure, C++ lambda or
+    // Python callable can be bound to one — it is `void *user_data` under a Zig name.
+    // The library never dereferences it.
+
     // Callback invoked once per message received on a subscribed topic. It runs on
     // the subscriber's own background thread (asynchronously w.r.t. the caller), so
     // it must be thread-safe. `msg` points into the read buffer and is only valid
     // for the duration of the call — copy it if you need to keep it.
-    pub const MessageHandler = *const fn (topic: []const u8, msg: []const u8) void;
+    pub const MessageHandler = *const fn (topic: []const u8, msg: []const u8, context: ?*anyopaque) void;
 
     // Callback invoked once per scheduler tick on a topic this node publishes, to
     // produce the payload for that tick. Returning null skips the tick (nothing is
@@ -85,21 +254,42 @@ pub const Qnnt = struct {
     // thread-safe. The payload is written to the subscriber sockets AFTER the
     // callback returns, so it must outlive the call: return a literal, a global, or
     // heap memory the callback keeps alive — never a buffer on the callback's frame.
-    pub const SourceHandler = *const fn (topic: []const u8) ?[]const u8;
+    pub const SourceHandler = *const fn (topic: []const u8, context: ?*anyopaque) ?[]const u8;
 
     /// Callback for a TLD-framed subscription. `frame` borrows a buffer owned by the
     /// subscriber thread and is only valid for the duration of the call — copy
     /// anything you keep, including the slices its accessors return.
-    pub const FrameHandler = *const fn (topic: []const u8, frame: Tld.Frame) void;
+    pub const FrameHandler = *const fn (topic: []const u8, frame: Tld.Frame, context: ?*anyopaque) void;
 
     pub const run = &nodeRun;
     pub const runPublisher = &publisherRun;
     pub const publish = &publishAll;
     pub const subscribe = &subscribeRun;
     pub const subscribeFrames = &subscribeFramesRun;
+
+    /// Buffered subscription: messages land in a queue the caller drains with `poll`,
+    /// rather than arriving on a library thread. See the notes above `QueuedMessage`.
+    pub const subscribeQueue = &subscribeQueueRun;
+    pub const poll = &queuePoll;
+    pub const reserveQueue = &queueReserve;
+    pub const queueDropped = &queueDroppedCount;
     pub const deinit = &nodeDeinit;
     pub const sleepMs = &sleepMsFn;
     pub const nowMicros = &nowMicrosFn;
+
+    /// Registry port control. Set before `run()`; see `setRegistryPort`.
+    pub const setRegistryPort = &setRegistryPortFn;
+    pub const registryPort = &currentRegistryPort;
+
+    /// Opt in to handling Ctrl-C and SIGTERM. Off by default: a library must not
+    /// install process-wide handlers behind its host's back, nor replace one the host
+    /// already set. Call it after `run()` — see `installSignalHandlers`.
+    pub const installSignalHandlers = &installShutdownHandlers;
+
+    /// True once a stop has been requested, by a handled signal or by `deinit`. An
+    /// application whose main thread has nothing to do can loop on this and fall
+    /// through to its own `deinit` when it flips.
+    pub const stopRequested = &isShuttingDown;
 };
 
 // Parse "tcp://<host>:<port>" into an address. Rejects anything else (e.g. the
@@ -561,6 +751,10 @@ fn commitPeerReport(topic: []const u8) bool {
 fn handleRegistryClient(client: Stream) !void {
     defer client.close(io);
 
+    // Untracked before the close above, so this handle is only listed while open.
+    if (!trackSocket(client.socket, .stream)) return;
+    defer untrackSocket(client.socket);
+
     var rbuf: [1024]u8 = undefined;
     var reader = client.reader(io, &rbuf);
 
@@ -571,7 +765,7 @@ fn handleRegistryClient(client: Stream) !void {
     // connecting to silence and wondering whether anything is listening.
     try writer.interface.writeAll("# qnnt registry, type 'help' for commands\n");
 
-    while (true) {
+    while (!isShuttingDown()) {
         const chunk = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
             error.EndOfStream => return, // client closed
             error.StreamTooLong => {
@@ -601,30 +795,128 @@ fn takeReply(reader: *Io.Reader) Io.Reader.DelimiterError![]u8 {
     }
 }
 
-// The registry lives on a well-known port. Every node contends for it; whoever
-// binds first plays the registry role, the rest stand by. `reuse_address` stays
-// false on purpose so the bind is mutually exclusive (SO_REUSEPORT would let
-// several nodes bind at once and defeat the election).
-const registry_port = 2222;
+// The registry lives on a well-known port. Every node contends for it; whoever binds
+// first plays the registry role, the rest stand by. The bind must therefore be mutually
+// exclusive, which rules out `IpAddress.listen`'s `reuse_address`: its docstring says it
+// sets SO_REUSEADDR *and* SO_REUSEPORT, and SO_REUSEPORT is precisely the option that
+// lets two live listeners share a port — it would silently dissolve the election.
+//
+// But leaving both off has its own cost: a lingering TIME_WAIT socket on the port blocks
+// the next bind, and this node's own shutdown creates one whenever it closes an accepted
+// registry connection (the server closing first is what puts *its* end in TIME_WAIT).
+// One such socket is enough to lock every node out for an MSL — around 15 s here — which
+// stalls failover and makes a restarted node unable to take the role it just released.
+//
+// SO_REUSEADDR alone is exactly the fix: it permits binding over TIME_WAIT while two
+// listeners on one address still collide. Since std bundles the two options together,
+// the listener is opened by hand in `listenRegistry`.
+pub const default_registry_port = 2222;
+
+// Latched once per `nodeRun` and fixed for that node's lifetime: the registry thread, the
+// publishers' registration loops and every subscriber's resolver all hold it, so moving it
+// under them would be incoherent.
+//
+// No environment lookup here. Zig 0.16 gives a library no ambient access to the
+// environment — `Environ` has to be handed down from `main` — and that is the right shape
+// anyway: the library takes a port, and the caller decides whether it came from a flag, an
+// env var or a constant.
+var registry_port: u16 = default_registry_port;
+var node_running = false;
+
+/// Set the port the next `run()` will use. Returns false while a node is running, since
+/// the value is already in use by its workers; stop the node first.
+///
+/// Distinct ports give fully independent registries in one machine, which is what makes it
+/// possible to run tests and examples side by side instead of having them fight over one
+/// well-known port.
+pub fn setRegistryPortFn(port: u16) bool {
+    if (node_running) return false;
+    registry_port = port;
+    return true;
+}
+
+/// The port in effect — the one a running node is using, or the one the next `run()` will.
+pub fn currentRegistryPort() u16 {
+    return registry_port;
+}
 
 // How often standby nodes re-check the port, publishers refresh their registration,
 // and subscribers re-poll for a topic URI.
 const registry_probe_interval_ms = 2000;
 
+// Open the registry listener with SO_REUSEADDR but NOT SO_REUSEPORT; see the note on
+// `registry_port` for why std's one-flag-for-both is unusable here. Everything after
+// this is ordinary `net.Server`: accept, shutdown and deinit only use the handle.
+fn listenRegistry(addr: net.IpAddress) !net.Server {
+    const posix = std.posix;
+
+    const family = Io.Threaded.posixAddressFamily(&addr);
+    // Only Linux accepts SOCK_CLOEXEC inside socket(); the constant exists on macOS but
+    // the call rejects it with EPROTONOSUPPORT, so `@hasDecl` is the wrong test. Where it
+    // is unavailable the listener is inheritable across exec — worth knowing before this
+    // library is used from a process that forks and execs.
+    const cloexec: u32 = if (@import("builtin").os.tag == .linux) posix.SOCK.CLOEXEC else 0;
+    const flags: u32 = posix.SOCK.STREAM | cloexec;
+
+    const fd_rc = posix.system.socket(family, flags, 0);
+    if (posix.errno(fd_rc) != .SUCCESS) return error.SocketOpenFailed;
+    const fd: posix.socket_t = @intCast(fd_rc);
+    errdefer _ = posix.system.close(fd);
+
+    try posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
+
+    var storage: Io.Threaded.PosixAddress = undefined;
+    const addr_len = Io.Threaded.addressToPosix(&addr, &storage);
+
+    switch (posix.errno(posix.system.bind(fd, &storage.any, addr_len))) {
+        .SUCCESS => {},
+        .ADDRINUSE => return error.AddressInUse, // another node holds the role
+        else => return error.BindFailed,
+    }
+    switch (posix.errno(posix.system.listen(fd, registry_backlog))) {
+        .SUCCESS => {},
+        .ADDRINUSE => return error.AddressInUse,
+        else => return error.ListenFailed,
+    }
+
+    return .{
+        .socket = .{ .handle = fd, .address = addr },
+        .options = if (net.Server.AcceptOptions != void) .{ .mode = .stream, .protocol = .tcp },
+    };
+}
+
+const registry_backlog = 128;
+
 fn registryRun() void {
-    while (true) {
+    // Whether the "standing by" notice has been printed for the current contention.
+    // Printing every probe would be noise; printing nothing at all is worse — a node
+    // silently failing to bind is indistinguishable from one that simply is not the
+    // registry, which hid an AddressInUse loop for a long time.
+    var announced_standby = false;
+
+    while (!isShuttingDown()) {
         const addr: net.IpAddress = net.IpAddress.parse("127.0.0.1", registry_port) catch |err| {
             std.debug.print("registry address parse failed: {}\n", .{err});
             return;
         };
 
-        var server = addr.listen(io, .{ .reuse_address = false }) catch {
+        var server = listenRegistry(addr) catch |err| {
             // Another node already holds the registry role; stand by and re-probe.
-            sleepMsFn(registry_probe_interval_ms);
+            if (!announced_standby) {
+                std.debug.print("registry standing by (port {d}: {})\n", .{ registry_port, err });
+                announced_standby = true;
+            }
+            if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
             continue;
         };
         defer server.deinit(io); // released before we re-contend for the role
 
+        // Tracked so a shutdown can break the accept below. Untracked before the
+        // deinit above, so the handle is never stale while it is listed.
+        if (!trackSocket(server.socket, .listener)) return;
+        defer untrackSocket(server.socket);
+
+        announced_standby = false;
         registry_since_us.store(@intCast(nowMicrosFn()), .monotonic);
         std.debug.print("registry role acquired, listening on port {}\n", .{addr.getPort()});
 
@@ -632,14 +924,26 @@ fn registryRun() void {
         // and re-enter contention.
         while (true) {
             const client = server.accept(io) catch |err| {
+                // A shutdown breaking our own listener is not a failure worth
+                // reporting; anything else means the role is being lost.
+                if (isShuttingDown()) return;
                 std.debug.print("registry accept failed ({}); releasing role\n", .{err});
                 break;
             };
-            // handle in a thread; drop spawn if you want single-threaded
-            _ = std.Thread.spawn(.{}, handleRegistryClient, .{client}) catch |err| {
-                std.debug.print("error spawning registry client handler: {}\n", .{err});
+
+            if (isShuttingDown()) {
                 client.close(io);
-            };
+                return;
+            }
+
+            if (!spawnWorker(handleRegistryClient, .{client})) {
+                client.close(io);
+                // spawnWorker also refuses once a shutdown is under way, and by then the
+                // listener has already been woken, so going back to accept would block
+                // for good.
+                if (isShuttingDown()) return;
+                std.debug.print("error spawning registry client handler\n", .{});
+            }
         }
     }
 }
@@ -659,6 +963,8 @@ pub fn publishAll(topic: []const u8, data: []const u8) !void {
             var writer = list_ptr.items[idx].client.writer(io, &.{});
             writer.interface.writeAll(data) catch |err| {
                 std.debug.print("error writing: {}\n", .{err});
+                // Close before dropping it: swapRemove alone leaked the descriptor.
+                list_ptr.items[idx].client.close(io);
                 _ = list_ptr.swapRemove(idx);
                 continue;
             };
@@ -672,10 +978,10 @@ pub fn publishAll(topic: []const u8, data: []const u8) !void {
 // Drive `source` at a fixed rate, publishing whatever it returns. Paced against an
 // absolute deadline rather than "sleep(period) after the work", so the callback's own
 // cost and wake-up jitter don't accumulate into drift. A period of 0 is unpaced.
-fn publisherSchedule(topic: []const u8, source: Qnnt.SourceHandler, period_us: u64) void {
+fn publisherSchedule(topic: []const u8, source: Qnnt.SourceHandler, period_us: u64, context: ?*anyopaque) void {
     var next_us: u64 = @intCast(nowMicrosFn());
 
-    while (true) {
+    while (!isShuttingDown()) {
         // Unpaced has no deadline to wait for, so it skips the clock read as well as
         // the sleep — the read is the only remaining per-tick overhead at that point.
         if (period_us != 0) {
@@ -683,7 +989,7 @@ fn publisherSchedule(topic: []const u8, source: Qnnt.SourceHandler, period_us: u
             const now_us: u64 = @intCast(nowMicrosFn());
 
             if (next_us > now_us) {
-                sleepUsFn(next_us - now_us);
+                if (!sleepUsInterruptible(next_us - now_us)) return;
             } else if (now_us - next_us >= period_us) {
                 // More than a full period behind (slow callback, scheduling hiccup):
                 // give up on the missed ticks and resynchronize, rather than firing a
@@ -692,7 +998,7 @@ fn publisherSchedule(topic: []const u8, source: Qnnt.SourceHandler, period_us: u
             }
         }
 
-        if (source(topic)) |payload| {
+        if (source(topic, context)) |payload| {
             publishAll(topic, payload) catch |err| {
                 std.debug.print("error publishing on {s}: {}\n", .{ topic, err });
             };
@@ -700,13 +1006,17 @@ fn publisherSchedule(topic: []const u8, source: Qnnt.SourceHandler, period_us: u
     }
 }
 
-fn nodePublish(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: u64) !void {
+fn nodePublish(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: u64, context: ?*anyopaque) !void {
     // Bind to loopback with an ephemeral port (0); the OS fills in the real port,
     // which we read back from the socket and register with the discovery directory.
     const addr: net.IpAddress = try .parse("127.0.0.1", 0);
 
     var server = try addr.listen(io, .{ .reuse_address = false });
     defer server.deinit(io);
+
+    // Tracked so shutdown can break the accept loop below.
+    if (!trackSocket(server.socket, .listener)) return;
+    defer untrackSocket(server.socket);
 
     const endpoint = server.socket.address; // resolved, including the ephemeral port
 
@@ -722,21 +1032,24 @@ fn nodePublish(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: u64) !
     // node holds the registry (we register over the network, even to ourselves),
     // retries until a registry exists, and refreshes so a newly-elected registry
     // after a failover re-learns this publisher.
-    _ = std.Thread.spawn(.{}, registerLoop, .{ topic, endpoint }) catch |err| {
-        std.debug.print("failed to spawn register loop for {s}: {}\n", .{ topic, err });
-    };
+    if (!spawnWorker(registerLoop, .{ topic, endpoint })) {
+        std.debug.print("failed to spawn register loop for {s}\n", .{topic});
+    }
 
     // Self-paced publishing, if the caller supplied a source. Started only once the
     // listener is up and registered, so no tick can fire before subscribers have
     // somewhere to connect.
     if (source) |src| {
-        _ = std.Thread.spawn(.{}, publisherSchedule, .{ topic, src, period_us }) catch |err| {
-            std.debug.print("failed to spawn scheduler for {s}: {}\n", .{ topic, err });
-        };
+        if (!spawnWorker(publisherSchedule, .{ topic, src, period_us, context })) {
+            std.debug.print("failed to spawn scheduler for {s}\n", .{topic});
+        }
     }
 
-    while (true) {
-        const client = try server.accept(io);
+    while (!isShuttingDown()) {
+        const client = server.accept(io) catch |err| {
+            if (isShuttingDown()) return; // our own shutdown broke the accept
+            return err;
+        };
 
         subscribers_mutex.lockUncancelable(io);
         defer subscribers_mutex.unlock(io);
@@ -783,6 +1096,11 @@ fn registerOnce(topic: []const u8, endpoint: net.IpAddress) !void {
     var conn = try reg.connect(io, .{ .mode = .stream });
     defer conn.close(io);
 
+    // Short-lived, but it blocks on a read: tracked so a shutdown mid-exchange does
+    // not hold the worker until the peer answers.
+    if (!trackSocket(conn.socket, .stream)) return error.ShuttingDown;
+    defer untrackSocket(conn.socket);
+
     var writer = conn.writer(io, &.{});
     var rbuf: [256]u8 = undefined;
     var reader = conn.reader(io, &rbuf);
@@ -822,9 +1140,9 @@ fn registerOnce(topic: []const u8, endpoint: net.IpAddress) !void {
 }
 
 fn registerLoop(topic: []const u8, endpoint: net.IpAddress) void {
-    while (true) {
+    while (!isShuttingDown()) {
         registerOnce(topic, endpoint) catch {}; // registry not up yet / mid-failover
-        sleepMsFn(registry_probe_interval_ms);
+        if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
     }
 }
 
@@ -835,6 +1153,11 @@ fn resolveTopic(topic: []const u8) !net.IpAddress {
     const reg: net.IpAddress = try net.IpAddress.parse("127.0.0.1", registry_port);
     var conn = try reg.connect(io, .{ .mode = .stream });
     defer conn.close(io);
+
+    // Short-lived, but it blocks on a read: tracked so a shutdown mid-exchange does
+    // not hold the worker until the peer answers.
+    if (!trackSocket(conn.socket, .stream)) return error.ShuttingDown;
+    defer untrackSocket(conn.socket);
 
     var cmdbuf: [256]u8 = undefined;
     const cmd = try std.fmt.bufPrint(&cmdbuf, "sub {s}\n", .{topic});
@@ -851,18 +1174,22 @@ fn resolveTopic(topic: []const u8) !net.IpAddress {
 // message received to `handler`. Retries resolution/connection so it tolerates the
 // registry or publisher not being ready yet (e.g. the publishing node started
 // later), and reconnects if the publisher goes away.
-fn subscribeLoop(topic: []const u8, handler: Qnnt.MessageHandler) void {
-    while (true) {
+fn subscribeLoop(topic: []const u8, handler: Qnnt.MessageHandler, context: ?*anyopaque) void {
+    while (!isShuttingDown()) {
         const endpoint = resolveTopic(topic) catch {
-            sleepMsFn(registry_probe_interval_ms);
+            if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
             continue;
         };
 
         var stream = endpoint.connect(io, .{ .mode = .stream }) catch {
-            sleepMsFn(registry_probe_interval_ms);
+            if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
             continue;
         };
         defer stream.close(io);
+
+        // Tracked so shutdown breaks the blocking read below.
+        if (!trackSocket(stream.socket, .stream)) return;
+        defer untrackSocket(stream.socket);
 
         std.debug.print("subscribed to {s} @ tcp://{f}\n", .{ topic, endpoint });
 
@@ -870,19 +1197,19 @@ fn subscribeLoop(topic: []const u8, handler: Qnnt.MessageHandler) void {
         var reader = stream.reader(io, &rbuf);
         while (true) {
             const msg = reader.interface.takeDelimiterInclusive('\n') catch break;
-            handler(topic, msg); // delivered on this thread; msg valid only for the call
+            handler(topic, msg, context); // delivered on this thread; msg valid only for the call
         }
 
-        // Publisher closed; re-resolve and reconnect after a short pause.
-        sleepMsFn(registry_probe_interval_ms);
+        // Publisher closed (or we are shutting down); re-resolve and reconnect.
+        if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
     }
 }
 
-pub fn subscribeRun(topic: []const u8, handler: Qnnt.MessageHandler) bool {
-    _ = std.Thread.spawn(.{}, subscribeLoop, .{ topic, handler }) catch |err| {
-        std.debug.print("error spawning subscriber thread for {s}: {}\n", .{topic, err});
+pub fn subscribeRun(topic: []const u8, handler: Qnnt.MessageHandler, context: ?*anyopaque) bool {
+    if (!spawnWorker(subscribeLoop, .{ topic, handler, context })) {
+        std.debug.print("error spawning subscriber thread for {s}\n", .{topic});
         return false;
-    };
+    }
     return true;
 }
 
@@ -897,22 +1224,26 @@ const max_frame_bytes = 1 << 20;
 // A topic is one or the other, not both: the framing is a property of the stream, so a
 // producer publishing TLD must be read with `subscribeFrames`, and a producer
 // publishing text lines with `subscribe`.
-fn subscribeFramesLoop(topic: []const u8, handler: Qnnt.FrameHandler) void {
+fn subscribeFramesLoop(topic: []const u8, handler: Qnnt.FrameHandler, context: ?*anyopaque) void {
     // One buffer per subscription, reused for every frame, holding at most a frame.
     var frame_buf: std.ArrayList(u8) = .empty;
     defer frame_buf.deinit(allocator);
 
-    while (true) {
+    while (!isShuttingDown()) {
         const endpoint = resolveTopic(topic) catch {
-            sleepMsFn(registry_probe_interval_ms);
+            if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
             continue;
         };
 
         var stream = endpoint.connect(io, .{ .mode = .stream }) catch {
-            sleepMsFn(registry_probe_interval_ms);
+            if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
             continue;
         };
         defer stream.close(io);
+
+        // Tracked so shutdown breaks the blocking frame read below.
+        if (!trackSocket(stream.socket, .stream)) return;
+        defer untrackSocket(stream.socket);
 
         std.debug.print("subscribed to {s} @ tcp://{f} (tld)\n", .{ topic, endpoint });
 
@@ -928,18 +1259,226 @@ fn subscribeFramesLoop(topic: []const u8, handler: Qnnt.FrameHandler) void {
                 }
                 break;
             };
-            handler(topic, frame);
+            handler(topic, frame, context);
         }
 
-        sleepMsFn(registry_probe_interval_ms);
+        if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
     }
 }
 
-pub fn subscribeFramesRun(topic: []const u8, handler: Qnnt.FrameHandler) bool {
-    _ = std.Thread.spawn(.{}, subscribeFramesLoop, .{ topic, handler }) catch |err| {
-        std.debug.print("error spawning tld subscriber thread for {s}: {}\n", .{ topic, err });
-        return false;
+// ---------------------------------------------------------------- buffered subscription
+//
+// A second delivery mode: instead of invoking a callback on the subscriber's thread,
+// copy each message into a queue the application drains on its own thread.
+//
+// This exists for callers on the other side of a language boundary. Crossing one per
+// message costs far more than the copy — a ctypes callback is microseconds against a
+// ~30 ns decode — so draining a thousand at a time amortises it away. It also sidesteps
+// calling into a host runtime from a thread that runtime has never heard of, which under
+// CPython means acquiring the GIL from a foreign thread and having nowhere to put an
+// exception. With a queue, no library thread ever calls out.
+//
+// One queue serves every buffered subscription, so an application has a single drain
+// point; each message carries the topic it arrived on. Drain from one thread only.
+//
+// Message buffers are recycled rather than reallocated: `poll` swaps a ring slot's buffer
+// with a staging slot's, so steady-state delivery allocates nothing.
+
+pub const QueuedMessage = struct {
+    /// The topic string handed to `subscribeQueue` — the caller's, not a copy.
+    topic: []const u8,
+    /// Owned by the queue and valid until the next `poll` call, which recycles it.
+    data: []const u8,
+    received_us: u64,
+};
+
+const QueueSlot = struct {
+    topic: []const u8 = &.{},
+    buf: std.ArrayList(u8) = .empty,
+    received_us: u64 = 0,
+};
+
+const queue_default_capacity = 1024;
+
+var queue_ring: []QueueSlot = &.{};
+var queue_head: usize = 0;
+var queue_count: usize = 0;
+var queue_dropped: u64 = 0;
+var queue_mutex: Io.Mutex = .init;
+var queue_staging: std.ArrayList(QueueSlot) = .empty;
+
+// Bumped on every push and used as the futex word, so a waiting drainer wakes on arrival
+// rather than polling a flag.
+var queue_seq: std.atomic.Value(u32) = .init(0);
+
+fn queueEnsureCapacity(capacity: usize) !void {
+    if (queue_ring.len >= capacity) return;
+
+    const grown = try allocator.alloc(QueueSlot, capacity);
+    // Carry the existing entries over in order, so reserving more room mid-run does not
+    // reorder or drop what is already queued.
+    for (grown, 0..) |*slot, i| {
+        slot.* = if (i < queue_count) queue_ring[(queue_head + i) % queue_ring.len] else .{};
+    }
+    if (queue_ring.len > 0) allocator.free(queue_ring);
+    queue_ring = grown;
+    queue_head = 0;
+}
+
+/// Reserve queue room before subscribing. Optional: the first `subscribeQueue` reserves
+/// `queue_default_capacity` if nothing else has.
+pub fn queueReserve(capacity: usize) bool {
+    queue_mutex.lockUncancelable(io);
+    defer queue_mutex.unlock(io);
+
+    queueEnsureCapacity(capacity) catch return false;
+    return true;
+}
+
+/// How many messages have been dropped because the queue was full. A drainer that keeps
+/// up never sees this move; one that does not needs to know rather than guess.
+pub fn queueDroppedCount() u64 {
+    queue_mutex.lockUncancelable(io);
+    defer queue_mutex.unlock(io);
+    return queue_dropped;
+}
+
+// The handler behind every buffered subscription. `context` is the topic slice, boxed by
+// subscribeQueue, so one handler serves them all.
+fn queuePush(topic: []const u8, msg: []const u8, _: ?*anyopaque) void {
+    queue_mutex.lockUncancelable(io);
+    defer queue_mutex.unlock(io);
+
+    if (queue_ring.len == 0) return; // never reserved; nothing to push into
+
+    if (queue_count == queue_ring.len) {
+        // Full. Drop the newest rather than the oldest: that keeps what has already been
+        // accepted contiguous, so a consumer tracking sequence numbers sees a clean gap
+        // at the end instead of a hole in the middle.
+        queue_dropped += 1;
+        return;
+    }
+
+    const slot = &queue_ring[(queue_head + queue_count) % queue_ring.len];
+    slot.buf.clearRetainingCapacity();
+    slot.buf.appendSlice(allocator, msg) catch {
+        queue_dropped += 1;
+        return;
     };
+    slot.topic = topic;
+    slot.received_us = @intCast(nowMicrosFn());
+    queue_count += 1;
+
+    _ = queue_seq.fetchAdd(1, .monotonic);
+    io.futexWake(u32, &queue_seq.raw, 1);
+}
+
+/// Which reader a queued subscription uses. Framing is a property of the stream, not of
+/// the delivery mode, so the queue has to be told: a TLD producer read as text would be
+/// chopped at every 0x0A byte inside a payload, which is not a hypothetical — it is what
+/// happens the first time a buffer holds a newline.
+pub const QueueMode = enum { text, frames };
+
+/// Subscribe to `topic`, delivering into the shared queue instead of a callback. For
+/// `.frames` the queued bytes are the complete TLD frame, ready to hand to `Tld.decode`.
+pub fn subscribeQueueRun(topic: []const u8, mode: QueueMode) bool {
+    if (!queueReserveDefault()) return false;
+    return switch (mode) {
+        .text => subscribeRun(topic, queuePush, null),
+        .frames => subscribeFramesRun(topic, queuePushFrame, null),
+    };
+}
+
+fn queuePushFrame(topic: []const u8, frame: Tld.Frame, context: ?*anyopaque) void {
+    // Queue the whole frame, prefix included, so a consumer can decode it as it stands.
+    queuePush(topic, frame.raw, context);
+}
+
+// Apply the default capacity only if nothing has been reserved. Reserving
+// unconditionally would quietly override a deliberate `reserveQueue(2)` with 1024, since
+// the ring only ever grows — the caller asked for a small queue precisely to feel
+// backpressure early.
+fn queueReserveDefault() bool {
+    queue_mutex.lockUncancelable(io);
+    defer queue_mutex.unlock(io);
+
+    if (queue_ring.len > 0) return true;
+    queueEnsureCapacity(queue_default_capacity) catch return false;
+    return true;
+}
+
+/// Move up to `out.len` messages out of the queue. Returns the slice actually filled,
+/// whose `data` stays valid until the next call. `timeout_ms` of 0 never blocks and -1
+/// blocks until something arrives.
+pub fn queuePoll(out: []QueuedMessage, timeout_ms: i32) []QueuedMessage {
+    if (out.len == 0) return out[0..0];
+
+    queue_mutex.lockUncancelable(io);
+    defer queue_mutex.unlock(io);
+
+    if (queue_count == 0 and timeout_ms != 0) {
+        // Read the sequence before unlocking so a push landing in the gap is not missed:
+        // futexWaitTimeout returns immediately when the word has already moved on.
+        const observed = queue_seq.load(.monotonic);
+        queue_mutex.unlock(io);
+        const timeout: Io.Timeout = if (timeout_ms < 0)
+            .none
+        else
+            .{ .duration = .{
+                // .awake is the monotonic clock here, the same one sleepMs uses: a
+                // timeout must not be dragged around by wall-clock adjustments.
+                .raw = Io.Duration.fromMilliseconds(timeout_ms),
+                .clock = .awake,
+            } };
+        io.futexWaitTimeout(u32, &queue_seq.raw, observed, timeout) catch {};
+        queue_mutex.lockUncancelable(io);
+    }
+
+    const take = @min(out.len, queue_count);
+    if (take == 0) return out[0..0];
+
+    queue_staging.ensureTotalCapacity(allocator, take) catch return out[0..0];
+    while (queue_staging.items.len < take) queue_staging.appendAssumeCapacity(.{});
+
+    for (0..take) |i| {
+        const src = &queue_ring[(queue_head + i) % queue_ring.len];
+        const dst = &queue_staging.items[i];
+
+        // Swap buffers rather than copying: the ring slot inherits the staging slot's
+        // buffer and its capacity, so nothing is allocated once things are warm.
+        std.mem.swap(std.ArrayList(u8), &src.buf, &dst.buf);
+        dst.topic = src.topic;
+        dst.received_us = src.received_us;
+
+        out[i] = .{ .topic = dst.topic, .data = dst.buf.items, .received_us = dst.received_us };
+    }
+
+    queue_head = (queue_head + take) % queue_ring.len;
+    queue_count -= take;
+    return out[0..take];
+}
+
+fn queueDeinit() void {
+    queue_mutex.lockUncancelable(io);
+    defer queue_mutex.unlock(io);
+
+    for (queue_ring) |*slot| slot.buf.deinit(allocator);
+    if (queue_ring.len > 0) allocator.free(queue_ring);
+    queue_ring = &.{};
+
+    for (queue_staging.items) |*slot| slot.buf.deinit(allocator);
+    queue_staging.clearAndFree(allocator);
+
+    queue_head = 0;
+    queue_count = 0;
+    queue_dropped = 0;
+}
+
+pub fn subscribeFramesRun(topic: []const u8, handler: Qnnt.FrameHandler, context: ?*anyopaque) bool {
+    if (!spawnWorker(subscribeFramesLoop, .{ topic, handler, context })) {
+        std.debug.print("error spawning tld subscriber thread for {s}\n", .{topic});
+        return false;
+    }
     return true;
 }
 
@@ -956,17 +1495,27 @@ fn nowMicrosFn() i64 {
     return Io.Timestamp.now(io, .real).toMicroseconds();
 }
 
-// Exit promptly on Ctrl-C / termination. Io.Threaded installs signal machinery
-// that otherwise swallows SIGINT, so a node would keep holding the registry port
-// after Ctrl-C and no standby could ever take over. _exit is async-signal-safe and
-// lets the OS close the listening socket immediately, so a standby rebinds within
-// one probe interval. (No prints here: std.debug.print takes a lock and is not
-// async-signal-safe.)
+// Ask the node to stop, from Ctrl-C or SIGTERM. An atomic store is async-signal-safe,
+// which is all this does — no prints, since std.debug.print takes a lock and is not.
+//
+// This used to call `std.c._exit(0)`, because Io.Threaded's signal machinery swallows
+// SIGINT and a node would otherwise keep holding the registry port with no standby able
+// to take over. Now that stopping is a real operation, the flag is enough: workers wind
+// themselves up, and the application's own `deinit` releases the port properly. It also
+// stops the library from killing its host, which `_exit` inside a shared library would.
 fn onShutdownSignal(_: std.posix.SIG) callconv(.c) void {
-    std.c._exit(0);
+    shutting_down.store(true, .monotonic);
 }
 
-fn installShutdownHandlers() void {
+/// Install handlers for SIGINT and SIGTERM so they request a stop. Opt-in, and never
+/// called by `run()`: taking over a process's signal disposition is the host
+/// application's decision, not a library's, and doing it silently would clobber a
+/// handler the host had already installed — under a Python binding it would break
+/// KeyboardInterrupt outright.
+///
+/// Call it AFTER `run()`. Io.Threaded installs its own signal setup during init, so
+/// handlers registered before that get overwritten by it.
+pub fn installShutdownHandlers() void {
     const act: std.posix.Sigaction = .{
         .handler = .{ .handler = onShutdownSignal },
         .mask = std.posix.sigemptyset(),
@@ -977,16 +1526,21 @@ fn installShutdownHandlers() void {
 }
 
 pub fn nodeRun() bool {
+    // Cleared here rather than only in nodeDeinit, so a node can be started again after
+    // being stopped — which is the whole point of having a shutdown path.
+    shutting_down.store(false, .monotonic);
+    registry_since_us.store(0, .monotonic);
+    node_running = true;
+
     io_impl = .init(allocator, .{});
     io = io_impl.io();
 
-    // Must run after Io.Threaded's own signal setup so our INT/TERM handlers win.
-    installShutdownHandlers();
+    // Signal handlers are deliberately NOT installed here; see installShutdownHandlers.
 
-    _ = std.Thread.spawn(.{}, registryRun, .{}) catch |err| {
-        std.debug.print("error spawning registry thread: {}\n", .{err});
+    if (!spawnWorker(registryRun, .{})) {
+        std.debug.print("error spawning registry thread\n", .{});
         return false;
-    };
+    }
     sleepMsFn(5);
     return true;
 }
@@ -1005,7 +1559,7 @@ pub fn nodeRun() bool {
 // non-zero period still sleeps every tick, and a 1 us sleep costs several microseconds
 // of syscall, so 0 is measurably faster than 1. It also busies a core, hence the
 // notice at startup.
-pub fn publisherRun(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: ?u64) bool {
+pub fn publisherRun(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: ?u64, context: ?*anyopaque) bool {
     if ((source == null) != (period_us == null)) {
         std.debug.print("publisher {s}: source and period must be given together\n", .{topic});
         return false;
@@ -1016,15 +1570,30 @@ pub fn publisherRun(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: ?
         std.debug.print("publisher {s}: unpaced (period 0), will busy one core\n", .{topic});
     }
 
-    _ = std.Thread.spawn(.{}, nodePublish, .{ topic, source, period }) catch |err| {
-        std.debug.print("error spawning publisher thread for {s}: {}\n", .{topic, err});
+    if (!spawnWorker(nodePublish, .{ topic, source, period, context })) {
+        std.debug.print("error spawning publisher thread for {s}\n", .{topic});
         return false;
-    };
+    }
     sleepMsFn(5);
     return true;
 }
 
+// Stop the node and release everything it holds. Safe to call once per `nodeRun`, and a
+// node may be started again afterwards.
+//
+// The ordering is the whole point: the workers must be *gone* before anything they touch
+// is freed. Signal them, break the calls they are blocked in, join them, and only then
+// tear down the maps and `io`. Doing this in the other order — which is what this
+// function used to do — frees `io` out from under threads still parked in `accept`.
 pub fn nodeDeinit() void {
+    shutting_down.store(true, .monotonic);
+    breakLiveSockets();
+    breakSubscriberStreams();
+    joinWorkers();
+
+    // Past this point no worker exists, so the locks below are uncontended and only
+    // taken to keep the access pattern honest.
+
     {
         directory_mutex.lockUncancelable(io);
         defer directory_mutex.unlock(io);
@@ -1040,11 +1609,26 @@ pub fn nodeDeinit() void {
         subscribers_mutex.lockUncancelable(io);
         defer subscribers_mutex.unlock(io);
         var it = subscribers.iterator();
-        while (it.next()) |entry| entry.value_ptr.deinit(allocator);
+        while (it.next()) |entry| {
+            // Close the delivery connections too. Leaving these open leaked a socket per
+            // subscriber per node lifetime, which only stayed invisible because a node
+            // never used to outlive its process.
+            for (entry.value_ptr.items) |node| node.client.close(io);
+            entry.value_ptr.deinit(allocator);
+        }
         subscribers.clearAndFree();
     }
 
+    {
+        live_sockets_mutex.lockUncancelable(io);
+        defer live_sockets_mutex.unlock(io);
+        live_sockets.clearAndFree(allocator);
+    }
+
+    queueDeinit();
+
     io_impl.deinit();
+    node_running = false;
 }
 
 test {

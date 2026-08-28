@@ -31,7 +31,7 @@ var frame: std.ArrayList(u8) = .empty;
 var payload: []u8 = &.{};
 var seq: u64 = 0;
 
-fn benchSource(_: []const u8) ?[]const u8 {
+fn benchSource(_: []const u8, _: ?*anyopaque) ?[]const u8 {
     frame.clearRetainingCapacity();
     var enc = tld.Encoder.init(allocator, &frame);
 
@@ -69,9 +69,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     defer qnnt.deinit();
 
+    qnnt.installSignalHandlers();
+
     // Encode one frame up front purely to report the wire size, so the two nodes'
     // numbers can be compared without guessing at framing overhead.
-    _ = benchSource(topic);
+    _ = benchSource(topic, null);
     const frame_bytes = frame.items.len;
     sent.store(0, .monotonic);
     sent_bytes.store(0, .monotonic);
@@ -95,7 +97,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         });
     }
 
-    if (! qnnt.runPublisher(topic, benchSource, period_us)) {
+    if (! qnnt.runPublisher(topic, benchSource, period_us, null)) {
         std.debug.print("failed to run {s} publisher\n", .{topic});
         return;
     }
@@ -106,7 +108,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var last_bytes: u64 = 0;
     var last_us: u64 = @intCast(qnnt.nowMicros());
 
-    while (true) {
+    while (!qnnt.stopRequested()) {
         qnnt.sleepMs(1000);
 
         const now_us: u64 = @intCast(qnnt.nowMicros());

@@ -168,7 +168,7 @@ fn report(now_us: u64) void {
     hist_overflow = 0;
 }
 
-fn onFrame(_: []const u8, f: tld.Frame) void {
+fn onFrame(_: []const u8, f: tld.Frame, _: ?*anyopaque) void {
     const info = readFrame(f) catch {
         decode_errors += 1;
         return;
@@ -213,13 +213,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
     defer qnnt.deinit();
 
+    qnnt.installSignalHandlers();
+
     std.debug.print("node-4 benchmarking {s} (mode {s}), reporting every {d} ms\n", .{
         topic,
         @tagName(@import("builtin").mode),
         report_interval_us / 1000,
     });
 
-    if (! qnnt.subscribeFrames(topic, onFrame)) {
+    if (! qnnt.subscribeFrames(topic, onFrame, null)) {
         std.debug.print("failed to subscribe to {s}\n", .{topic});
         return;
     }
@@ -227,7 +229,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // The subscriber thread owns the live statistics and reports them itself. Main only
     // runs the decoder microbenchmark, which needs a captured frame and must not sit
     // on the delivery path.
-    while (true) {
+    while (!qnnt.stopRequested()) {
         qnnt.sleepMs(5000);
 
         if (sample_len == 0) continue;
