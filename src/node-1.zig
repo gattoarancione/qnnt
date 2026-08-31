@@ -21,6 +21,9 @@ fn onTopicA(topic: []const u8, msg: []const u8, _: ?*anyopaque) void {
 }
 
 pub fn main() !void {
+    // Every QNNT_* variable, handled by the library so all four languages agree.
+    qnnt.configureFromEnvironment();
+
     if (! qnnt.run()) {
         std.debug.print("failed to run QNNT\n", .{});
     }

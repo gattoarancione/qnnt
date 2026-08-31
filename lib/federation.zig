@@ -42,6 +42,9 @@ const Reply = qnnt.Reply;
 const max_peers = 32;
 const fed_sync_interval_ms = 5_000;
 
+/// Federation's own port, separate from the registry's so the registry can stay loopback.
+pub const default_port = 2223;
+
 // A remote entry stops being handed out once this stale, because pointing a subscriber at
 // an unreachable host just makes it retry, and is dropped entirely after `forget`.
 const fed_serve_until_us: u64 = 30 * std.time.us_per_s;
@@ -66,10 +69,12 @@ const Peer = struct {
 
 var fed_peers: [max_peers]Peer = @splat(.{});
 var peer_count: usize = 0;
-var federation_port: u16 = 0;
+var federation_port: u16 = default_port;
 
-// No default. Federation refuses to start without a key, because the alternative is an
-// unauthenticated directory reachable from the network.
+// The cluster key is the switch. Federation runs when one is set and not otherwise,
+// because the alternative -- an unauthenticated directory reachable from a network -- lets
+// anyone redirect a topic's subscribers. Requiring a port as well was the wrong shape: it
+// meant the common case (one key, default port) started nothing and said nothing.
 var cluster_key: [64]u8 = @splat(0);
 var cluster_key_len: usize = 0;
 
@@ -111,7 +116,8 @@ fn waitForChangeOrDeadline(observed: u32, ms: u64) bool {
     return !qnnt.isShuttingDown();
 }
 
-/// Port for the federation listener. 0 (the default) disables federation entirely.
+/// Port for the federation listener; defaults to `default_port`. Passing 0 disables
+/// federation outright, whatever key is set.
 pub fn setPort(port: u16) bool {
     if (qnnt.node_running) return false;
     federation_port = port;
@@ -142,8 +148,11 @@ pub fn addPeer(host: []const u8, port: u16) bool {
     return true;
 }
 
+/// Whether federation will actually run: a key to authenticate with, and a port to listen
+/// on. Asked by `bindText`, so a node with no key keeps its sockets on loopback and
+/// exposes nothing.
 pub fn enabled() bool {
-    return federation_port != 0;
+    return cluster_key_len != 0 and federation_port != 0;
 }
 
 // ---------------------------------------------------------------- applying entries
@@ -430,7 +439,11 @@ fn listenerRun() void {
         // SO_REUSEADDR here too, for the same reason as the registry: a restart must not
         // be locked out by a TIME_WAIT socket left by the previous listener.
         var server = qnnt.listenExclusiveOn(addr) catch |err| {
-            std.debug.print("federation listen on {d} failed: {}\n", .{ federation_port, err });
+            std.debug.print(
+                "federation listen on {s}:{d} failed: {} -- another node here already " ++
+                    "holds it; give each one its own QNNT_FEDERATION_PORT\n",
+                .{ qnnt.bindText(), federation_port, err },
+            );
             if (!qnnt.sleepMsInterruptible(qnnt.registry_probe_interval_ms)) return;
             continue;
         };
@@ -736,17 +749,29 @@ pub fn entryIsServable(entry: *const TopicEntry, now_us: u64) bool {
 }
 
 pub fn start() void {
-    if (federation_port == 0) return;
+    // Always says which way it went. Silence was the actual failure mode: with a key but
+    // no port the previous version returned without a word, so federation neither ran nor
+    // explained itself, and the only symptom was a port that never appeared.
+    if (federation_port == 0) {
+        std.debug.print("federation disabled (port explicitly set to 0)\n", .{});
+        return;
+    }
 
     if (cluster_key_len == 0) {
         std.debug.print(
-            "federation NOT started: no cluster key set. An unauthenticated directory on " ++
-                "a network lets anyone redirect a topic's subscribers.\n",
+            "federation disabled: no cluster key. Set one to enable it -- an " ++
+                "unauthenticated directory on a network lets anyone redirect a topic's " ++
+                "subscribers.\n",
             .{},
         );
-        federation_port = 0;
         return;
     }
+
+    std.debug.print("federation enabled: port {d}, {d} peer(s) to dial, binding {s}\n", .{
+        federation_port,
+        peer_count,
+        qnnt.bindText(),
+    });
 
     if (!qnnt.spawnWorker(listenerRun, .{})) {
         std.debug.print("failed to start the federation listener\n", .{});

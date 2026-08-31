@@ -85,6 +85,14 @@ export fn qnnt_registry_port() callconv(.c) u16 {
     return qnnt.currentRegistryPort();
 }
 
+/// Apply configuration from the process environment. One call, and the same six QNNT_*
+/// variables work identically from C, C++, Python and Zig. Explicit rather than automatic:
+/// a library that silently reconfigures itself from process-wide state surprises whatever
+/// embeds it. Call before qnnt_init, then override explicitly if you want to.
+export fn qnnt_configure_from_environment() callconv(.c) void {
+    qnnt.Qnnt.configureFromEnvironment();
+}
+
 export fn qnnt_init() callconv(.c) Status {
     return if (qnnt.nodeRun()) .ok else .failed;
 }

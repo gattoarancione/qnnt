@@ -305,34 +305,8 @@ int main(int argc, char **argv) {
     /* The library reads no environment of its own, by design, so an example that wants a
      * port from one has to read it and pass it. Matches python/nodes.py, which is what
      * lets the two find each other. */
-    const char *adv_env = getenv("QNNT_ADVERTISE_ADDR");
-    if (adv_env) CHECK(qnnt_set_advertise_address(adv_env));
-    const char *bind_env = getenv("QNNT_BIND_ADDR");
-    if (bind_env) CHECK(qnnt_set_bind_address(bind_env));
-
-    const char *fed_env = getenv("QNNT_FEDERATION_PORT");
-    if (fed_env) CHECK(qnnt_set_federation_port((uint16_t)strtoul(fed_env, NULL, 10)));
-    const char *key_env = getenv("QNNT_CLUSTER_KEY");
-    if (key_env) CHECK(qnnt_set_cluster_key(key_env));
-
-    /* QNNT_PEERS=host[:port],host[:port],... */
-    const char *peers_env = getenv("QNNT_PEERS");
-    if (peers_env) {
-        char buf[512];
-        snprintf(buf, sizeof buf, "%s", peers_env);
-        for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
-            char *colon = strrchr(tok, ':');
-            uint16_t pport = 0;
-            if (colon) { *colon = 0; pport = (uint16_t)strtoul(colon + 1, NULL, 10); }
-            CHECK(qnnt_add_peer(tok, pport));
-        }
-    }
-
-    const char *port_env = getenv("QNNT_REGISTRY_PORT");
-    if (port_env) {
-        const unsigned long port = strtoul(port_env, NULL, 10);
-        CHECK(qnnt_set_registry_port((uint16_t)port));
-    }
+    /* Every QNNT_* variable, handled by the library so all four languages agree. */
+    qnnt_configure_from_environment();
 
     if (qnnt_init() != QNNT_OK) { fprintf(stderr, "qnnt_init failed\n"); return 1; }
     printf("node-c %d: registry port %u\n", role, qnnt_registry_port());

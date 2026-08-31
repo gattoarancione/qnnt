@@ -88,45 +88,26 @@ class Node:
 
         self._lib = declare(load())
 
-        # Precedence: the argument, then QNNT_REGISTRY_PORT, then the library default.
-        # The library reads no environment itself -- that is deliberate, so this is the
-        # layer that decides where the value comes from.
-        if registry_port is None:
-            env = os.environ.get("QNNT_REGISTRY_PORT")
-            registry_port = int(env) if env else None
-        if registry_port is not None:
-            _check(
-                self._lib,
-                self._lib.qnnt_set_registry_port(registry_port),
-                f"set_registry_port({registry_port})",
-            )
+        # Topics are retained by the library rather than copied, so the encoded bytes have
+        # to be kept alive here for as long as the subscription exists.
+        self._topics: dict[str, bytes] = {}
+        self._closed = False
 
-        # Addressing. Both optional: unset means loopback, and once federation is on an
-        # unset advertise address is the normal case -- each peer fills in the address it
-        # reached this host on, so a node behind a gateway needs no idea of its own.
-        if advertise_addr is None:
-            advertise_addr = os.environ.get("QNNT_ADVERTISE_ADDR")
+        # The library reads every QNNT_* variable itself, so all four languages agree on
+        # what they mean. Keyword arguments are applied on top and win, which is why this
+        # runs first.
+        self._lib.qnnt_configure_from_environment()
+
+        if registry_port is not None:
+            _check(self._lib, self._lib.qnnt_set_registry_port(registry_port),
+                   f"set_registry_port({registry_port})")
         if advertise_addr:
             _check(self._lib, self._lib.qnnt_set_advertise_address(advertise_addr.encode()),
                    "set_advertise_address")
-        if bind_addr is None:
-            bind_addr = os.environ.get("QNNT_BIND_ADDR")
         if bind_addr:
             _check(self._lib, self._lib.qnnt_set_bind_address(bind_addr.encode()),
                    "set_bind_address")
-
-        # Federation. Needs BOTH a port and a cluster key; the library refuses to expose an
-        # unauthenticated directory to a network.
-        if federation_port is None:
-            env_fed = os.environ.get("QNNT_FEDERATION_PORT")
-            federation_port = int(env_fed) if env_fed else None
-        if cluster_key is None:
-            cluster_key = os.environ.get("QNNT_CLUSTER_KEY")
-        if peers is None:
-            env_peers = os.environ.get("QNNT_PEERS")
-            peers = [p for p in env_peers.split(",") if p] if env_peers else None
-
-        if federation_port:
+        if federation_port is not None:
             _check(self._lib, self._lib.qnnt_set_federation_port(federation_port),
                    "set_federation_port")
         if cluster_key:
@@ -138,10 +119,6 @@ class Node:
                 host, port_text = spec, "0"
             _check(self._lib, self._lib.qnnt_add_peer(host.encode(), int(port_text or 0)),
                    f"add_peer({spec})")
-        # Topics are retained by the library rather than copied, so the encoded bytes have
-        # to be kept alive here for as long as the subscription exists.
-        self._topics: dict[str, bytes] = {}
-        self._closed = False
 
         _check(self._lib, self._lib.qnnt_init(), "init")
         Node._open = self

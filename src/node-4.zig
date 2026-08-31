@@ -208,6 +208,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         report_interval_us = ms * 1000;
     }
 
+    // Every QNNT_* variable, handled by the library so all four languages agree.
+    qnnt.configureFromEnvironment();
+
     if (! qnnt.run()) {
         std.debug.print("failed to run QNNT\n", .{});
     }

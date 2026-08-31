@@ -318,6 +318,10 @@ pub const Qnnt = struct {
     /// address. See the note on `NodeId` for why it is not derived from one.
     pub const nodeIdText = &nodeIdTextFn;
 
+    /// Apply configuration from the process environment: one call, one implementation,
+    /// shared by every language binding. Explicit rather than automatic — see lib/env.zig.
+    pub const configureFromEnvironment = &@import("env.zig").configureFromEnvironment;
+
     /// Federation. All must be set before `run()`. Federation stays off unless a port
     /// AND a cluster key are given.
     pub const setFederationPort = &federation.setPort;
@@ -744,10 +748,10 @@ fn writeStatus(buffer: *std.ArrayList(u8)) !void {
     try buffer.print(allocator, "port {d}\n", .{registry_port});
     try buffer.print(allocator, "probe-interval {d}ms\n", .{registry_probe_interval_ms});
     try buffer.print(allocator, "stale-after {d}ms\n", .{stale_after_us / 1000});
-    if (federation.currentPort() == 0) {
-        try buffer.print(allocator, "federation off\n", .{});
-    } else {
+    if (federation.enabled()) {
         try buffer.print(allocator, "federation port {d}\n", .{federation.currentPort()});
+    } else {
+        try buffer.print(allocator, "federation off\n", .{});
     }
 }
 
@@ -1051,7 +1055,7 @@ pub fn bindText() []const u8 {
     //
     // Getting this wrong made federation bind 127.0.0.1 and look fine on one machine
     // while being unreachable from any other.
-    if (federation.currentPort() != 0) return any_text;
+    if (federation.enabled()) return any_text;
 
     // Nothing asked to be reachable: stay private and expose no port by accident.
     return loopback_text;

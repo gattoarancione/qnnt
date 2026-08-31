@@ -64,6 +64,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer allocator.free(payload);
     for (payload, 0..) |*b, i| b.* = @truncate(i);
 
+    // Every QNNT_* variable, handled by the library so all four languages agree.
+    qnnt.configureFromEnvironment();
+
     if (! qnnt.run()) {
         std.debug.print("failed to run QNNT\n", .{});
     }

@@ -13,6 +13,9 @@ fn topicBSource(_: []const u8, _: ?*anyopaque) ?[]const u8 {
 }
 
 pub fn main() !void {
+    // Every QNNT_* variable, handled by the library so all four languages agree.
+    qnnt.configureFromEnvironment();
+
     if (! qnnt.run()) {
         std.debug.print("failed to run QNNT\n", .{});
     }

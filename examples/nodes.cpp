@@ -319,45 +319,8 @@ int main(int argc, char** argv) {
 
     const int role = argc > 1 ? std::atoi(argv[1]) : 0;
 
-    // Federation, same environment contract as nodes.c.
-    if (const char* fed = std::getenv("QNNT_FEDERATION_PORT")) {
-        if (!check(qnnt_set_federation_port(static_cast<std::uint16_t>(std::strtoul(fed, nullptr, 10))),
-                   "set_federation_port")) return 1;
-    }
-    if (const char* key = std::getenv("QNNT_CLUSTER_KEY")) {
-        if (!check(qnnt_set_cluster_key(key), "set_cluster_key")) return 1;
-    }
-    if (const char* peers = std::getenv("QNNT_PEERS")) {
-        std::string list{peers};
-        std::size_t pos = 0;
-        while (pos <= list.size()) {
-            const auto comma = list.find(',', pos);
-            auto spec = list.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
-            if (!spec.empty()) {
-                std::uint16_t pport = 0;
-                if (const auto colon = spec.rfind(':'); colon != std::string::npos) {
-                    pport = static_cast<std::uint16_t>(std::strtoul(spec.c_str() + colon + 1, nullptr, 10));
-                    spec.resize(colon);
-                }
-                if (!check(qnnt_add_peer(spec.c_str(), pport), "add_peer")) return 1;
-            }
-            if (comma == std::string::npos) break;
-            pos = comma + 1;
-        }
-    }
-    if (const char* adv = std::getenv("QNNT_ADVERTISE_ADDR")) {
-        if (!check(qnnt_set_advertise_address(adv), "set_advertise_address")) return 1;
-    }
-    if (const char* bind = std::getenv("QNNT_BIND_ADDR")) {
-        if (!check(qnnt_set_bind_address(bind), "set_bind_address")) return 1;
-    }
-
-    // The library reads no environment of its own, so an example wanting the port from
-    // one reads it and passes it. Matches nodes.c and python/nodes.py.
-    if (const char* port_env = std::getenv("QNNT_REGISTRY_PORT")) {
-        const auto port = static_cast<std::uint16_t>(std::strtoul(port_env, nullptr, 10));
-        if (!check(qnnt_set_registry_port(port), "set_registry_port")) return 1;
-    }
+    // Every QNNT_* variable, handled by the library so all four languages agree.
+    qnnt_configure_from_environment();
 
     if (!check(qnnt_init(), "qnnt_init")) return 1;
     std::printf("node-cpp %d: registry port %u\n", role, qnnt_registry_port());

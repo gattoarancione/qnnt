@@ -82,6 +82,19 @@ qnnt_status qnnt_set_federation_port(uint16_t port);
 qnnt_status qnnt_set_cluster_key(const char *key);
 qnnt_status qnnt_add_peer(const char *host, uint16_t port);
 
+/* Apply configuration from the process environment, reading these if present:
+ *
+ *   QNNT_REGISTRY_PORT   QNNT_ADVERTISE_ADDR   QNNT_BIND_ADDR
+ *   QNNT_CLUSTER_KEY     QNNT_FEDERATION_PORT  QNNT_PEERS
+ *
+ * One call, and the same variables behave identically from C, C++, Python and Zig. An unset
+ * or empty variable is absent; a value that cannot be used is reported on stderr rather
+ * than ignored. Explicit rather than automatic, because a library that silently
+ * reconfigures itself from process-wide state surprises whatever embeds it.
+ *
+ * Call before qnnt_init; explicit setters afterwards override it. */
+void qnnt_configure_from_environment(void);
+
 /* Start the node: joins the registry election and brings up the worker threads. */
 qnnt_status qnnt_init(void);
 

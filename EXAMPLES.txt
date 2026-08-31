@@ -61,6 +61,24 @@ The Python package finds the freshly built shared library by itself when run fro
 checkout -- no PYTHONPATH, no LD_LIBRARY_PATH, nothing to export. It needs no
 dependencies beyond the standard library.
 
+All five roles also exist as standalone Zig binaries (section 9), and every one of
+them -- C, C++, Python and Zig alike -- honours the same QNNT_* variables described
+in sections 6 and 7. They agree because there is one implementation, inside the
+library: each program calls for it in a single line rather than parsing the
+environment itself.
+
+An unset or empty variable is simply absent -- 'export QNNT_CLUSTER_KEY' with no
+value means unset, not an empty key. A value that cannot be used is reported rather
+than ignored:
+
+    ignoring QNNT_REGISTRY_PORT=notanumber: not accepted
+
+Reading it is an explicit call, not something starting a node does implicitly, so a
+program that embeds qnnt is never reconfigured by process-wide state behind its
+back. In Python the environment is read first and keyword arguments override it:
+
+    qnnt.Node(registry_port=9999)     # wins over QNNT_REGISTRY_PORT
+
 Via the build system instead, which rebuilds first if needed:
 
     zig build run-c   -- 0
@@ -241,17 +259,32 @@ each other through it. Federation joins the registries of several hosts, so a
 subscriber on one host resolves a topic published on another and connects to it
 without knowing it is remote.
 
-Each node is given the addresses of its peers. Three settings, all optional and
-all needed together for federation to start:
+The cluster key is the switch. Set one and federation starts; leave it unset and
+it does not:
 
-    QNNT_FEDERATION_PORT=2223      a port of its own; the registry port stays
-                                   loopback-only and is never exposed
-    QNNT_CLUSTER_KEY=some-secret   shared by every node in the cluster
-    QNNT_PEERS=10.0.0.8,10.0.0.9:2223    host or host:port, comma-separated
+    QNNT_CLUSTER_KEY=some-secret   shared by every node in the cluster -- REQUIRED
+    QNNT_PEERS=10.0.0.8,10.0.0.9   host or host:port, comma-separated
+    QNNT_FEDERATION_PORT=2223      optional; 2223 by default, and 0 disables
 
-Federation will NOT start without a cluster key, and says so. An unauthenticated
-directory reachable from a network lets anyone redirect a topic's subscribers,
-which is worse than not federating at all.
+The key is not optional because an unauthenticated directory reachable from a
+network lets anyone redirect a topic's subscribers, which is worse than not
+federating at all.
+
+A node always reports which way it went, on its first lines of output:
+
+    federation enabled: port 2223, 1 peer(s) to dial, binding 0.0.0.0
+    federation listening on 0.0.0.0:2223
+
+or, with no key:
+
+    federation disabled: no cluster key. Set one to enable it -- an
+    unauthenticated directory on a network lets anyone redirect a topic's
+    subscribers.
+
+On real hosts that is the whole configuration: a key everywhere, and each node's
+QNNT_PEERS naming the others. The port only needs setting when several nodes share
+one machine, since they cannot all bind 2223 -- and a node that loses that race
+says so rather than failing quietly.
 
   Terminal 1 -- host A, publishing:
 
@@ -349,9 +382,13 @@ A node prints nothing while clearly working
     Watched in a terminal, all of them print as they go.
 
 Federation does not start
-    It needs BOTH QNNT_FEDERATION_PORT and QNNT_CLUSTER_KEY; with a port and no
-    key it refuses and prints why. Check with 'status', which reports either
+    It needs QNNT_CLUSTER_KEY; without one it prints "federation disabled: no
+    cluster key" and stays off. 'status' confirms, reporting either
     "federation off" or the port in use.
+
+Federation says AddressInUse on 2223
+    Another node on this machine already holds the default port. Give each one
+    its own QNNT_FEDERATION_PORT. Across separate hosts the default is fine.
 
 Federated topics never appear
     Check 'peers' on the node that should be learning them. "down" means it
