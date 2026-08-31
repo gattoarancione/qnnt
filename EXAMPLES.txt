@@ -289,9 +289,17 @@ Notes worth having before deploying this:
 
   Nodes do not need to know their own address. An entry carries a port and,
   optionally, a host; when the host is absent the peer substitutes the address
-  it reached the sender on. So a node can bind 0.0.0.0, or sit behind a gateway
-  that chooses its public address, and still be reachable. Set
-  QNNT_ADVERTISE_ADDR only to override that -- for a specific interface, say.
+  it reached the sender on. So a node can sit behind a gateway that chooses its
+  public address and still be reachable. Set QNNT_ADVERTISE_ADDR only to
+  override that -- to pin a specific interface, say.
+
+  Turning federation on therefore also opens the sockets. With no federation
+  port, the federation listener does not exist and publishers bind loopback, so
+  nothing is reachable from another machine. Set a federation port and both the
+  federation listener and the publisher sockets bind 0.0.0.0, because peers have
+  to be able to reach them and no configured address is needed to allow that.
+  The registry port itself is never exposed: it stays on loopback in every case,
+  which is what keeps 'unpub' and the inspection commands local.
 
   Changes propagate in milliseconds where a peer connection exists to push over,
   and otherwise within one 5-second anti-entropy round. A node that only listens

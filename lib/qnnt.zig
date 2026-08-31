@@ -1040,8 +1040,21 @@ pub fn advertiseText() []const u8 {
 
 pub fn bindText() []const u8 {
     if (bind_len != 0) return bind_buf[0..bind_len];
-    // Follow the advertise address: loopback stays private, anything else listens widely.
-    return if (advertise_len == 0) loopback_text else any_text;
+
+    // An explicit advertise address means "be reachable there", so listen widely.
+    if (advertise_len != 0) return any_text;
+
+    // Federation on with no advertise address is the NORMAL case, not an omission: the
+    // whole point of letting each peer fill in the address it reached us on is that we
+    // need not know our own. But that only works if we are actually listening on the
+    // interface they arrive over, so this must be 0.0.0.0 rather than loopback.
+    //
+    // Getting this wrong made federation bind 127.0.0.1 and look fine on one machine
+    // while being unreachable from any other.
+    if (federation.currentPort() != 0) return any_text;
+
+    // Nothing asked to be reachable: stay private and expose no port by accident.
+    return loopback_text;
 }
 
 /// The address remote subscribers are told to dial, with `port` filled in. Set it before
