@@ -50,6 +50,37 @@ export fn qnnt_set_registry_port(port: u16) callconv(.c) Status {
     return if (qnnt.setRegistryPortFn(port)) .ok else .failed;
 }
 
+/// The address remote subscribers should dial. Optional: leave it unset and observers
+/// fill it in from the connection they reached this host on, which is what lets a node
+/// behind a gateway work without knowing its own public address.
+export fn qnnt_set_advertise_address(addr: ?[*:0]const u8) callconv(.c) Status {
+    const text = addr orelse return .invalid_argument;
+    return if (qnnt.setAdvertiseAddressFn(std.mem.span(text))) .ok else .failed;
+}
+
+/// The address publisher sockets bind. Defaults to following the advertise address.
+export fn qnnt_set_bind_address(addr: ?[*:0]const u8) callconv(.c) Status {
+    const text = addr orelse return .invalid_argument;
+    return if (qnnt.setBindAddressFn(std.mem.span(text))) .ok else .failed;
+}
+
+/// Federation. All optional and all before qnnt_init; federation stays off unless both a
+/// port and a cluster key are given.
+export fn qnnt_set_federation_port(port: u16) callconv(.c) Status {
+    return if (qnnt.Qnnt.setFederationPort(port)) .ok else .failed;
+}
+
+export fn qnnt_set_cluster_key(key: ?[*:0]const u8) callconv(.c) Status {
+    const text = key orelse return .invalid_argument;
+    return if (qnnt.Qnnt.setClusterKey(std.mem.span(text))) .ok else .failed;
+}
+
+/// Add a peer to dial. Port 0 means "the federation port".
+export fn qnnt_add_peer(host: ?[*:0]const u8, port: u16) callconv(.c) Status {
+    const text = host orelse return .invalid_argument;
+    return if (qnnt.Qnnt.addPeer(std.mem.span(text), port)) .ok else .failed;
+}
+
 export fn qnnt_registry_port() callconv(.c) u16 {
     return qnnt.currentRegistryPort();
 }

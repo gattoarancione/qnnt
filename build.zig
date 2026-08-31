@@ -177,6 +177,49 @@ pub fn build(b: *Build) void {
     const wheel_test_step = b.step("wheel-test", "Install the wheel in a venv and run the demo from it");
     wheel_test_step.dependOn(&wheel_test.step);
 
+    // The five demo node roles in C and C++, mirroring src/node-0..4. One program each,
+    // with the role chosen by argument, so the roles stay directly comparable:
+    //   zig build run-c -- 0        zig build run-cpp -- 3 1000 64
+    // Topics and rates match the Zig nodes, so any mix of languages interoperates.
+    const node_langs = [_]struct {
+        name: []const u8,
+        src: []const u8,
+        step: []const u8,
+        cpp: bool,
+    }{
+        .{ .name = "node-c", .src = "examples/nodes.c", .step = "run-c", .cpp = false },
+        .{ .name = "node-cpp", .src = "examples/nodes.cpp", .step = "run-cpp", .cpp = true },
+    };
+
+    for (node_langs) |lang| {
+        const mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = lang.cpp,
+        });
+        mod.addCSourceFile(.{
+            .file = b.path(lang.src),
+            .flags = if (lang.cpp)
+                &.{ "-std=c++20", "-Wall", "-Wextra", "-Werror" }
+            else
+                &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+        });
+        mod.addIncludePath(b.path("include"));
+        mod.linkLibrary(qnnt_c_static);
+
+        const exe = b.addExecutable(.{ .name = lang.name, .root_module = mod });
+        b.installArtifact(exe);
+
+        const run = b.addRunArtifact(exe);
+        if (b.args) |args| run.addArgs(args);
+        const step = b.step(lang.step, b.fmt("Run {s} (role 0..4 as the first argument)", .{lang.name}));
+        step.dependOn(&run.step);
+
+        // Compiling them is part of `test`; running a role would block forever.
+        test_step.dependOn(&exe.step);
+    }
+
     test_step.dependOn(&run_c_demo.step);
     test_step.dependOn(&run_cpp_demo.step);
     test_step.dependOn(&run_node_demo.step);

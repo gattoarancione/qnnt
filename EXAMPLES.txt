@@ -1,0 +1,374 @@
+================================================================================
+ qnnt examples -- running the C, C++ and Python demo nodes
+================================================================================
+
+There are five demo node roles. Each language has ONE program that can play any of
+them, chosen by its first argument, so the same five roles exist three times over:
+
+    role 0   publish test/topic-a at 100 Hz and test/topic-b at 20 Hz
+    role 1   publish test/topic-c at 1 kHz, and subscribe to test/topic-a
+    role 2   subscribe to test/topic-b and test/topic-c (no publishing)
+    role 3   TLD load generator on test/bench   [period_us] [payload_bytes]
+    role 4   TLD benchmark subscriber on test/bench   [report_ms]
+
+Topics and rates are identical across the languages, so any mix interoperates: a C
+role 0 feeding a Python role 2 is the same system as five Zig nodes.
+
+Each node runs in the foreground and prints continuously, so give each one its own
+terminal. Stop any of them with Ctrl-C.
+
+
+--------------------------------------------------------------------------------
+ 1. Build first (once)
+--------------------------------------------------------------------------------
+
+From the repository root:
+
+    zig build
+
+That produces everything the examples need:
+
+    zig-out/bin/node-c          the C program
+    zig-out/bin/node-cpp        the C++ program
+    zig-out/lib/libqnnt_c.*     the shared library the Python package loads
+    zig-out/include/            qnnt.h, qnnt_tld.h, qnnt_tld.hpp
+
+For the benchmark roles (3 and 4) build optimised instead, or the numbers measure
+a debug build:
+
+    zig build -Doptimize=ReleaseFast
+
+
+--------------------------------------------------------------------------------
+ 2. Run the demos
+--------------------------------------------------------------------------------
+
+All commands are run from the repository root.
+
+C
+    ./zig-out/bin/node-c 0
+    ./zig-out/bin/node-c 3 1000 64
+
+C++
+    ./zig-out/bin/node-cpp 1
+    ./zig-out/bin/node-cpp 4 1000
+
+Python
+    python3 python/nodes.py 2
+    python3 python/nodes.py 3 1000 64
+
+The Python package finds the freshly built shared library by itself when run from a
+checkout -- no PYTHONPATH, no LD_LIBRARY_PATH, nothing to export. It needs no
+dependencies beyond the standard library.
+
+Via the build system instead, which rebuilds first if needed:
+
+    zig build run-c   -- 0
+    zig build run-cpp -- 3 1000 64
+
+
+--------------------------------------------------------------------------------
+ 3. A three-language system (three terminals)
+--------------------------------------------------------------------------------
+
+Pick a registry port so this run cannot collide with anything else you have
+going, and use the SAME port in every terminal -- that is what makes the nodes
+find each other.
+
+  Terminal 1 -- C publisher:
+
+    export QNNT_REGISTRY_PORT=22400
+    ./zig-out/bin/node-c 0
+
+  Terminal 2 -- C++ publisher and subscriber:
+
+    export QNNT_REGISTRY_PORT=22400
+    ./zig-out/bin/node-cpp 1
+
+  Terminal 3 -- Python subscriber:
+
+    export QNNT_REGISTRY_PORT=22400
+    python3 python/nodes.py 2
+
+Terminal 2 prints test/topic-a arriving from the C node:
+
+    [1787918548717.511] (+7229us) node-cpp 1 received on test/topic-a: ciao!
+
+Terminal 3 prints both topic-b (from C, 20 Hz) and topic-c (from C++, 1 kHz),
+each with its own counter:
+
+    [1787918548686.916] (+49274us) node-py 2 feed b #140 on test/topic-b: !oaic
+    [1787918470730.900] (+1000us) node-py 2 feed c #6981 on test/topic-c: hola!
+
+Start the terminals in any order. A subscriber whose topic does not exist yet
+retries, so nothing has to be brought up first.
+
+
+--------------------------------------------------------------------------------
+ 4. The TLD benchmark (two or three terminals)
+--------------------------------------------------------------------------------
+
+One publisher, any number of subscribers, in any languages.
+
+  Terminal 1 -- generate load (1 kHz, 64-byte payloads):
+
+    export QNNT_REGISTRY_PORT=22402
+    ./zig-out/bin/node-c 3 1000 64
+
+  Terminal 2 -- measure it:
+
+    export QNNT_REGISTRY_PORT=22402
+    ./zig-out/bin/node-cpp 4 1000
+
+  Terminal 3 -- measure it from Python too:
+
+    export QNNT_REGISTRY_PORT=22402
+    python3 python/nodes.py 4 1000
+
+Typical output, same stream seen from both:
+
+    node-c 3 sent 1000 frames/s (87.9 KB/s), 10044 total
+    node-cpp 4 1000 frames/s | wire 87.9 KB/s | lat us min 28 mean 63 p50 64
+              p99 96 max 355 | gaps 0 badpay 0 err 0 | 9004 total
+    node-py 4 1000 frames/s | wire 87.9 KB/s | lat us min 81 mean 190 p50 210
+              p99 268 max 673 | gaps 0 badpay 0 err 0 | 7003 total
+
+Reading it:
+
+  gaps      missing sequence numbers. Should be 0; anything else means frames
+            were mis-parsed, since TCP does not lose bytes.
+  badpay    payload bytes that did not match the generator's 0..255 pattern.
+            Should be 0. The pattern deliberately contains 0x0A and 0xFF, so a
+            framing mistake shows up here.
+  lat       encode -> publish -> loopback -> read -> decode, end to end. It is
+            not decode cost; the decoder itself is tens of nanoseconds.
+
+The latency difference between the two subscribers is the cost of the language
+boundary, not of the protocol: Python pays for the ctypes crossing and for
+building an object per message.
+
+Other rates to try:
+
+    ./zig-out/bin/node-c 3 10000 64      100 Hz
+    ./zig-out/bin/node-c 3 50 64         20 kHz
+    ./zig-out/bin/node-c 3 0 64          unpaced -- as fast as the machine goes,
+                                         which will busy one core
+    ./zig-out/bin/node-c 3 2000 65536    500 Hz of 64 KiB payloads (~32 MB/s)
+
+A pure-Python generator (python3 python/nodes.py 3 1000 64) reaches roughly
+950-1000 frames/s rather than a flat 1000: the interpreter, not the transport. It
+reports what it actually achieved.
+
+
+--------------------------------------------------------------------------------
+ 5. Inspecting a running system
+--------------------------------------------------------------------------------
+
+The registry speaks a plain line protocol, so any running system can be examined
+with netcat. Use the port your nodes are on:
+
+    nc 127.0.0.1 22400
+
+Then type:
+
+    help                    the command list
+    list                    every topic: publisher, subscriber count, age,
+                            origin, state
+    subs test/topic-a       one line per subscriber: peer, connected, messages
+    peers                   federation peers: state, last sync, entries learned
+    status                  uptime, topic count, node id, addressing, timings
+    quit
+
+For example:
+
+    # topic         publisher              subs  refreshed  age   origin  state
+      test/topic-a  tcp://127.0.0.1:60373  1     1.5s       6.0s  local   live
+      test/topic-c  tcp://127.0.0.1:60377  0     0.5s       5.0s  82ff671c  live
+    # 2 topic(s)
+    # end
+
+Reading the columns:
+
+  origin    "local" if a node on this host publishes it, otherwise the first 8
+            hex digits of the node that does. Anything not "local" arrived by
+            federation (section 7).
+  state     live, stale (the publisher has stopped refreshing), or CONFLICT --
+            two hosts publishing the same topic name. On a conflict each host
+            keeps its own publisher and flags the clash rather than silently
+            hiding one of them.
+
+Lines beginning with '#' are commentary and are ignored by the nodes themselves,
+so anything shown to a human can be added without breaking a parser. Every
+non-empty reply ends with '# end', which is how a client knows a multi-line reply
+is complete instead of having to guess with a timeout.
+
+
+--------------------------------------------------------------------------------
+ 6. The registry port
+--------------------------------------------------------------------------------
+
+Nodes find each other through a registry on a well-known port, default 2222. The
+first node to start plays the registry; the rest stand by and take over if it
+exits.
+
+Nodes on DIFFERENT ports are completely independent. Use that to keep a demo run
+away from anything else, and to run several unrelated systems on one machine:
+
+    QNNT_REGISTRY_PORT=22400 ./zig-out/bin/node-c 0
+
+QNNT_REGISTRY_PORT is read by the example programs, not by the library -- the
+library takes a port and leaves it to the caller to decide where it came from:
+
+    C / C++    qnnt_set_registry_port(port)   before qnnt_init()
+    Python     qnnt.Node(registry_port=port)
+    Zig        qnnt.setRegistryPort(port)      before qnnt.run()
+
+If a node prints
+
+    registry standing by (port 22400: error.AddressInUse)
+
+then another node already holds that port, which is normal and expected: exactly
+one node is the registry at a time. If you did not intend to share, use a
+different port.
+
+
+--------------------------------------------------------------------------------
+ 7. Spanning more than one host (federation)
+--------------------------------------------------------------------------------
+
+Everything above runs on one machine: the registry is host-local, and nodes find
+each other through it. Federation joins the registries of several hosts, so a
+subscriber on one host resolves a topic published on another and connects to it
+without knowing it is remote.
+
+Each node is given the addresses of its peers. Three settings, all optional and
+all needed together for federation to start:
+
+    QNNT_FEDERATION_PORT=2223      a port of its own; the registry port stays
+                                   loopback-only and is never exposed
+    QNNT_CLUSTER_KEY=some-secret   shared by every node in the cluster
+    QNNT_PEERS=10.0.0.8,10.0.0.9:2223    host or host:port, comma-separated
+
+Federation will NOT start without a cluster key, and says so. An unauthenticated
+directory reachable from a network lets anyone redirect a topic's subscribers,
+which is worse than not federating at all.
+
+  Terminal 1 -- host A, publishing:
+
+    export QNNT_CLUSTER_KEY=some-secret
+    QNNT_REGISTRY_PORT=24101 QNNT_FEDERATION_PORT=24201 ./zig-out/bin/node-c 0
+
+  Terminal 2 -- host B, subscribing, told where A is:
+
+    export QNNT_CLUSTER_KEY=some-secret
+    QNNT_REGISTRY_PORT=24102 QNNT_FEDERATION_PORT=24202 \
+      QNNT_PEERS=127.0.0.1:24201 python3 -u python/nodes.py 2
+
+(The two ports per node let both "hosts" run on one machine for a look at it;
+across real machines every node can keep the defaults and differ only in
+QNNT_PEERS.)
+
+B's registry then holds A's topics, marked with A's node id, and B's subscriber
+receives across the link:
+
+    # topic         publisher              subs  refreshed  age   origin    state
+      test/topic-a  tcp://127.0.0.1:55451  0     2.5s       7.5s  d5ee8c33  live
+      test/topic-b  tcp://127.0.0.1:55453  1     2.5s       7.5s  d5ee8c33  live
+
+    nc 127.0.0.1 24102   ->   peers
+    # peer                state      last sync  learned  attempts
+      127.0.0.1:24201     connected  2.5s             4         1
+    # plus 0 entr(ies) applied from peers that dialed us
+
+Notes worth having before deploying this:
+
+  Peer lists need not be symmetric. A node that dials nobody still federates
+  with anyone who dials it, and an entry learned from one peer is passed on to
+  the others, so a chain converges. A full mesh converges in one hop and is the
+  safer choice across gateways.
+
+  Nodes do not need to know their own address. An entry carries a port and,
+  optionally, a host; when the host is absent the peer substitutes the address
+  it reached the sender on. So a node can bind 0.0.0.0, or sit behind a gateway
+  that chooses its public address, and still be reachable. Set
+  QNNT_ADVERTISE_ADDR only to override that -- for a specific interface, say.
+
+  Changes propagate in milliseconds where a peer connection exists to push over,
+  and otherwise within one 5-second anti-entropy round. A node that only listens
+  cannot push, so a mutual mesh is what makes propagation immediate.
+
+  Entries whose origin goes quiet age out on their own: stale after 6s, no longer
+  handed out after 30s, forgotten after 5 minutes. There is no distributed delete
+  to go wrong -- 'unpub' simply stops refreshing.
+
+  Across the internet, run qnnt over a VPN or tunnel and treat that as a LAN. The
+  cluster key protects the directory's integrity, but the data plane
+  (publisher -> subscriber) has no authentication at all: anyone who can reach an
+  advertised publisher port can read that topic. Port-translating NAT without
+  forwarding cannot work either way, since inbound connections are impossible.
+
+  Language support is the same everywhere -- C, C++, Python and Zig all read the
+  same QNNT_* variables and expose the same setters. Python:
+
+    qnnt.Node(federation_port=24202, cluster_key="some-secret",
+              peers=["10.0.0.8:2223"])
+
+
+--------------------------------------------------------------------------------
+ 8. If something does not work
+--------------------------------------------------------------------------------
+
+No output in a subscriber
+    Check every terminal is on the same QNNT_REGISTRY_PORT. Different ports mean
+    different, isolated systems -- each will work, but they cannot see each other.
+
+Nodes from an earlier run still going
+    They hold their topics and keep publishing. Clear them out with:
+        pkill -f 'node-c|node-cpp|nodes.py'
+
+Python cannot find the library
+    Build it (zig build), and run from the repository root. To point at a specific
+    build explicitly:
+        export QNNT_LIBRARY=$PWD/zig-out/lib/libqnnt_c.dylib     # .so on Linux
+
+Benchmark numbers look poor
+    Build with -Doptimize=ReleaseFast. A debug build carries safety checks that
+    dominate the measurement.
+
+A node prints nothing while clearly working
+    Only when its output is redirected to a file, and only for Python: run it
+    with 'python3 -u'. The C and C++ examples set line buffering themselves.
+    Watched in a terminal, all of them print as they go.
+
+Federation does not start
+    It needs BOTH QNNT_FEDERATION_PORT and QNNT_CLUSTER_KEY; with a port and no
+    key it refuses and prints why. Check with 'status', which reports either
+    "federation off" or the port in use.
+
+Federated topics never appear
+    Check 'peers' on the node that should be learning them. "down" means it
+    cannot reach the peer; a mismatched QNNT_CLUSTER_KEY shows as repeated
+    AuthRejected in that node's output.
+
+
+--------------------------------------------------------------------------------
+ 9. The equivalent Zig nodes, and the rest of the build
+--------------------------------------------------------------------------------
+
+The original Zig nodes are the same five roles, one binary each:
+
+    zig build run-0        ...        zig build run-4
+    zig build run-3 -- 1000 64        arguments after --
+
+Everything else `zig build` can do:
+
+    zig build test         all tests, plus every example compiled and the
+                           self-checking demos run
+    zig build c-demo       TLD codec through the C ABI
+    zig build cpp-demo     TLD codec through the C++ wrapper
+    zig build node-demo    a whole node in C, both delivery modes at once
+    zig build python-demo  the Python package against the built library
+    zig build wheel        build a Python wheel with the library bundled
+    zig build wheel-test   install that wheel in a throwaway venv and test it
+    zig build run-c        the C node, role 0..4 as the first argument
+    zig build run-cpp      the C++ node, likewise

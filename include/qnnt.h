@@ -52,6 +52,36 @@ const char *qnnt_status_name(qnnt_status status);
 qnnt_status qnnt_set_registry_port(uint16_t port);
 uint16_t    qnnt_registry_port(void);
 
+/* Addressing. Both optional and both must precede qnnt_init.
+ *
+ * advertise: the address remote subscribers are told to dial. Leave it unset and a peer
+ *   fills it in from the address it reached this host on -- which is what lets a node that
+ *   binds 0.0.0.0, or sits behind a gateway that picks its public address, be reachable
+ *   without ever knowing its own address.
+ * bind: what publisher sockets listen on. Defaults to following the advertise address, so
+ *   loopback stays private and anything else listens on 0.0.0.0.
+ */
+qnnt_status qnnt_set_advertise_address(const char *addr);
+qnnt_status qnnt_set_bind_address(const char *addr);
+
+/* Federation across hosts. All optional, all before qnnt_init.
+ *
+ * Federation stays off unless BOTH a port and a cluster key are set: an unauthenticated
+ * directory reachable from a network lets anyone redirect a topic's subscribers.
+ *
+ * Peers need not know their own addresses. An entry carries a port and an optional host;
+ * when the host is absent the receiver substitutes the address it reached the sender on.
+ * A node can therefore bind 0.0.0.0, or sit behind a gateway that chooses its public
+ * address, and still be reachable.
+ *
+ * Port-translating NAT with no forwarding is the exception: inbound connections are
+ * impossible there, and no address rewriting changes that. Across the internet, run qnnt
+ * over a VPN or tunnel and treat it as a LAN.
+ */
+qnnt_status qnnt_set_federation_port(uint16_t port);
+qnnt_status qnnt_set_cluster_key(const char *key);
+qnnt_status qnnt_add_peer(const char *host, uint16_t port);
+
 /* Start the node: joins the registry election and brings up the worker threads. */
 qnnt_status qnnt_init(void);
 

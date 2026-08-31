@@ -75,6 +75,11 @@ class Node:
         self,
         *,
         registry_port: int | None = None,
+        advertise_addr: str | None = None,
+        bind_addr: str | None = None,
+        federation_port: int | None = None,
+        cluster_key: str | None = None,
+        peers: Sequence[str] | None = None,
         queue_capacity: int = 4096,
         handle_signals: bool = False,
     ) -> None:
@@ -95,6 +100,44 @@ class Node:
                 self._lib.qnnt_set_registry_port(registry_port),
                 f"set_registry_port({registry_port})",
             )
+
+        # Addressing. Both optional: unset means loopback, and once federation is on an
+        # unset advertise address is the normal case -- each peer fills in the address it
+        # reached this host on, so a node behind a gateway needs no idea of its own.
+        if advertise_addr is None:
+            advertise_addr = os.environ.get("QNNT_ADVERTISE_ADDR")
+        if advertise_addr:
+            _check(self._lib, self._lib.qnnt_set_advertise_address(advertise_addr.encode()),
+                   "set_advertise_address")
+        if bind_addr is None:
+            bind_addr = os.environ.get("QNNT_BIND_ADDR")
+        if bind_addr:
+            _check(self._lib, self._lib.qnnt_set_bind_address(bind_addr.encode()),
+                   "set_bind_address")
+
+        # Federation. Needs BOTH a port and a cluster key; the library refuses to expose an
+        # unauthenticated directory to a network.
+        if federation_port is None:
+            env_fed = os.environ.get("QNNT_FEDERATION_PORT")
+            federation_port = int(env_fed) if env_fed else None
+        if cluster_key is None:
+            cluster_key = os.environ.get("QNNT_CLUSTER_KEY")
+        if peers is None:
+            env_peers = os.environ.get("QNNT_PEERS")
+            peers = [p for p in env_peers.split(",") if p] if env_peers else None
+
+        if federation_port:
+            _check(self._lib, self._lib.qnnt_set_federation_port(federation_port),
+                   "set_federation_port")
+        if cluster_key:
+            _check(self._lib, self._lib.qnnt_set_cluster_key(cluster_key.encode()),
+                   "set_cluster_key")
+        for spec in peers or ():
+            host, _, port_text = spec.rpartition(":")
+            if not host:            # bare host, no port: use the federation port
+                host, port_text = spec, "0"
+            _check(self._lib, self._lib.qnnt_add_peer(host.encode(), int(port_text or 0)),
+                   f"add_peer({spec})")
         # Topics are retained by the library rather than copied, so the encoded bytes have
         # to be kept alive here for as long as the subscription exists.
         self._topics: dict[str, bytes] = {}

@@ -7,13 +7,18 @@ const Stream = net.Stream;
 /// second import. See `subscribeFrames` for how it meets the pub/sub data path.
 pub const Tld = @import("tld.zig");
 
+// Federating the registry across hosts. Kept in its own file: separate protocol, separate
+// listener, separate workers. What it reaches back into here is marked below under
+// "internal surface"; what this file uses from it is only the four calls named there.
+const federation = @import("federation.zig");
+
 const allocator = @import("alloc.zig").allocator;
 
 // The 0.16 std.Io interface: a concrete implementation (`Threaded`) provides the
 // `Io` fat pointer that every net/sleep call is threaded through. Both are process
 // globals so the value stays stable while worker threads borrow `io`.
 var io_impl: Io.Threaded = undefined;
-var io: Io = undefined;
+pub var io: Io = undefined;
 
 const QnntNode = struct {
     client: Stream,
@@ -25,7 +30,7 @@ const QnntNode = struct {
 // One subscriber of one topic. Only the node publishing that topic holds the
 // connections, so this is the shape it reports upward to the registry; see the
 // `report` command in the wire conventions below.
-const PeerRecord = struct {
+pub const PeerRecord = struct {
     address: net.IpAddress,
     connected_us: u64, // how long it had been connected when the report was taken
     messages: u64,
@@ -46,7 +51,7 @@ const PeerRecord = struct {
 // What the directory knows about one topic. The timestamps exist for the human side
 // of the interface: `pub` registrations are refreshed on a timer, so a registration
 // that stopped being refreshed is how a dead publisher becomes visible.
-const TopicEntry = struct {
+pub const TopicEntry = struct {
     endpoint: net.IpAddress,
     first_us: u64, // first time this topic was registered
     last_us: u64, // most recent refresh
@@ -60,10 +65,32 @@ const TopicEntry = struct {
     // The snapshot being assembled between `report begin` and `report end`, so a
     // half-delivered report never replaces a good one.
     pending: std.ArrayList(PeerRecord),
+
+    // --- provenance, for federation ---
+
+    /// Which node registered this topic. Compared as an opaque id, never parsed as an
+    /// address: see the note on `NodeId`.
+    origin: NodeId,
+
+    /// The origin's own clock when it last published this state. Only ever compared
+    /// against other versions from the SAME origin, which makes clock skew between hosts
+    /// irrelevant -- no vector clocks and no NTP dependency -- and is also what stops an
+    /// update from looping around a mesh forever.
+    version: u64,
+
+    /// When this node learned the entry. For a local registration that is the same as
+    /// `last_us`; for one learned from a peer it is how remote entries age out.
+    learned_us: u64,
+
+    /// Set when another origin tried to claim a topic this one already holds. First
+    /// registration wins, and the loser is reported rather than silently dropped: a
+    /// duplicate topic name across hosts is a misconfiguration, and one that hides a
+    /// publisher looks like "my data sometimes vanishes".
+    conflict: bool,
 };
 
-var directory: std.StringHashMap(TopicEntry) = .init(allocator);
-var directory_mutex: Io.Mutex = .init;
+pub var directory: std.StringHashMap(TopicEntry) = .init(allocator);
+pub var directory_mutex: Io.Mutex = .init;
 
 // When the current registry role was acquired, for `status`. Written by the registry
 // thread and read by client handlers, hence atomic.
@@ -102,7 +129,7 @@ var live_sockets_mutex: Io.Mutex = .init;
 // this are taken in one go, so ordinary publish pacing is untouched.
 const shutdown_poll_ms = 50;
 
-fn isShuttingDown() bool {
+pub fn isShuttingDown() bool {
     // A plain flag with no data published through it, so monotonic is enough — and it
     // is read once per published frame on the unpaced path.
     return shutting_down.load(.monotonic);
@@ -117,7 +144,7 @@ fn isShuttingDown() bool {
 // it, a worker spawned between `joinWorkers` moving the list out and the caller noticing
 // the flag lands in the fresh list, is never joined, and outlives `io` — which shows up
 // as the process failing at exit long after every visible operation succeeded.
-fn spawnWorker(comptime function: anytype, args: anytype) bool {
+pub fn spawnWorker(comptime function: anytype, args: anytype) bool {
     workers_mutex.lockUncancelable(io);
     defer workers_mutex.unlock(io);
 
@@ -139,7 +166,7 @@ fn spawnWorker(comptime function: anytype, args: anytype) bool {
 // blocking after it has passed would never be interrupted. Testing the flag under the
 // same lock leaves no gap: register before the break and the break sees you, register
 // after it and you are told to stop instead.
-fn trackSocket(socket: net.Socket, kind: @FieldType(TrackedSocket, "kind")) bool {
+pub fn trackSocket(socket: net.Socket, kind: @FieldType(TrackedSocket, "kind")) bool {
     live_sockets_mutex.lockUncancelable(io);
     defer live_sockets_mutex.unlock(io);
 
@@ -151,7 +178,7 @@ fn trackSocket(socket: net.Socket, kind: @FieldType(TrackedSocket, "kind")) bool
     return true;
 }
 
-fn untrackSocket(socket: net.Socket) void {
+pub fn untrackSocket(socket: net.Socket) void {
     live_sockets_mutex.lockUncancelable(io);
     defer live_sockets_mutex.unlock(io);
     for (live_sockets.items, 0..) |tracked, i| {
@@ -228,7 +255,7 @@ fn sleepUsInterruptible(us: u64) bool {
     return !isShuttingDown();
 }
 
-fn sleepMsInterruptible(ms: u64) bool {
+pub fn sleepMsInterruptible(ms: u64) bool {
     return sleepUsInterruptible(ms * 1000);
 }
 
@@ -281,6 +308,23 @@ pub const Qnnt = struct {
     pub const setRegistryPort = &setRegistryPortFn;
     pub const registryPort = &currentRegistryPort;
 
+    /// Addressing. Both must be set before `run()`. Defaults keep everything on
+    /// loopback, so a local deployment is unchanged and nothing is exposed unasked.
+    pub const setAdvertiseAddress = &setAdvertiseAddressFn;
+    pub const setBindAddress = &setBindAddressFn;
+    pub const advertiseAddress = &advertiseAddressFn;
+
+    /// This node's identity: 32 hex characters, random per process, independent of any
+    /// address. See the note on `NodeId` for why it is not derived from one.
+    pub const nodeIdText = &nodeIdTextFn;
+
+    /// Federation. All must be set before `run()`. Federation stays off unless a port
+    /// AND a cluster key are given.
+    pub const setFederationPort = &federation.setPort;
+    pub const setClusterKey = &federation.setClusterKey;
+    pub const addPeer = &federation.addPeer;
+    pub const federationEnabled = &federation.enabled;
+
     /// Opt in to handling Ctrl-C and SIGTERM. Off by default: a library must not
     /// install process-wide handlers behind its host's back, nor replace one the host
     /// already set. Call it after `run()` — see `installSignalHandlers`.
@@ -316,24 +360,28 @@ fn parseTcpUri(text: []const u8) !net.IpAddress {
 //  * failures answer with a single line starting "error: ";
 //  * the commands nodes depend on (`pub`, `sub`) answer in exactly one data line, and
 //    `sub`'s is the bare publisher URI. That shape is load-bearing — don't dress it up.
-const comment_prefix = "#";
+pub const comment_prefix = "#";
+
+// Written after every non-empty reply. Informational, so it is invisible to machine
+// clients, and it is what lets an interactive client know a reply is complete.
+pub const response_terminator = "# end\n";
 
 // A registration is considered stale once it has missed a few refresh cycles. Only
 // ever reported, never acted on: a stale entry is still served, since a publisher that
 // went quiet is not necessarily gone and the subscriber will retry anyway.
 const stale_after_us: u64 = 3 * registry_probe_interval_ms * 1000;
 
-const Reply = struct {
+pub const Reply = struct {
     text: []const u8, // heap-owned; caller frees
     close: bool = false, // hang up after sending, for `quit`
 };
 
-fn eqlAny(verb: []const u8, names: []const []const u8) bool {
+pub fn eqlAny(verb: []const u8, names: []const []const u8) bool {
     for (names) |name| if (std.ascii.eqlIgnoreCase(verb, name)) return true;
     return false;
 }
 
-fn ownedReply(buffer: *std.ArrayList(u8)) !Reply {
+pub fn ownedReply(buffer: *std.ArrayList(u8)) !Reply {
     return .{ .text = try buffer.toOwnedSlice(allocator) };
 }
 
@@ -342,7 +390,7 @@ fn usageReply(buffer: *std.ArrayList(u8), usage: []const u8) !Reply {
     return ownedReply(buffer);
 }
 
-fn errorReply(buffer: *std.ArrayList(u8), reason: []const u8) !Reply {
+pub fn errorReply(buffer: *std.ArrayList(u8), reason: []const u8) !Reply {
     try buffer.print(allocator, "error: {s}\n", .{reason});
     return ownedReply(buffer);
 }
@@ -366,7 +414,7 @@ fn clientCommand(command: []const u8) !Reply {
             try buffer.print(allocator, "error: malformed uri '{s}', expected tcp://<host>:<port>\n", .{uri});
             return ownedReply(&buffer);
         };
-        try registerTopic(topic, endpoint);
+        try registerTopic(topic, endpoint, node_id);
         try buffer.print(allocator, "ok\n", .{});
     } else if (eqlAny(verb, &.{"sub"})) {
         // Hand the subscriber the complete URI of the topic's publisher so it
@@ -375,11 +423,17 @@ fn clientCommand(command: []const u8) !Reply {
         directory_mutex.lockUncancelable(io);
         defer directory_mutex.unlock(io);
         if (directory.get(topic)) |entry| {
-            try buffer.print(allocator, "tcp://{f}\n", .{entry.endpoint});
+            // A remote entry whose origin has gone quiet is withheld rather than handed
+            // out: pointing a subscriber at an unreachable host only makes it retry.
+            if (!federation.entryIsServable(&entry, @intCast(nowMicrosFn()))) {
+                try buffer.print(allocator, "error: topic {s} expired\n", .{topic});
+            } else {
+                try buffer.print(allocator, "tcp://{f}\n", .{entry.endpoint});
+            }
         } else {
             try buffer.print(allocator, "error: topic {s} not found\n", .{topic});
         }
-    } else if (eqlAny(verb, &.{ "subs", "peers" })) {
+    } else if (eqlAny(verb, &.{"subs"})) {
         const topic = it.next() orelse return usageReply(&buffer, "subs <topic>");
         try writeSubscriberList(&buffer, topic);
     } else if (eqlAny(verb, &.{"report"})) {
@@ -417,6 +471,8 @@ fn clientCommand(command: []const u8) !Reply {
         } else {
             try buffer.print(allocator, "error: topic {s} not found\n", .{topic});
         }
+    } else if (eqlAny(verb, &.{"peers"})) {
+        try federation.writePeerList(&buffer);
     } else if (eqlAny(verb, &.{ "status", "stat" })) {
         try writeStatus(&buffer);
     } else if (eqlAny(verb, &.{"ping"})) {
@@ -441,29 +497,31 @@ fn writeHelp(buffer: *std.ArrayList(u8)) !void {
         \\#   sub <topic>          resolve a topic to its publisher URI
         \\#   pub <topic> <uri>    register or refresh a topic's publisher endpoint
         \\#   unpub <topic>        drop a registration
+        \\#   peers                federation peers: state, last sync, entries learned
         \\#   status               registry uptime, topic count, timings
         \\#   ping                 liveness check
         \\#   help                 this text
         \\#   quit                 close the connection
-        \\# aliases: ls, peers, rm, stat, h, ?, q, exit
+        \\# aliases: ls, rm, stat, h, ?, q, exit
         \\# subscriber figures come from the publishing nodes, which report them with
         \\# each refresh, so they lag by up to one probe interval; 'subs' says how stale.
         \\# node protocol: report <topic> begin | peer <uri> <connected_us> <msgs> | end
         \\# '#' lines are informational; failures reply "error: <reason>".
+        \\# every non-empty reply ends with '# end'.
         \\
     , .{});
 }
 
 // Human-readable age. The exact figure matters less than being able to tell at a
 // glance which registrations have gone quiet.
-fn formatAge(buf: []u8, age_us: u64) []const u8 {
+pub fn formatAge(buf: []u8, age_us: u64) []const u8 {
     const secs = age_us / 1_000_000;
     if (secs < 10) return std.fmt.bufPrint(buf, "{d}.{d}s", .{ secs, (age_us % 1_000_000) / 100_000 }) catch "?";
     if (secs < 60) return std.fmt.bufPrint(buf, "{d}s", .{secs}) catch "?";
     return std.fmt.bufPrint(buf, "{d}m{d:0>2}s", .{ secs / 60, secs % 60 }) catch "?";
 }
 
-fn writePadded(buffer: *std.ArrayList(u8), text: []const u8, width: usize) !void {
+pub fn writePadded(buffer: *std.ArrayList(u8), text: []const u8, width: usize) !void {
     try buffer.appendSlice(allocator, text);
     if (width > text.len) try buffer.appendNTimes(allocator, ' ', width - text.len);
 }
@@ -472,6 +530,10 @@ fn writePadded(buffer: *std.ArrayList(u8), text: []const u8, width: usize) !void
 const age_column_width = "refreshed".len;
 
 const subs_column_width = "subs".len;
+
+// "local", or the first 8 hex characters of a remote origin -- enough to tell origins
+// apart in a log without turning the table into a wall of hex.
+const origin_column_width = 8;
 
 // One row of the topic table. Header and data rows are both rendered from this, with
 // the same widths, so they cannot drift out of alignment.
@@ -482,6 +544,7 @@ const TopicRow = struct {
     subs: []const u8,
     refreshed: []const u8,
     age: []const u8,
+    origin: []const u8,
     state: []const u8,
 };
 
@@ -501,6 +564,8 @@ fn writeTopicRow(buffer: *std.ArrayList(u8), widths: TopicWidths, row: TopicRow)
     try writePadded(buffer, row.refreshed, age_column_width);
     try buffer.appendSlice(allocator, "  ");
     try writePadded(buffer, row.age, age_column_width);
+    try buffer.appendSlice(allocator, "  ");
+    try writePadded(buffer, row.origin, origin_column_width);
     try buffer.appendSlice(allocator, "  ");
     try buffer.appendSlice(allocator, row.state);
     try buffer.appendSlice(allocator, "\n");
@@ -541,6 +606,7 @@ fn writeTopicList(buffer: *std.ArrayList(u8)) !void {
         .subs = "subs",
         .refreshed = "refreshed",
         .age = "age",
+        .origin = "origin",
         .state = "state",
     });
 
@@ -559,6 +625,7 @@ fn writeTopicList(buffer: *std.ArrayList(u8)) !void {
         var refreshed_buf: [16]u8 = undefined;
         var age_buf: [16]u8 = undefined;
         var subs_buf: [16]u8 = undefined;
+        var origin_buf: [32]u8 = undefined;
 
         // "-" rather than "0" when the publisher has never reported: not knowing the
         // count is a different fact from knowing it is zero.
@@ -574,7 +641,15 @@ fn writeTopicList(buffer: *std.ArrayList(u8)) !void {
             .subs = subs,
             .refreshed = formatAge(&refreshed_buf, refreshed_us),
             .age = formatAge(&age_buf, now_us -| entry.value_ptr.first_us),
-            .state = if (is_stale) "stale" else "live",
+            .origin = if (std.mem.eql(u8, &entry.value_ptr.origin, &node_id))
+                "local"
+            else
+                formatNodeId(&origin_buf, entry.value_ptr.origin)[0..origin_column_width],
+            // A conflict is worth more than the liveness state: the entry is live, but a
+            // second origin is trying to publish the same topic name and losing.
+            .state = if (entry.value_ptr.conflict)
+                "CONFLICT"
+            else if (is_stale) "stale" else "live",
         });
     }
 
@@ -663,16 +738,30 @@ fn writeStatus(buffer: *std.ArrayList(u8)) !void {
 
     try buffer.print(allocator, "uptime {s}\n", .{uptime});
     try buffer.print(allocator, "topics {d}\n", .{topics});
+    var id_buf: [32]u8 = undefined;
+    try buffer.print(allocator, "node {s}\n", .{formatNodeId(&id_buf, node_id)});
+    try buffer.print(allocator, "advertise {s}\n", .{advertiseText()});
     try buffer.print(allocator, "port {d}\n", .{registry_port});
     try buffer.print(allocator, "probe-interval {d}ms\n", .{registry_probe_interval_ms});
     try buffer.print(allocator, "stale-after {d}ms\n", .{stale_after_us / 1000});
+    if (federation.currentPort() == 0) {
+        try buffer.print(allocator, "federation off\n", .{});
+    } else {
+        try buffer.print(allocator, "federation port {d}\n", .{federation.currentPort()});
+    }
 }
 
 // Record (or refresh) a topic's publisher endpoint in the discovery directory.
 // The topic key arrives in a transient network buffer, so it is heap-owned on
 // first insert and left untouched on refresh.
-fn registerTopic(topic: []const u8, endpoint: net.IpAddress) !void {
+fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId) !void {
     const now_us: u64 = @intCast(nowMicrosFn());
+
+    // Notified after the lock is released: waking a connector while holding the directory
+    // mutex would have it block on the very lock it needs to serialise what it was woken
+    // for.
+    var changed = false;
+    defer if (changed) federation.notifyChange();
 
     directory_mutex.lockUncancelable(io);
     defer directory_mutex.unlock(io);
@@ -690,16 +779,51 @@ fn registerTopic(topic: []const u8, endpoint: net.IpAddress) !void {
             .peers = .empty,
             .peers_us = 0,
             .pending = .empty,
+            .origin = origin,
+            .version = now_us,
+            .learned_us = now_us,
+            .conflict = false,
         };
-    } else {
-        // A refresh. The endpoint is re-read rather than assumed: a restarted
-        // publisher comes back on a different ephemeral port.
+        changed = true;
+        return;
+    }
+
+    // Same origin: an ordinary refresh. The endpoint is re-read rather than assumed,
+    // since a restarted publisher comes back on a different ephemeral port. Two local
+    // publishers of one topic still overwrite each other exactly as before, because they
+    // share this node's origin.
+    if (std.mem.eql(u8, &gop.value_ptr.origin, &origin)) {
+        // A moved endpoint is structural (the publisher restarted on a new port); a
+        // version bump on its own is just the refresh heartbeat.
+        if (!std.meta.eql(gop.value_ptr.endpoint, endpoint)) changed = true;
         gop.value_ptr.endpoint = endpoint;
         gop.value_ptr.last_us = now_us;
+        gop.value_ptr.version = now_us;
+        return;
     }
+
+    // A different origin holds this topic. A LOCAL publisher takes it over regardless of
+    // who got there first: this node is authoritative for topics its own publishers
+    // serve, and deferring to a remote claim would route local subscribers across the
+    // network while a perfectly good local publisher sits idle. First-wins settles
+    // clashes *between remote origins*; local always beats remote.
+    //
+    // Federation made this visible: a peer's entries arrive on connect, which is well
+    // before the local publisher's first refresh, so "first" was almost always the remote
+    // one and every host ended up preferring someone else's publisher.
+    gop.value_ptr.conflict = true;
+    gop.value_ptr.origin = origin;
+    gop.value_ptr.endpoint = endpoint;
+    gop.value_ptr.last_us = now_us;
+    gop.value_ptr.version = now_us;
+    gop.value_ptr.learned_us = now_us;
+    changed = true;
 }
 
 fn unregisterTopic(topic: []const u8) bool {
+    var removed = false;
+    defer if (removed) federation.notifyChange();
+
     directory_mutex.lockUncancelable(io);
     defer directory_mutex.unlock(io);
 
@@ -708,6 +832,7 @@ fn unregisterTopic(topic: []const u8) bool {
         entry.peers.deinit(allocator);
         entry.pending.deinit(allocator);
         allocator.free(kv.key); // owned on insert
+        removed = true;
         return true;
     }
     return false;
@@ -763,11 +888,17 @@ fn handleRegistryClient(client: Stream) !void {
 
     // Informational, so machine clients skip it; a human gets a hint instead of
     // connecting to silence and wondering whether anything is listening.
+    // Terminated like any other reply, so a client can use one "read until '# end'" loop
+    // from the moment it connects instead of special-casing the greeting.
     try writer.interface.writeAll("# qnnt registry, type 'help' for commands\n");
+    try writer.interface.writeAll(response_terminator);
 
     while (!isShuttingDown()) {
         const chunk = reader.interface.takeDelimiterInclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => return, // client closed
+            // Gone, cleanly (FIN) or not (RST, e.g. a client killed mid-command). Both are
+            // ordinary on an interactive port; propagating either printed a worker-thread
+            // stack trace and made a normal disconnect look like a fault.
+            error.EndOfStream, error.ReadFailed => return,
             error.StreamTooLong => {
                 // A line too long for the read buffer. Say so and resynchronize on the
                 // next newline rather than dropping an interactive session over it.
@@ -775,12 +906,20 @@ fn handleRegistryClient(client: Stream) !void {
                 _ = reader.interface.discardDelimiterInclusive('\n') catch return;
                 continue;
             },
-            else => return err,
         };
 
         const reply = try clientCommand(chunk);
         defer allocator.free(reply.text);
         try writer.interface.writeAll(reply.text);
+
+        // Terminate every non-empty reply. Without this a client cannot tell where a
+        // multi-line reply ends and has to fall back on an idle timeout, which measured
+        // 81.6 ms per command against 0.47 ms when the length is known. It is an
+        // informational line, so machine clients skip it exactly as they skip the banner
+        // (see `takeReply`) and nothing that already works has to change. A blank input
+        // line still produces nothing at all, so no reply means no terminator either.
+        if (reply.text.len > 0) try writer.interface.writeAll(response_terminator);
+
         if (reply.close) return;
     }
 }
@@ -793,6 +932,29 @@ fn takeReply(reader: *Io.Reader) Io.Reader.DelimiterError![]u8 {
         const line = try reader.takeDelimiterInclusive('\n');
         if (!std.mem.startsWith(u8, line, comment_prefix)) return line;
     }
+}
+
+// Consume the rest of a reply, terminator included.
+//
+// Not tidiness -- required. Closing a socket that still holds unread received data makes
+// the kernel send RST rather than FIN, and the peer's next read then fails with
+// ECONNRESET. Leaving the '# end' line unread was enough to make every registration close
+// abortively, which showed up as a stack trace from the registry's client handler on a
+// node that was doing nothing but running.
+//
+// The returned slice from `takeReply` points into the reader's buffer, so callers must
+// finish with the line before draining.
+fn drainReply(reader: *Io.Reader) void {
+    while (true) {
+        const line = reader.takeDelimiterInclusive('\n') catch return;
+        if (std.mem.startsWith(u8, line, "# end")) return;
+    }
+}
+
+// Read a reply and discard it, leaving the connection on a reply boundary.
+fn discardReply(reader: *Io.Reader) void {
+    _ = takeReply(reader) catch return;
+    drainReply(reader);
 }
 
 // The registry lives on a well-known port. Every node contends for it; whoever binds
@@ -810,6 +972,102 @@ fn takeReply(reader: *Io.Reader) Io.Reader.DelimiterError![]u8 {
 // SO_REUSEADDR alone is exactly the fix: it permits binding over TIME_WAIT while two
 // listeners on one address still collide. Since std bundles the two options together,
 // the listener is opened by hand in `listenRegistry`.
+// ---------------------------------------------------------------- node identity
+//
+// A node's identity is a random 128-bit id, NOT its address.
+//
+// That is forced by how nodes are actually deployed: a host may bind 0.0.0.0 and have no
+// idea which of its addresses a peer will reach it on, and behind a gateway its public
+// address is chosen by the gateway and never visible locally at all. An address-derived
+// identity would be unknowable to its owner, and would change whenever the gateway's
+// choice changed.
+//
+// So identity and reachability are separated. The id names the origin of a directory
+// entry and is what version comparisons and loop suppression key on. Addresses are
+// routing hints, and the rule for them is that the OBSERVER decides: whoever wants to
+// dial a publisher uses the address it reached that publisher's host on, paired with the
+// port from the entry. A node never has to know its own address for others to reach it.
+pub const NodeId = [16]u8;
+
+pub var node_id: NodeId = @splat(0);
+var node_id_set = false;
+
+fn ensureNodeId() void {
+    if (node_id_set) return;
+    io.random(&node_id);
+    node_id_set = true;
+}
+
+pub fn formatNodeId(buf: *[32]u8, id: NodeId) []const u8 {
+    return std.fmt.bufPrint(buf, "{x}", .{id}) catch buf[0..0];
+}
+
+/// This node's id, as 32 hex characters. Stable for the process lifetime.
+pub fn nodeIdTextFn(buf: *[32]u8) []const u8 {
+    return formatNodeId(buf, node_id);
+}
+
+// ---------------------------------------------------------------- addressing
+//
+// Three addresses, previously all hardcoded to loopback:
+//
+//  * the registry listener stays on loopback, always. It carries the human interface and
+//    the destructive commands, and neither belongs on a network.
+//  * publishers bind `bind_addr` (what the socket listens on).
+//  * publishers advertise `advertise_addr` (what a subscriber is told to dial).
+//
+// The default is loopback for both, so a purely local deployment behaves exactly as
+// before and no port is exposed by accident. Setting an advertise address is the explicit
+// opt-in to being reachable, and `bind_addr` then defaults to 0.0.0.0 to match, because
+// advertising an address you are not listening on is never useful.
+//
+// The advertised address is NOT auto-detected. Multi-homed hosts, containers and NAT all
+// defeat "pick the first non-loopback interface", and a wrong guess here is a silent
+// data-path failure: a remote subscriber dials an address that either refuses or, worse,
+// reaches a different publisher holding that port on its own machine.
+
+const loopback_text = "127.0.0.1";
+const any_text = "0.0.0.0";
+
+var advertise_buf: [46]u8 = undefined; // fits IPv6 text
+pub var advertise_len: usize = 0; // 0 => loopback default
+var bind_buf: [46]u8 = undefined;
+var bind_len: usize = 0; // 0 => follow the advertise address
+
+pub fn advertiseText() []const u8 {
+    return if (advertise_len == 0) loopback_text else advertise_buf[0..advertise_len];
+}
+
+pub fn bindText() []const u8 {
+    if (bind_len != 0) return bind_buf[0..bind_len];
+    // Follow the advertise address: loopback stays private, anything else listens widely.
+    return if (advertise_len == 0) loopback_text else any_text;
+}
+
+/// The address remote subscribers are told to dial, with `port` filled in. Set it before
+/// `run()` to make this node reachable off-host.
+pub fn setAdvertiseAddressFn(text: []const u8) bool {
+    if (node_running or text.len > advertise_buf.len) return false;
+    // Parsed now so a bad address fails at configuration time, not at first publish.
+    _ = net.IpAddress.parse(text, 0) catch return false;
+    @memcpy(advertise_buf[0..text.len], text);
+    advertise_len = text.len;
+    return true;
+}
+
+/// The address publisher sockets bind. Defaults to following the advertise address.
+pub fn setBindAddressFn(text: []const u8) bool {
+    if (node_running or text.len > bind_buf.len) return false;
+    _ = net.IpAddress.parse(text, 0) catch return false;
+    @memcpy(bind_buf[0..text.len], text);
+    bind_len = text.len;
+    return true;
+}
+
+pub fn advertiseAddressFn() []const u8 {
+    return advertiseText();
+}
+
 pub const default_registry_port = 2222;
 
 // Latched once per `nodeRun` and fixed for that node's lifetime: the registry thread, the
@@ -821,7 +1079,7 @@ pub const default_registry_port = 2222;
 // anyway: the library takes a port, and the caller decides whether it came from a flag, an
 // env var or a constant.
 var registry_port: u16 = default_registry_port;
-var node_running = false;
+pub var node_running = false;
 
 /// Set the port the next `run()` will use. Returns false while a node is running, since
 /// the value is already in use by its workers; stop the node first.
@@ -842,12 +1100,19 @@ pub fn currentRegistryPort() u16 {
 
 // How often standby nodes re-check the port, publishers refresh their registration,
 // and subscribers re-poll for a topic URI.
-const registry_probe_interval_ms = 2000;
+pub const registry_probe_interval_ms = 2000;
 
 // Open the registry listener with SO_REUSEADDR but NOT SO_REUSEPORT; see the note on
 // `registry_port` for why std's one-flag-for-both is unusable here. Everything after
 // this is ordinary `net.Server`: accept, shutdown and deinit only use the handle.
 fn listenRegistry(addr: net.IpAddress) !net.Server {
+    return listenExclusiveOn(addr);
+}
+
+// SO_REUSEADDR but NOT SO_REUSEPORT: binding over a lingering TIME_WAIT must work, while
+// two live listeners on one address must still collide, since that collision IS the
+// election. std's `reuse_address` sets both, so the socket is opened by hand.
+pub fn listenExclusiveOn(addr: net.IpAddress) !net.Server {
     const posix = std.posix;
 
     const family = Io.Threaded.posixAddressFamily(&addr);
@@ -1007,9 +1272,9 @@ fn publisherSchedule(topic: []const u8, source: Qnnt.SourceHandler, period_us: u
 }
 
 fn nodePublish(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: u64, context: ?*anyopaque) !void {
-    // Bind to loopback with an ephemeral port (0); the OS fills in the real port,
-    // which we read back from the socket and register with the discovery directory.
-    const addr: net.IpAddress = try .parse("127.0.0.1", 0);
+    // Bind with an ephemeral port (0); the OS fills in the real port, which we read back
+    // from the socket.
+    const addr: net.IpAddress = try .parse(bindText(), 0);
 
     var server = try addr.listen(io, .{ .reuse_address = false });
     defer server.deinit(io);
@@ -1018,7 +1283,11 @@ fn nodePublish(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: u64, c
     if (!trackSocket(server.socket, .listener)) return;
     defer untrackSocket(server.socket);
 
-    const endpoint = server.socket.address; // resolved, including the ephemeral port
+    // What we listen on and what we advertise are separate: binding 0.0.0.0 is useful,
+    // telling a subscriber to dial 0.0.0.0 is not. Take the port the OS chose and pair it
+    // with the address remote subscribers can actually reach.
+    var endpoint: net.IpAddress = try .parse(advertiseText(), 0);
+    endpoint.setPort(server.socket.address.getPort());
 
     {
         subscribers_mutex.lockUncancelable(io);
@@ -1109,7 +1378,7 @@ fn registerOnce(topic: []const u8, endpoint: net.IpAddress) !void {
 
     const cmd = try std.fmt.bufPrint(&cmdbuf, "pub {s} tcp://{f}\n", .{ topic, endpoint });
     try writer.interface.writeAll(cmd);
-    _ = takeReply(&reader.interface) catch {}; // best-effort ack
+    discardReply(&reader.interface); // ack; drained so the close stays orderly
 
     const now_us: u64 = @intCast(nowMicrosFn());
     const peers = try snapshotPeers(topic, now_us);
@@ -1119,7 +1388,7 @@ fn registerOnce(topic: []const u8, endpoint: net.IpAddress) !void {
     // leaves the previous snapshot in place instead of a truncated one.
     const begin = try std.fmt.bufPrint(&cmdbuf, "report {s} begin\n", .{topic});
     try writer.interface.writeAll(begin);
-    _ = takeReply(&reader.interface) catch {};
+    discardReply(&reader.interface);
 
     // Each line is acknowledged before the next is sent: it keeps this in lockstep
     // with the registry rather than pushing an unbounded batch at it.
@@ -1131,12 +1400,12 @@ fn registerOnce(topic: []const u8, endpoint: net.IpAddress) !void {
             peer.messages,
         });
         try writer.interface.writeAll(line);
-        _ = takeReply(&reader.interface) catch {};
+        discardReply(&reader.interface);
     }
 
     const end = try std.fmt.bufPrint(&cmdbuf, "report {s} end\n", .{topic});
     try writer.interface.writeAll(end);
-    _ = takeReply(&reader.interface) catch {};
+    discardReply(&reader.interface);
 }
 
 fn registerLoop(topic: []const u8, endpoint: net.IpAddress) void {
@@ -1167,7 +1436,9 @@ fn resolveTopic(topic: []const u8) !net.IpAddress {
     var rbuf: [256]u8 = undefined;
     var reader = conn.reader(io, &rbuf);
     const line = try takeReply(&reader.interface);
-    return parseTcpUri(line); // errors (incl. "error: not found") -> caller retries
+    const parsed = parseTcpUri(line); // errors (incl. "error: not found") -> caller retries
+    drainReply(&reader.interface);
+    return parsed;
 }
 
 // Resolve `topic` through the registry, connect to its publisher, and deliver every
@@ -1491,7 +1762,7 @@ fn sleepUsFn(us: u64) void {
 }
 
 // Wall-clock time now, in microseconds since the Unix epoch.
-fn nowMicrosFn() i64 {
+pub fn nowMicrosFn() i64 {
     return Io.Timestamp.now(io, .real).toMicroseconds();
 }
 
@@ -1525,6 +1796,19 @@ pub fn installShutdownHandlers() void {
     std.posix.sigaction(.TERM, &act, null);
 }
 
+
+// ---------------------------------------------------------------- internal surface
+//
+// The declarations below are `pub` for one reason: `federation.zig` needs them, and Zig
+// has no narrower way to share state between two files of one module. They are internals,
+// not API — a library user should reach for `Qnnt` and `Tld` and nothing else here.
+//
+// Keeping them listed in one comment rather than scattering `pub` silently through the
+// file makes the coupling countable, which is the point: federation touches the directory
+// and its mutex, the node id, the worker and shutdown machinery, the addressing helpers,
+// the reply/formatting helpers used by its `peers` output, and the SO_REUSEADDR listener.
+// If that list starts growing, the split is in the wrong place.
+
 pub fn nodeRun() bool {
     // Cleared here rather than only in nodeDeinit, so a node can be started again after
     // being stopped — which is the whole point of having a shutdown path.
@@ -1535,12 +1819,17 @@ pub fn nodeRun() bool {
     io_impl = .init(allocator, .{});
     io = io_impl.io();
 
+    ensureNodeId(); // needs `io` for randomness, so it cannot happen any earlier
+
     // Signal handlers are deliberately NOT installed here; see installShutdownHandlers.
 
     if (!spawnWorker(registryRun, .{})) {
         std.debug.print("error spawning registry thread\n", .{});
         return false;
     }
+
+    federation.start();
+
     sleepMsFn(5);
     return true;
 }
@@ -1587,6 +1876,9 @@ pub fn publisherRun(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: ?
 // function used to do — frees `io` out from under threads still parked in `accept`.
 pub fn nodeDeinit() void {
     shutting_down.store(true, .monotonic);
+    // Wakes any federation connector parked on its change futex, so shutdown does not
+    // wait out an anti-entropy interval.
+    federation.wakeForShutdown();
     breakLiveSockets();
     breakSubscriberStreams();
     joinWorkers();
@@ -1630,6 +1922,7 @@ pub fn nodeDeinit() void {
     io_impl.deinit();
     node_running = false;
 }
+
 
 test {
     _ = @import("./qnnt.test.zig");
