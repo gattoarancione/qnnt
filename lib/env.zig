@@ -18,7 +18,7 @@
 //!   QNNT_BIND_ADDR         what publisher sockets bind
 //!   QNNT_CLUSTER_KEY       enables federation; required for it
 //!   QNNT_FEDERATION_PORT   federation's port (default 2223, 0 disables)
-//!   QNNT_PEERS             host[:port],host[:port],... to dial
+//!   QNNT_PEERS             host[:port],... to dial; host may be an address or a name
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -41,6 +41,38 @@ fn parsePort(text: []const u8) ?u16 {
     return std.fmt.parseInt(u16, text, 10) catch null;
 }
 
+/// Split a peer spec into host and port, where a port of 0 means "none given".
+///
+/// Splitting on the last colon is not enough on its own: a bare IPv6 literal is all
+/// colons, and `fe80::1` would come apart into the host `fe80:` on port 1. The bracketed
+/// form is the standard way to say where the address stops, so:
+///
+///   [fe80::1]:2223   bracketed, with a port
+///   [fe80::1]        bracketed, no port
+///   fe80::1          two or more colons and no brackets, so all address, no port
+///   10.0.0.9:2223    one colon, so host and port
+///   nodeb.local      no colon
+fn splitHostPort(spec: []const u8) struct { host: []const u8, port: u16 } {
+    if (spec.len != 0 and spec[0] == '[') {
+        if (std.mem.indexOfScalar(u8, spec, ']')) |close| {
+            const host = spec[1..close];
+            const rest = spec[close + 1 ..];
+            if (rest.len > 1 and rest[0] == ':') {
+                if (parsePort(rest[1..])) |value| return .{ .host = host, .port = value };
+            }
+            return .{ .host = host, .port = 0 };
+        }
+    }
+
+    const colons = std.mem.count(u8, spec, ":");
+    if (colons == 1) {
+        const colon = std.mem.indexOfScalar(u8, spec, ':').?;
+        if (parsePort(spec[colon + 1 ..])) |value| return .{ .host = spec[0..colon], .port = value };
+    }
+
+    return .{ .host = spec, .port = 0 };
+}
+
 // A rejected setting is reported, never dropped in silence. Quietly discarding
 // configuration is what made this class of problem invisible.
 fn reject(name: []const u8, value: []const u8) void {
@@ -54,8 +86,14 @@ fn reject(name: []const u8, value: []const u8) void {
 /// pretending to have read a configuration it could not see.
 pub fn configureFromEnvironment() void {
     if (!builtin.link_libc) {
+        // Loud, because the consequence is that NOTHING was configured: a node would come
+        // up on its defaults with no cluster key and no peers, and the only symptom is a
+        // port that never appears. Zig links no libc by default on Linux, so this is a
+        // platform difference, not a rare edge case.
         std.debug.print(
-            "qnnt: configureFromEnvironment needs libc for getenv; configure explicitly\n",
+            "qnnt: configureFromEnvironment() did nothing -- this binary is not linked " ++
+                "against libc, so getenv is unavailable and EVERY QNNT_* variable was " ++
+                "ignored. Build with libc (link_libc = true) or configure explicitly.\n",
             .{},
         );
         return;
@@ -92,15 +130,36 @@ pub fn configureFromEnvironment() void {
             const trimmed = std.mem.trim(u8, spec, " \t");
             if (trimmed.len == 0) continue;
 
-            // Split on the LAST colon, so an IPv6 literal is not cut at its first one.
-            if (std.mem.lastIndexOfScalar(u8, trimmed, ':')) |colon| {
-                if (parsePort(trimmed[colon + 1 ..])) |value| {
-                    if (!federation.addPeer(trimmed[0..colon], value)) reject("QNNT_PEERS", trimmed);
-                    continue;
-                }
-            }
-            // No port given: 0 means "use the federation port".
-            if (!federation.addPeer(trimmed, 0)) reject("QNNT_PEERS", trimmed);
+            const split = splitHostPort(trimmed);
+            // A port of 0 means "use the federation port".
+            if (!federation.addPeer(split.host, split.port)) reject("QNNT_PEERS", trimmed);
         }
+    }
+}
+
+// -- tests ------------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "splitHostPort understands v4, v6 and names" {
+    const cases = [_]struct { spec: []const u8, host: []const u8, port: u16 }{
+        .{ .spec = "10.0.0.9:2223", .host = "10.0.0.9", .port = 2223 },
+        .{ .spec = "10.0.0.9", .host = "10.0.0.9", .port = 0 },
+        .{ .spec = "nodeb.local:2223", .host = "nodeb.local", .port = 2223 },
+        .{ .spec = "nodeb.local", .host = "nodeb.local", .port = 0 },
+        // The case the old last-colon split got wrong: no brackets, so it is all address.
+        .{ .spec = "fe80::1", .host = "fe80::1", .port = 0 },
+        .{ .spec = "::1", .host = "::1", .port = 0 },
+        .{ .spec = "[fe80::1]:2223", .host = "fe80::1", .port = 2223 },
+        .{ .spec = "[fe80::1]", .host = "fe80::1", .port = 0 },
+        // A port that is not a number is not a port; the whole spec stays the host, and
+        // fails later as an unresolvable name rather than being silently truncated.
+        .{ .spec = "nodeb.local:http", .host = "nodeb.local:http", .port = 0 },
+    };
+
+    for (cases) |c| {
+        const got = splitHostPort(c.spec);
+        try testing.expectEqualStrings(c.host, got.host);
+        try testing.expectEqual(c.port, got.port);
     }
 }

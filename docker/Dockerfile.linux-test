@@ -1,0 +1,22 @@
+# Runs cross-compiled Linux binaries with no toolchain in the image.
+#
+# Zig cross-compiles the whole library, sockets and threads included, so the binaries are
+# built on the host and only executed here. That keeps the image tiny and means the thing
+# under test is exactly the artefact that would ship.
+#
+# glibc, because `zig build -Dtarget=*-linux-gnu` links against it. For a musl build
+# (-Dtarget=*-linux-musl) use alpine instead.
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends netcat-openbsd python3 file procps \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /qnnt
+COPY zig-out/bin/ /qnnt/bin/
+COPY zig-out/lib/ /qnnt/lib/
+COPY python/ /qnnt/python/
+COPY docker/run-tests.sh /qnnt/run-tests.sh
+
+ENV QNNT_LIBRARY=/qnnt/lib/libqnnt_c.so
+ENTRYPOINT ["/bin/bash", "/qnnt/run-tests.sh"]

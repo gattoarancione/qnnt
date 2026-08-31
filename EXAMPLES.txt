@@ -263,7 +263,7 @@ The cluster key is the switch. Set one and federation starts; leave it unset and
 it does not:
 
     QNNT_CLUSTER_KEY=some-secret   shared by every node in the cluster -- REQUIRED
-    QNNT_PEERS=10.0.0.8,10.0.0.9   host or host:port, comma-separated
+    QNNT_PEERS=10.0.0.8,nodeb.local  address or hostname, optional :port, comma-separated
     QNNT_FEDERATION_PORT=2223      optional; 2223 by default, and 0 disables
 
 The key is not optional because an unauthenticated directory reachable from a
@@ -285,6 +285,27 @@ On real hosts that is the whole configuration: a key everywhere, and each node's
 QNNT_PEERS naming the others. The port only needs setting when several nodes share
 one machine, since they cannot all bind 2223 -- and a node that loses that race
 says so rather than failing quietly.
+
+Peers may be given as addresses or as hostnames. Names go through the system resolver, so
+/etc/hosts, resolv.conf, search domains and mDNS names all work:
+
+    QNNT_PEERS=nodeb.local,10.0.0.9:2223,[fe80::1]:2223,fe80::2
+
+The port is optional and defaults to QNNT_FEDERATION_PORT. An IPv6 address needs brackets
+only when a port follows it -- without them there is no telling where the address stops.
+
+A name is re-resolved on every connection attempt rather than once at startup, so a peer
+that changes address is followed, and a name that does not resolve until the network comes
+up needs no restart. The address a name resolved to is reported next to it:
+
+    federation: synced with nodeb.local:2223 (10.0.0.9)
+
+A name that does not exist is reported as UnknownHost, and one that may work later -- no
+DNS server reachable yet -- as TemporaryResolveFailure, so a peer that never connects says
+why. QNNT_ADVERTISE_ADDR and QNNT_BIND_ADDR accept names too, but resolve once at startup
+and are stored as the resulting address: what a publisher advertises has to be something
+every subscriber can parse, including ones that cannot resolve the name.
+
 
   Terminal 1 -- host A, publishing:
 

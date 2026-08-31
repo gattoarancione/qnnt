@@ -49,6 +49,33 @@ def _check(lib: C.CDLL, status: int, context: str) -> None:
         raise Error(status, lib.qnnt_status_name(status).decode(), context)
 
 
+def _split_host_port(spec):
+    """Split a peer spec into (host, port); port 0 means "use the federation port".
+
+    Splitting on the last colon is wrong for IPv6 -- `fe80::1` would come apart into the
+    host `fe80:` on port 1 -- so brackets are how an address with a port says where it
+    stops. Mirrors splitHostPort in lib/env.zig, which parses QNNT_PEERS the same way:
+
+        nodeb.local        10.0.0.9:2223        [fe80::1]:2223        fe80::1
+
+    A host may be an address or a name; names are resolved by the library, per attempt.
+    """
+    if spec.startswith("["):
+        host, close, rest = spec[1:].partition("]")
+        if close and rest.startswith(":") and rest[1:].isdigit():
+            return host, int(rest[1:])
+        return host, 0
+
+    if spec.count(":") == 1:
+        host, _, port_text = spec.partition(":")
+        if port_text.isdigit():
+            return host, int(port_text)
+
+    # No port, or something that is not a number where one would go: the whole spec is the
+    # host, and an unusable one fails later by name rather than being silently truncated.
+    return spec, 0
+
+
 @dataclass(frozen=True)
 class Message:
     """One received message. `data` is already copied out of library storage."""
@@ -114,10 +141,8 @@ class Node:
             _check(self._lib, self._lib.qnnt_set_cluster_key(cluster_key.encode()),
                    "set_cluster_key")
         for spec in peers or ():
-            host, _, port_text = spec.rpartition(":")
-            if not host:            # bare host, no port: use the federation port
-                host, port_text = spec, "0"
-            _check(self._lib, self._lib.qnnt_add_peer(host.encode(), int(port_text or 0)),
+            host, port = _split_host_port(spec)
+            _check(self._lib, self._lib.qnnt_add_peer(host.encode(), port),
                    f"add_peer({spec})")
 
         _check(self._lib, self._lib.qnnt_init(), "init")

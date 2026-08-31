@@ -38,6 +38,7 @@ const allocator = @import("alloc.zig").allocator;
 const NodeId = qnnt.NodeId;
 const TopicEntry = qnnt.TopicEntry;
 const Reply = qnnt.Reply;
+const resolve = @import("resolve.zig");
 
 const max_peers = 32;
 const fed_sync_interval_ms = 5_000;
@@ -51,7 +52,9 @@ const fed_serve_until_us: u64 = 30 * std.time.us_per_s;
 const fed_forget_after_us: u64 = 300 * std.time.us_per_s;
 
 const Peer = struct {
-    host: [46]u8 = @splat(0),
+    // Wide enough for a hostname, not just an address literal: peers may be named, and the
+    // name is kept verbatim so it is re-resolved on every dial attempt.
+    host: [resolve.max_host_len]u8 = @splat(0),
     host_len: usize = 0,
     port: u16 = 0,
 
@@ -132,9 +135,17 @@ pub fn setClusterKey(key: []const u8) bool {
     return true;
 }
 
-/// Add a peer to dial. Peer lists need not be symmetric or complete: an entry learned
-/// from one peer is re-advertised to the others with its origin preserved, so a chain
-/// converges too.
+/// Add a peer to dial.
+///
+/// `host` is an IPv4 or IPv6 literal, or a hostname -- resolved through libc, so /etc/hosts,
+/// resolv.conf, mDNS and search domains all apply. A name is stored as written and resolved
+/// again on every dial attempt, so a peer that changes address, or a name that does not
+/// resolve until the network comes up, needs no restart. Resolution failures are reported by
+/// the connector, named: `UnknownHost` for a name that does not exist,
+/// `TemporaryResolveFailure` for one worth retrying.
+///
+/// Peer lists need not be symmetric or complete: an entry learned from one peer is
+/// re-advertised to the others with its origin preserved, so a chain converges too.
 pub fn addPeer(host: []const u8, port: u16) bool {
     if (qnnt.node_running or peer_count == max_peers or host.len == 0) return false;
     if (host.len > fed_peers[0].host.len) return false;
@@ -501,8 +512,7 @@ fn peerConnectorRun(index: usize) void {
     }
 }
 
-const SyncError = error{
-    BadPeerAddress,
+const SyncError = resolve.Error || error{
     ConnectFailed,
     ShuttingDown,
     NoNonce,
@@ -515,7 +525,9 @@ const SyncError = error{
 // Connect, authenticate, then exchange until the connection breaks or we are asked to
 // stop. Returns an error naming the step that failed, which is what the caller logs.
 fn serveePeer(peer: *Peer, announced_failure: *bool) SyncError!void {
-    const addr = net.IpAddress.parse(peer.hostText(), peer.port) catch return error.BadPeerAddress;
+    // Resolved per attempt, not once at configuration time, so a peer that moves is
+    // followed. This blocks the connector thread for as long as the system resolver takes.
+    const addr = try resolve.resolve(peer.hostText(), peer.port);
     var conn = addr.connect(qnnt.io, .{ .mode = .stream }) catch return error.ConnectFailed;
     defer conn.close(qnnt.io);
 
@@ -528,7 +540,13 @@ fn serveePeer(peer: *Peer, announced_failure: *bool) SyncError!void {
 
     // The address we dialed is the address that works for us, so it is what we attribute
     // this peer's own entries to when they decline to name a host.
-    const observed = peer.hostText();
+    //
+    // It has to be the RESOLVED address in numeric form, never the configured text: this
+    // string is written into the directory as an entry's host and every node that reads it
+    // back -- including nodes that never heard the name -- parses it as a literal. A
+    // hostname here would make the peer's entries undialable everywhere.
+    var observed_buf: [resolve.max_host_text]u8 = undefined;
+    const observed = resolve.hostText(addr, &observed_buf);
 
     try authenticate(&reader.interface, &writer.interface);
 
@@ -539,7 +557,16 @@ fn serveePeer(peer: *Peer, announced_failure: *bool) SyncError!void {
     // Announce a first connection and a recovery, but not every reconnect in a flapping
     // loop -- the failure side is already rate-limited the same way.
     if (announced_failure.* or peer.last_sync_us.load(.monotonic) == 0) {
-        std.debug.print("federation: synced with {s}:{d}\n", .{ peer.hostText(), peer.port });
+        // Naming the resolved address too, when the peer was configured as a name: which
+        // address a name landed on is the first thing worth knowing when a peer that
+        // "should" be reachable is not.
+        if (std.mem.eql(u8, observed, peer.hostText())) {
+            std.debug.print("federation: synced with {s}:{d}\n", .{ peer.hostText(), peer.port });
+        } else {
+            std.debug.print("federation: synced with {s}:{d} ({s})\n", .{
+                peer.hostText(), peer.port, observed,
+            });
+        }
         announced_failure.* = false;
     }
 

@@ -80,6 +80,17 @@ qnnt_status qnnt_set_bind_address(const char *addr);
  */
 qnnt_status qnnt_set_federation_port(uint16_t port);
 qnnt_status qnnt_set_cluster_key(const char *key);
+/*
+ * A peer to dial. `host` may be an IPv4 or IPv6 address, or a hostname -- names are
+ * resolved through the system resolver (so /etc/hosts, resolv.conf, search domains and
+ * mDNS all apply) and re-resolved on every connection attempt, so a peer that changes
+ * address is followed without a restart. Pass 0 for `port` to use the federation port.
+ *
+ * Note that qnnt_set_advertise_address and qnnt_set_bind_address also accept names, but
+ * resolve once, at the time of the call, and keep the resulting address: what a publisher
+ * advertises has to be parseable by every subscriber, including ones that cannot resolve
+ * the name.
+ */
 qnnt_status qnnt_add_peer(const char *host, uint16_t port);
 
 /* Apply configuration from the process environment, reading these if present:

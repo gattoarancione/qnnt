@@ -9,6 +9,16 @@ pub fn build(b: *Build) void {
         .root_source_file = b.path("lib/qnnt.zig"),
         .target = target,
         .optimize = optimize,
+            // libc is required, not incidental. Two things depend on it and both failed
+            // silently on Linux without it, while macOS masked the problem by always
+            // linking libSystem:
+            //   * `configureFromEnvironment` uses getenv, and `builtin.link_libc` is a
+            //     property of the MODULE being compiled -- a C program linking libc does
+            //     not make it true inside this library;
+            //   * std.Thread uses pthreads with libc and a raw-clone path without it, and
+            //     that path tripped an alignment assert on aarch64-linux at the first
+            //     spawnWorker, aborting qnnt_init outright.
+            .link_libc = true,
     });
 
     const qnnt_lib = b.addLibrary(.{
@@ -47,6 +57,8 @@ pub fn build(b: *Build) void {
         .root_source_file = b.path("lib/qnnt_c.zig"),
         .target = target,
         .optimize = optimize,
+        // Same reason as qnnt_lib_mod above: getenv and pthreads.
+        .link_libc = true,
     });
 
     var qnnt_c_static: *Build.Step.Compile = undefined;
@@ -69,12 +81,13 @@ pub fn build(b: *Build) void {
     // These used to need serialising, because every node contended for one well-known
     // registry port and build steps run in parallel. Each now uses a port of its own
     // (22300 tests, 22301 the C node demo, 22302 Python), so they are independent.
-    for ([_][]const u8{ "lib/tld.zig", "lib/qnnt.zig" }) |src| {
+    for ([_][]const u8{ "lib/tld.zig", "lib/resolve.zig", "lib/env.zig", "lib/qnnt.zig" }) |src| {
         const tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(src),
                 .target = target,
                 .optimize = optimize,
+                .link_libc = true, // threads and getenv, as above
             }),
         });
         test_step.dependOn(&b.addRunArtifact(tests).step);
@@ -245,6 +258,12 @@ pub fn build(b: *Build) void {
             .root_source_file = b.path(node.src),
             .target = target,
             .optimize = optimize,
+            // Needed for getenv, which is how `configureFromEnvironment` reads QNNT_*.
+            // Without it Zig links no libc on Linux (macOS always links libSystem), the
+            // binary comes out static, and every environment variable is silently
+            // ignored -- which is exactly how a node ended up with no cluster key and no
+            // federation port on Linux while working on macOS.
+            .link_libc = true,
         });
 
         const exe = b.addExecutable(.{

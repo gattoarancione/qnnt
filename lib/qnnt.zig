@@ -11,6 +11,7 @@ pub const Tld = @import("tld.zig");
 // listener, separate workers. What it reaches back into here is marked below under
 // "internal surface"; what this file uses from it is only the four calls named there.
 const federation = @import("federation.zig");
+const resolve = @import("resolve.zig");
 
 const allocator = @import("alloc.zig").allocator;
 
@@ -1033,9 +1034,9 @@ pub fn nodeIdTextFn(buf: *[32]u8) []const u8 {
 const loopback_text = "127.0.0.1";
 const any_text = "0.0.0.0";
 
-var advertise_buf: [46]u8 = undefined; // fits IPv6 text
+var advertise_buf: [resolve.max_host_text]u8 = undefined; // fits IPv6 text
 pub var advertise_len: usize = 0; // 0 => loopback default
-var bind_buf: [46]u8 = undefined;
+var bind_buf: [resolve.max_host_text]u8 = undefined;
 var bind_len: usize = 0; // 0 => follow the advertise address
 
 pub fn advertiseText() []const u8 {
@@ -1064,20 +1065,33 @@ pub fn bindText() []const u8 {
 /// The address remote subscribers are told to dial, with `port` filled in. Set it before
 /// `run()` to make this node reachable off-host.
 pub fn setAdvertiseAddressFn(text: []const u8) bool {
-    if (node_running or text.len > advertise_buf.len) return false;
-    // Parsed now so a bad address fails at configuration time, not at first publish.
-    _ = net.IpAddress.parse(text, 0) catch return false;
-    @memcpy(advertise_buf[0..text.len], text);
-    advertise_len = text.len;
+    if (node_running) return false;
+    // Resolved now, and stored as the numeric result rather than as written. Two reasons:
+    // a bad address fails at configuration time instead of at first publish, and what goes
+    // out as a publisher endpoint must be something every subscriber can parse as a
+    // literal -- a hostname only this host can resolve would be useless to them.
+    const addr = resolve.resolve(text, 0) catch return false;
+    var numeric_buf: [resolve.max_host_text]u8 = undefined;
+    const numeric = resolve.hostText(addr, &numeric_buf);
+    if (numeric.len == 0 or numeric.len > advertise_buf.len) return false;
+    @memcpy(advertise_buf[0..numeric.len], numeric);
+    advertise_len = numeric.len;
     return true;
 }
 
 /// The address publisher sockets bind. Defaults to following the advertise address.
 pub fn setBindAddressFn(text: []const u8) bool {
-    if (node_running or text.len > bind_buf.len) return false;
-    _ = net.IpAddress.parse(text, 0) catch return false;
-    @memcpy(bind_buf[0..text.len], text);
-    bind_len = text.len;
+    if (node_running) return false;
+    // Resolved and stored numerically, as above. A bind address is also deliberately
+    // resolved only once: it decides which local interface sockets attach to, and having
+    // that drift underneath a running node because a name started answering differently
+    // would be a surprise, not a feature.
+    const addr = resolve.resolve(text, 0) catch return false;
+    var numeric_buf: [resolve.max_host_text]u8 = undefined;
+    const numeric = resolve.hostText(addr, &numeric_buf);
+    if (numeric.len == 0 or numeric.len > bind_buf.len) return false;
+    @memcpy(bind_buf[0..numeric.len], numeric);
+    bind_len = numeric.len;
     return true;
 }
 
