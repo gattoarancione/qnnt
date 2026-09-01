@@ -25,6 +25,9 @@ Short version:
   * on-board and uncontended, the round trip is bounded under 1.1 ms across 18,000 trips
     for 9% of one of four cores. Under CPU contention that bound needs SCHED_FIFO, which
     QNNT_RT_PRIORITY now provides: p99 goes from ~5 ms back to 128 us. Sections B.5, B.7.
+  * the whole of target B re-run with that configuration is in B.8, including the two places
+    it does not help: throughput is unchanged, and on an unpaced publisher a real-time
+    priority costs 10% and adds 50 ms stalls via the kernel's RT throttle.
   * its round trip bottoms out below ICMP's minimum on both paths, so the transport adds
     nothing measurable to a network round trip.
   * on target B, entirely on-board, the round trip is bounded under 1.1 ms across 18,000
@@ -487,6 +490,107 @@ Do not combine it with an unpaced publisher (period_us 0). That is a busy loop a
 priority above everything else on its core, held back only by the kernel's RT throttle
 (sched_rt_runtime_us, 950 ms of each second by default). The library warns if asked to do
 both.
+
+
+B.8  the whole benchmark re-run with the full real-time configuration
+--------------------------------------------------------------------
+
+B.7 showed the two settings fixing the contended 1 kHz round trip. This is every other
+measurement in target B repeated with both of them on (QNNT_RT_PRIORITY=40,
+QNNT_LOCK_MEMORY=1), to see where they help, where they do nothing, and where they cost.
+The summary is that they are a latency configuration and behave like one: the tail improves
+by up to 3x, the medians barely move, throughput is unchanged, and one combination is
+actively worse.
+
+loopback throughput, unpaced publisher:
+
+  payload   default            FIFO 40 + mlockall     change
+  64 B      253,500 f/s        267,800 f/s            +5.7%
+            23.1 MB/s          24.4 MB/s
+  1 KiB     158,900 f/s        157,300 f/s            -1.0%
+            167.4 MB/s         165.5 MB/s
+  64 KiB    3,523 f/s          3,545 f/s              +0.6%
+            231.0 MB/s         232.4 MB/s
+
+  decode 419-435 ns/frame either way; gaps 0 and badpay 0 throughout
+
+Throughput is the same within noise, which is the expected and desired result -- nothing
+here should have made the transport faster, and nothing did.
+
+But look at the 64 B latency in that run: max went from 3.4 ms at default priority to
+40.7-42.1 ms with the real-time configuration. That is not a regression in qnnt, it is the
+kernel's real-time throttle. An unpaced publisher is a busy loop; at SCHED_FIFO it is a
+busy loop the scheduler cannot preempt, so sched_rt_runtime_us suspends it for 50 ms of
+every second, and a ~40 ms stall is exactly what that looks like from the subscriber. The
+library warns when asked for both, and this is the number behind the warning.
+
+The same thing costs throughput once the transport is the bottleneck rather than the link:
+
+  wired board -> mac, board on FIFO 40 + mlockall (link ceiling 117.6 MB/s)
+
+  payload   default            with the config        change
+  64 B      270,000 f/s        233,900-243,800 f/s    -10 to -13%
+            24.9 MB/s          21.5-22.4 MB/s         max latency 52.4 ms
+  1 KiB     117.67 MB/s        117.67 MB/s            line rate, identical
+  64 KiB    117.67 MB/s        117.67 MB/s            line rate, identical
+
+So: do not put a real-time priority on an unpaced, throughput-oriented publisher. At 1 KiB
+and above it makes no difference because the link is the limit; at 64 B it loses 10% and
+adds 50 ms stalls. Real-time priority is for paced, latency-sensitive work.
+
+on-board round trip, all four cells, paced so no throttle is involved:
+
+                        default             FIFO 40 + mlockall
+  20 Hz, idle           p50 832 us          p50 448-512 us
+                        p99 896 us          p99 512-832 us
+                        max 852-888 us      max 541-1,122 us
+  20 Hz, 4 cores busy   (not measured)      p50 128 us
+                                            p99 192 us
+                                            max 151-198 us
+  1 kHz, idle           p50 448 us          p50 448 us
+                        p99 768 us          p99 448-768 us
+                        max 785-1,077 us    max 768-1,071 us
+  1 kHz, 4 cores busy   p50 128 us          p50 128 us
+                        p99 3,648-5,376 us  p99 128 us
+                        max 6,312-47,132 us max 158-212 us
+
+Idle, the configuration changes little -- there is nothing to preempt and little to fault.
+Contended, it is the difference between a 5 ms p99 and a 128 us one. And the contended cells
+are faster than the idle ones at every percentile, for the reason given in B.3: busy cores
+do not have to come out of an idle state.
+
+across the wire, with only the board configured
+-----------------------------------------------
+
+The mac cannot take a real-time priority (macOS, refused), so this is the realistic
+deployment shape: the embedded target is configured, the workstation talking to it is not.
+node-6 on the mac, node-5 on the board, 1 KiB at 20 Hz over gigabit:
+
+                                  p50           p90           p99           max
+  board idle, board RT            2,240-2,304   2,368-2,432   2,496         2,470-2,533
+  board 4 cores busy, board RT    1,600-1,664   1,728-1,792   1,856-1,920   1,865-1,925
+  board 4 cores busy, default     1,600-1,664   1,728-1,792   3,968-5,248   5,248-5,551
+
+Read the last two rows together: identical medians and p90s, and a p99 that differs by
+2.7x with a worst case 2.9x apart. Configuring only the far end of the link still cuts the
+tail of a round trip that spends most of its time in the network and on an unconfigured
+mac. The tail was the board's scheduling, and now it is not.
+
+Also worth noting that the busy board answers *faster* at the median than the idle one
+(1.6 ms against 2.24 ms) even across the network -- the same hot-path effect, visible end
+to end.
+
+what to actually set
+--------------------
+
+  * a paced, latency-sensitive publisher or subscriber on a loaded machine: both settings.
+    That is the case they exist for, and it is worth up to 40x at p99.
+  * an unpaced or throughput-oriented publisher: neither. Give it a period if it needs a
+    priority, or leave it at default and let it run flat out.
+  * an idle machine: it makes little difference; set them anyway if the machine will not
+    always be idle, since the cost when nothing is contending is not measurable here.
+  * memory locking without a real-time priority is close to pointless -- the tail it removes
+    is small compared with the one scheduling leaves behind. Priority first, then locking.
 
 
 C.  reproducing any of it
