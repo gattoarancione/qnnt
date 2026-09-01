@@ -89,6 +89,16 @@ qnnt_status qnnt_set_lock_memory(uint8_t enabled);
 uint8_t qnnt_lock_memory(void);
 uint16_t    qnnt_registry_port(void);
 
+/* This node's identity as 32 hex characters plus a NUL: `cap` must be >= 33. Copied out,
+ * so the caller owns the buffer's lifetime. */
+qnnt_status qnnt_node_id(char *out, size_t cap);
+
+/* The address remote subscribers are told to dial, NUL-terminated. 46 bytes is enough. */
+qnnt_status qnnt_advertise_address(char *out, size_t cap);
+
+/* Non-zero when federation will actually run: a cluster key is set and a port is free. */
+uint8_t qnnt_federation_enabled(void);
+
 /* Addressing. Both optional and both must precede qnnt_init.
  *
  * advertise: the address remote subscribers are told to dial. Leave it unset and a peer
@@ -182,6 +192,11 @@ typedef const uint8_t *(*qnnt_source_fn)(const char *topic, size_t topic_len,
  * with no rounding step. */
 qnnt_status qnnt_publisher_start(const char *topic, size_t topic_len,
                                  qnnt_source_fn source, uint64_t period_us, void *user);
+
+/* Topic strings passed to qnnt_publisher_start, qnnt_subscribe, qnnt_subscribe_frames and
+ * qnnt_subscribe_queue are copied by the library, so a temporary is fine: a stack buffer, a
+ * QByteArray from toUtf8(), or a Python bytes object that is collected straight after. Only
+ * qnnt_publish borrows, and only for the duration of the call. */
 
 /* Publish one message. Payloads are arbitrary bytes if the topic's subscribers read
  * frames; readers using qnnt_subscribe expect newline-delimited text. */

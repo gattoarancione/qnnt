@@ -571,3 +571,34 @@ language is tested against it: Zig, C++ and Python each decode it AND re-encode 
 byte-for-byte, and C decodes it through its descriptor table. That file is the guarantee
 that a struct packed in one language is readable in the others -- if a change breaks it,
 `zig build test` fails rather than a peer written in another language failing later.
+
+
+Qt interface (proposal)
+-----------------------
+
+include/qnnt_qt.hpp proposes a Qt signal/slot interface shaped after the original Qt/nng
+Qnnt class. Qt is not a dependency of qnnt, so the example only builds when told where Qt
+is:
+
+    zig build qt-demo -Dqt=/Users/you/Qt/6.10.3/macos
+
+It runs moc over the header and over examples/qt_demo.cpp, links the C ABI, and exercises
+the whole path: start a node, publish text and TLD frames, receive both as signals on the
+Qt thread, unpack a struct with QString and QList members, stop.
+
+Two design points worth knowing before reviewing it:
+
+  * It is one object with an accessor, not a class you instantiate per component, because
+    the library is a process singleton -- one registry role and one queue per process.
+  * Messages arrive on qnnt's threads, which are not Qt threads. The interface therefore
+    uses the poll queue rather than the callbacks: a worker thread drains it and emits
+    through a queued connection, so every slot runs on the receiving object's thread with a
+    QByteArray it owns. That also turns one FFI crossing into a batch.
+
+The header carries TLD adaptors for QString, QByteArray, QList, QMap and QHash, so a Qt
+model class can be packed by the TLD_DEFINE_MAP macros directly.
+
+What it does NOT declare, because the library cannot do it yet: request/reply
+(addResponder, request, requestAvailable), per-topic teardown (removePublisher,
+removeSubscriber) and connection-lifecycle signals (publisherConnected and friends). Each
+is listed at the bottom of the header with what implementing it would take.

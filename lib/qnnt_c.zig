@@ -41,6 +41,24 @@ fn topicSlice(ptr: ?[*]const u8, len: usize) ?[]const u8 {
     return p[0..len];
 }
 
+/// Copy a topic the library is going to keep.
+///
+/// `topicSlice` only views the caller's bytes, and the library retains a topic for the life
+/// of the publisher or subscription that uses it -- the register loop, the subscriber
+/// thread and the subscribers map all hold the slice. A C caller who passed a stack buffer,
+/// a C++ caller who passed `topic.toUtf8().constData()`, or a Python caller whose
+/// `topic.encode()` temporary was collected, therefore left the library reading freed
+/// memory, and the symptom was a subscription for a garbled topic name that resolved to
+/// nothing.
+///
+/// Never freed, deliberately: publishers and subscriptions live until deinit, so this is
+/// bounded by the number of topics rather than by traffic -- the same reasoning as the
+/// source box below.
+fn retainTopic(topic: ?[*]const u8, topic_len: usize) ?[]const u8 {
+    const borrowed = topicSlice(topic, topic_len) orelse return null;
+    return allocator.dupe(u8, borrowed) catch null;
+}
+
 // ---------------------------------------------------------------- lifecycle
 
 /// Choose the registry port for the next `qnnt_init`. Returns QNNT_FAILED while a node is
@@ -108,6 +126,35 @@ export fn qnnt_set_cluster_key(key: ?[*:0]const u8) callconv(.c) Status {
 export fn qnnt_add_peer(host: ?[*:0]const u8, port: u16) callconv(.c) Status {
     const text = host orelse return .invalid_argument;
     return if (qnnt.Qnnt.addPeer(std.mem.span(text), port)) .ok else .failed;
+}
+
+/// This node's identity: 32 hex characters plus a NUL, so `cap` must be at least 33.
+/// Copied out rather than returned as a pointer, because the caller owns the lifetime it
+/// wants and the library's buffer is not it.
+export fn qnnt_node_id(out: ?[*]u8, cap: usize) callconv(.c) Status {
+    const dst = out orelse return .invalid_argument;
+    if (cap < 33) return .invalid_argument;
+    var buf: [32]u8 = undefined;
+    const text = qnnt.nodeIdTextFn(&buf);
+    @memcpy(dst[0..text.len], text);
+    dst[text.len] = 0;
+    return .ok;
+}
+
+/// The address remote subscribers are told to dial, as text. Copied out; `cap` must hold
+/// it plus a NUL (46 bytes is enough for any address).
+export fn qnnt_advertise_address(out: ?[*]u8, cap: usize) callconv(.c) Status {
+    const dst = out orelse return .invalid_argument;
+    const text = qnnt.advertiseAddressFn();
+    if (cap < text.len + 1) return .invalid_argument;
+    @memcpy(dst[0..text.len], text);
+    dst[text.len] = 0;
+    return .ok;
+}
+
+/// Whether federation will actually run: a cluster key is set and a port is available.
+export fn qnnt_federation_enabled() callconv(.c) u8 {
+    return if (qnnt.Qnnt.federationEnabled()) 1 else 0;
 }
 
 export fn qnnt_registry_port() callconv(.c) u16 {
@@ -187,7 +234,7 @@ export fn qnnt_publisher_start(
     period_us: u64,
     user: ?*anyopaque,
 ) callconv(.c) Status {
-    const name = topicSlice(topic, topic_len) orelse return .invalid_argument;
+    const name = retainTopic(topic, topic_len) orelse return .invalid_argument;
 
     if (source) |callback| {
         // The box must outlive the publisher, and publishers live until deinit, so it is
@@ -241,7 +288,7 @@ export fn qnnt_subscribe(
     callback: ?MessageFn,
     user: ?*anyopaque,
 ) callconv(.c) Status {
-    const name = topicSlice(topic, topic_len) orelse return .invalid_argument;
+    const name = retainTopic(topic, topic_len) orelse return .invalid_argument;
     const cb = callback orelse return .invalid_argument;
 
     const box = allocator.create(MessageBox) catch return .failed;
@@ -294,7 +341,7 @@ export fn qnnt_subscribe_frames(
     callback: ?FrameFn,
     user: ?*anyopaque,
 ) callconv(.c) Status {
-    const name = topicSlice(topic, topic_len) orelse return .invalid_argument;
+    const name = retainTopic(topic, topic_len) orelse return .invalid_argument;
     const cb = callback orelse return .invalid_argument;
 
     const box = allocator.create(FrameBox) catch return .failed;
@@ -332,7 +379,7 @@ export fn qnnt_subscribe_queue(
     topic_len: usize,
     mode: QueueMode,
 ) callconv(.c) Status {
-    const name = topicSlice(topic, topic_len) orelse return .invalid_argument;
+    const name = retainTopic(topic, topic_len) orelse return .invalid_argument;
     const zig_mode: qnnt.QueueMode = switch (mode) {
         .text => .text,
         .frames => .frames,

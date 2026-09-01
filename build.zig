@@ -76,6 +76,66 @@ pub fn build(b: *Build) void {
         if (linkage == .static) qnnt_c_static = lib else qnnt_c_dynamic = lib;
     }
 
+    // The Qt interface proposal, built only when told where Qt is. Qt is not a dependency
+    // of qnnt and `zig build test` must work without it, so this is opt-in rather than
+    // detected: -Dqt=/path/to/Qt/6.10.3/macos (a kit directory containing lib/ and
+    // libexec/moc). moc runs over the header, since it declares QObject classes.
+    if (b.option([]const u8, "qt", "Path to a Qt kit, enabling the qt-demo step")) |qt_path| {
+        const moc = b.addSystemCommand(&.{b.pathJoin(&.{ qt_path, "libexec", "moc" })});
+        moc.addArgs(&.{"-I"});
+        moc.addDirectoryArg(b.path("include"));
+        moc.addFileArg(b.path("include/qnnt_qt.hpp"));
+        moc.addArg("-o");
+        const moc_out = moc.addOutputFileArg("moc_qnnt_qt.cpp");
+
+        // The example declares its own QObject in the .cpp and includes the moc output at
+        // the bottom, which is the usual pattern for a single-file Qt program. That needs a
+        // second moc run, and its output directory on the include path.
+        const moc_demo = b.addSystemCommand(&.{b.pathJoin(&.{ qt_path, "libexec", "moc" })});
+        moc_demo.addArgs(&.{"-I"});
+        moc_demo.addDirectoryArg(b.path("include"));
+        moc_demo.addFileArg(b.path("examples/qt_demo.cpp"));
+        moc_demo.addArg("-o");
+        const demo_moc_out = moc_demo.addOutputFileArg("qt_demo.moc");
+
+        const qt_mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = true,
+        });
+        qt_mod.addCSourceFile(.{
+            .file = b.path("examples/qt_demo.cpp"),
+            // No -Werror here: the flags Qt's own headers want are its business, not ours.
+            .flags = &.{ "-std=c++20", "-Wall" },
+        });
+        qt_mod.addCSourceFile(.{ .file = moc_out, .flags = &.{"-std=c++20"} });
+        qt_mod.addIncludePath(b.path("include"));
+        qt_mod.addIncludePath(demo_moc_out.dirname());
+        qt_mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "include" }) });
+        qt_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "lib" }) });
+
+        // Qt ships frameworks on macOS and plain libraries everywhere else, and the two
+        // spellings are not interchangeable -- asking for a system library that is a
+        // framework fails the link rather than being ignored.
+        if (target.result.os.tag == .macos) {
+            qt_mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "lib", "QtCore.framework", "Headers" }) });
+            qt_mod.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "lib" }) });
+            qt_mod.linkFramework("QtCore", .{});
+        } else {
+            qt_mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "include", "QtCore" }) });
+            qt_mod.linkSystemLibrary("Qt6Core", .{});
+        }
+        qt_mod.linkLibrary(qnnt_c_static);
+
+        const qt_demo = b.addExecutable(.{ .name = "qt-demo", .root_module = qt_mod });
+        b.installArtifact(qt_demo);
+
+        const run_qt_demo = b.addRunArtifact(qt_demo);
+        const qt_step = b.step("qt-demo", "Build and run the Qt interface example (needs -Dqt=...)");
+        qt_step.dependOn(&run_qt_demo.step);
+    }
+
     const test_step = b.step("test", "Run unit tests");
 
     // These used to need serialising, because every node contended for one well-known
