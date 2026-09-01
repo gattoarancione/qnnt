@@ -194,7 +194,7 @@ fn applyRemoteEntry(entry: RemoteEntry, observed_host: []const u8) !bool {
     if (std.mem.eql(u8, &entry.origin, &qnnt.node_id)) return false;
 
     const host = if (entry.host.len == 0) observed_host else entry.host;
-    var endpoint = net.IpAddress.parse(host, entry.port) catch return false;
+    var endpoint = resolve.parseLiteral(host, entry.port) catch return false;
     endpoint.setPort(entry.port);
 
     const now_us: u64 = @intCast(qnnt.nowMicrosFn());
@@ -218,7 +218,7 @@ fn applyRemoteEntry(entry: RemoteEntry, observed_host: []const u8) !bool {
             .origin = entry.origin,
             .version = entry.version,
             .learned_us = now_us,
-            .conflict = false,
+            .conflict_us = 0,
         };
         // Subscriber detail is not federated -- only the count, recorded by padding the
         // peer list with placeholders. Detail stays with the host that owns it and is
@@ -242,9 +242,27 @@ fn applyRemoteEntry(entry: RemoteEntry, observed_host: []const u8) !bool {
         return true;
     }
 
-    // A different origin already holds this topic. First registration wins; record the
-    // clash so `list` can show it rather than silently hiding a publisher.
-    held.conflict = true;
+    // A different origin already holds this topic. First registration wins -- but only
+    // against a claimant that is still there. An entry past its serve window is one whose
+    // origin has stopped refreshing it, so it is not a rival any more, and preferring it
+    // black-holes the topic until the forget window expires: a publisher that restarts
+    // gets a new NodeId, so its own topic is held against it by the corpse of its previous
+    // process, and remote subscribers are told "expired" for minutes while a live
+    // publisher announces itself unheard.
+    if (!entryIsServable(held, now_us)) {
+        held.origin = entry.origin;
+        held.endpoint = endpoint;
+        held.version = entry.version;
+        held.last_us = now_us;
+        held.learned_us = now_us;
+        held.conflict_us = now_us;
+        try setRemoteSubCount(held, entry.subs, endpoint);
+        return true;
+    }
+
+    // Both are live: first wins, and the clash is recorded so `list` shows it rather than
+    // silently hiding a publisher.
+    held.conflict_us = now_us;
     return false;
 }
 
@@ -270,28 +288,36 @@ fn writeFedEntries(buffer: *std.ArrayList(u8)) !void {
     defer qnnt.directory_mutex.unlock(qnnt.io);
 
     var id_buf: [32]u8 = undefined;
+    const now_us: u64 = @intCast(qnnt.nowMicrosFn());
+
     var it = qnnt.directory.iterator();
     while (it.next()) |kv| {
         const entry = kv.value_ptr;
+
+        // Never pass on an entry we would refuse to serve. Without this a registry keeps
+        // re-teaching peers an address it already considers expired, and because a peer
+        // hearing it for the first time starts its own lease from now, a dead publisher's
+        // address can be handed out indefinitely -- each hop renewing what the lease was
+        // there to end. `sub` has always applied this test; gossip has to apply it too.
+        if (!entryIsServable(entry, now_us)) continue;
 
         // Ours: name a host only if one was configured. Left empty, the peer substitutes
         // the address it reached us on -- which is the address that works for it, and is
         // knowable even when our own public address is not.
         const is_local = std.mem.eql(u8, &entry.origin, &qnnt.node_id);
-        var host_buf: [46]u8 = undefined;
+        var host_buf: [resolve.max_host_text]u8 = undefined;
         const host: []const u8 = if (is_local)
             (if (qnnt.advertise_len == 0) "-" else qnnt.advertiseText())
         else
             // Learned from someone else: pass on the address we resolved for them, since
             // our own connection address says nothing about a third party.
-            (std.fmt.bufPrint(&host_buf, "{f}", .{entry.endpoint}) catch "-");
+            // Host only: the port travels as its own field. Formatting the whole address
+            // and trimming at the last colon used to leave an IPv6 address as "[::1]",
+            // which the receiving side's parser then rejected -- third-party IPv6 entries
+            // never propagated.
+            resolve.hostText(entry.endpoint, &host_buf);
 
-        // For a third-party host the formatted address includes the port; trim it, since
-        // the port travels as its own field.
-        const host_only = if (is_local) host else blk: {
-            const colon = std.mem.lastIndexOfScalar(u8, host, ':') orelse break :blk host;
-            break :blk host[0..colon];
-        };
+        const host_only = host;
 
         try buffer.print(allocator, "fed-entry {s} {d} {s} {s} {d} {d}\n", .{
             qnnt.formatNodeId(&id_buf, entry.origin),
@@ -356,7 +382,13 @@ fn fedCommand(session: *FedSession, command: []const u8) !Reply {
         try writeFedEntries(&buffer);
     } else if (qnnt.eqlAny(verb, &.{"fed-entry"})) {
         const entry = parseFedEntry(&it) orelse return qnnt.errorReply(&buffer, "malformed fed-entry");
-        _ = applyRemoteEntry(entry, session.observed()) catch {};
+        // Counted, because this is the only evidence a node has that a peer which dialled
+        // *in* is teaching it anything: such a peer is not in its own peer list and so has
+        // no row of its own in `peers`. Without the increment the command claimed nothing
+        // had been applied while the directory was visibly full of that peer's entries.
+        if (applyRemoteEntry(entry, session.observed()) catch false) {
+            _ = inbound_applied.fetchAdd(1, .monotonic);
+        }
         try buffer.print(allocator, "ok\n", .{});
     } else if (qnnt.eqlAny(verb, &.{"ping"})) {
         try buffer.print(allocator, "pong\n", .{});
@@ -814,3 +846,58 @@ pub fn start() void {
     }
 }
 
+
+// -- tests ------------------------------------------------------------------------------
+
+const testing = std.testing;
+
+test "first-wins holds against a live rival, yields to a stale one" {
+    const Q = @import("qnnt.zig").Qnnt;
+
+    try testing.expect(Q.setRegistryPort(22304));
+    try testing.expect(Q.run());
+    defer Q.deinit();
+
+    const origin_a: NodeId = @splat(0xAA);
+    const origin_b: NodeId = @splat(0xBB);
+    const topic = "test/takeover";
+
+    const from_a: RemoteEntry = .{
+        .origin = origin_a, .version = 1, .topic = topic,
+        .host = "10.0.0.8", .port = 9001, .subs = 0,
+    };
+    const from_b: RemoteEntry = .{
+        .origin = origin_b, .version = 1, .topic = topic,
+        .host = "10.0.0.9", .port = 9002, .subs = 0,
+    };
+
+    // A claims it first.
+    try testing.expect(try applyRemoteEntry(from_a, "10.0.0.8"));
+
+    // B loses while A's entry is still being refreshed: two live claimants, first wins.
+    try testing.expect(!try applyRemoteEntry(from_b, "10.0.0.9"));
+    try testing.expectEqual(@as(u16, 9001), heldPort(topic));
+
+    // Rewind A's lease past the serve window, which is what a node that has gone away
+    // looks like from here. No sleeping: the condition is a timestamp, so move it.
+    {
+        qnnt.directory_mutex.lockUncancelable(qnnt.io);
+        defer qnnt.directory_mutex.unlock(qnnt.io);
+        const held = qnnt.directory.getPtr(topic).?;
+        held.learned_us -= fed_serve_until_us + 1;
+    }
+
+    // Same announcement from B, and now it takes over: A is no longer a rival.
+    try testing.expect(try applyRemoteEntry(from_b, "10.0.0.9"));
+    try testing.expectEqual(@as(u16, 9002), heldPort(topic));
+
+    qnnt.directory_mutex.lockUncancelable(qnnt.io);
+    defer qnnt.directory_mutex.unlock(qnnt.io);
+    try testing.expectEqualSlices(u8, &origin_b, &qnnt.directory.getPtr(topic).?.origin);
+}
+
+fn heldPort(topic: []const u8) u16 {
+    qnnt.directory_mutex.lockUncancelable(qnnt.io);
+    defer qnnt.directory_mutex.unlock(qnnt.io);
+    return qnnt.directory.getPtr(topic).?.endpoint.getPort();
+}

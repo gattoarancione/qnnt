@@ -44,15 +44,29 @@ pub const max_host_text = 46;
 /// Resolving per dial attempt rather than once at configuration time is intentional: a
 /// peer that moves, or a name that starts out unresolvable because the network is not up
 /// yet, then works on the next attempt without a restart.
-pub fn resolve(host: []const u8, port: u16) Error!net.IpAddress {
-    // "[::1]" is what anyone copying an address out of a URL will write, and std's parser
-    // wants it bare. Strip the brackets rather than making every caller do it.
+/// Parse an address literal, tolerating the bracketed IPv6 form. No DNS, ever.
+///
+/// This is the right entry point for text that arrived over the network: resolving a name
+/// on a peer's behalf would let it choose what this host looks up, and would block the
+/// thread doing it. Federation parses entry hosts with this, and dials configured peers
+/// with `resolve` below.
+pub fn parseLiteral(host: []const u8, port: u16) error{NotAnAddress}!net.IpAddress {
     const text = if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']')
         host[1 .. host.len - 1]
     else
         host;
+    return net.IpAddress.parse(text, port) catch error.NotAnAddress;
+}
 
-    if (net.IpAddress.parse(text, port)) |addr| return addr else |_| {}
+pub fn resolve(host: []const u8, port: u16) Error!net.IpAddress {
+    if (parseLiteral(host, port)) |addr| return addr else |_| {}
+
+    // Names only from here. Brackets are an address syntax, so a bracketed thing that did
+    // not parse is malformed rather than a hostname to look up.
+    const text = if (host.len >= 2 and host[0] == '[' and host[host.len - 1] == ']')
+        return error.UnknownHost
+    else
+        host;
 
     if (!builtin.link_libc) return error.NoResolver;
     if (text.len == 0 or text.len > max_host_len) return error.HostTooLong;
@@ -210,4 +224,16 @@ test "the bracketed form is accepted" {
     var buf: [max_host_text]u8 = undefined;
     // ...and comes back out bare, since that is what everything downstream parses.
     try testing.expectEqualStrings("::1", hostText(bracketed, &buf));
+}
+
+test "parseLiteral takes addresses only, never names" {
+    try testing.expect((try parseLiteral("10.0.0.8", 1)).eql(&(try resolve("10.0.0.8", 1))));
+    try testing.expect((try parseLiteral("[::1]", 1)).eql(&(try resolve("::1", 1))));
+    // The point of it: wire data must not be able to make this host do a DNS lookup.
+    try testing.expectError(error.NotAnAddress, parseLiteral("localhost", 1));
+}
+
+test "a bracketed thing that is not an address is not a hostname" {
+    try testing.expectError(error.UnknownHost, resolve("[localhost]", 1));
+    try testing.expectError(error.UnknownHost, resolve("[not an address]", 1));
 }

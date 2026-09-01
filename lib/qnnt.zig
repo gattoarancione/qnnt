@@ -52,6 +52,11 @@ pub const PeerRecord = struct {
 // What the directory knows about one topic. The timestamps exist for the human side
 // of the interface: `pub` registrations are refreshed on a timer, so a registration
 // that stopped being refreshed is how a dead publisher becomes visible.
+/// How long after the last clashing announcement `list` keeps reporting CONFLICT. A
+/// losing origin re-announces on every sync, so an unresolved clash keeps refreshing this
+/// and stays visible; one that stops is over.
+pub const conflict_window_us: u64 = 30 * std.time.us_per_s;
+
 pub const TopicEntry = struct {
     endpoint: net.IpAddress,
     first_us: u64, // first time this topic was registered
@@ -87,7 +92,12 @@ pub const TopicEntry = struct {
     /// registration wins, and the loser is reported rather than silently dropped: a
     /// duplicate topic name across hosts is a misconfiguration, and one that hides a
     /// publisher looks like "my data sometimes vanishes".
-    conflict: bool,
+    /// When a second origin was last seen claiming this topic, or 0 if never. A timestamp
+    /// rather than a flag because a clash is a condition, not a permanent property: the
+    /// flag only ever went true, so one transient overlap -- a publisher restarting, a
+    /// peer's stale copy arriving on connect -- marked the topic CONFLICT for as long as
+    /// the entry lived, long after the rival was gone.
+    conflict_us: u64,
 };
 
 pub var directory: std.StringHashMap(TopicEntry) = .init(allocator);
@@ -650,9 +660,12 @@ fn writeTopicList(buffer: *std.ArrayList(u8)) !void {
                 "local"
             else
                 formatNodeId(&origin_buf, entry.value_ptr.origin)[0..origin_column_width],
-            // A conflict is worth more than the liveness state: the entry is live, but a
-            // second origin is trying to publish the same topic name and losing.
-            .state = if (entry.value_ptr.conflict)
+            // A conflict outranks the liveness state: the entry is live, but a second
+            // origin is claiming the same topic name and losing. Shown only while the
+            // clash is current, so the column reports what is happening now rather than
+            // what happened once.
+            .state = if (entry.value_ptr.conflict_us != 0 and
+                now_us -| entry.value_ptr.conflict_us <= conflict_window_us)
                 "CONFLICT"
             else if (is_stale) "stale" else "live",
         });
@@ -787,7 +800,7 @@ fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId) !vo
             .origin = origin,
             .version = now_us,
             .learned_us = now_us,
-            .conflict = false,
+            .conflict_us = 0,
         };
         changed = true;
         return;
@@ -816,7 +829,7 @@ fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId) !vo
     // Federation made this visible: a peer's entries arrive on connect, which is well
     // before the local publisher's first refresh, so "first" was almost always the remote
     // one and every host ended up preferring someone else's publisher.
-    gop.value_ptr.conflict = true;
+    gop.value_ptr.conflict_us = now_us;
     gop.value_ptr.origin = origin;
     gop.value_ptr.endpoint = endpoint;
     gop.value_ptr.last_us = now_us;
@@ -1957,4 +1970,8 @@ pub fn nodeDeinit() void {
 
 test {
     _ = @import("./qnnt.test.zig");
+    // Pulled in here rather than given its own build entry: federation.zig imports this
+    // file, so testing it as a root would recompile and re-run the whole suite in a second
+    // binary -- and both copies would race for the same test registry port.
+    _ = @import("./federation.zig");
 }
