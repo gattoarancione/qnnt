@@ -136,6 +136,55 @@ pub fn build(b: *Build) void {
     const cpp_demo_step = b.step("cpp-demo", "Build and run the C++ example against the wrapper");
     cpp_demo_step.dependOn(&run_cpp_demo.step);
 
+    // The struct mapping in C++: TLD_* macros, the msgpack-shaped calls, and the check
+    // that this side agrees byte-for-byte with the Zig and Python mappings on one golden
+    // frame. That agreement is the only thing standing between a C++ producer and a Zig
+    // consumer, so it belongs in `test`.
+    const tld_map_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .link_libcpp = true,
+    });
+    tld_map_mod.addCSourceFile(.{
+        .file = b.path("examples/tld_map.cpp"),
+        .flags = &.{ "-std=c++20", "-Wall", "-Wextra", "-Werror" },
+    });
+    tld_map_mod.addIncludePath(b.path("include"));
+    tld_map_mod.linkLibrary(tld_c_static);
+
+    const tld_map = b.addExecutable(.{ .name = "tld-map-cpp", .root_module = tld_map_mod });
+    b.installArtifact(tld_map);
+
+    const run_tld_map = b.addRunArtifact(tld_map);
+    // Reads lib/testdata/interop.tld by a relative path, so it must run from the root.
+    run_tld_map.setCwd(b.path("."));
+    const tld_map_step = b.step("tld-map", "Build and run the C++ struct-mapping example");
+    tld_map_step.dependOn(&run_tld_map.step);
+
+    // And the same mapping from C, where the schema is a descriptor table rather than a
+    // macro. It reads the same golden frame, so all four languages are pinned to one
+    // artifact.
+    const tld_map_c_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    tld_map_c_mod.addCSourceFile(.{
+        .file = b.path("examples/tld_map.c"),
+        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+    });
+    tld_map_c_mod.addIncludePath(b.path("include"));
+    tld_map_c_mod.linkLibrary(tld_c_static);
+
+    const tld_map_c = b.addExecutable(.{ .name = "tld-map-c", .root_module = tld_map_c_mod });
+    b.installArtifact(tld_map_c);
+
+    const run_tld_map_c = b.addRunArtifact(tld_map_c);
+    run_tld_map_c.setCwd(b.path("."));
+    const tld_map_c_step = b.step("tld-map-c", "Build and run the C struct-mapping example");
+    tld_map_c_step.dependOn(&run_tld_map_c.step);
+
     // A whole node driven from C: schedule a publisher, consume the same topic through a
     // callback and through the queue at once.
     const node_demo_mod = b.createModule(.{
@@ -236,6 +285,8 @@ pub fn build(b: *Build) void {
     test_step.dependOn(&run_c_demo.step);
     test_step.dependOn(&run_cpp_demo.step);
     test_step.dependOn(&run_node_demo.step);
+    test_step.dependOn(&run_tld_map.step);
+    test_step.dependOn(&run_tld_map_c.step);
     test_step.dependOn(&python_demo.step);
 
     // `zig build test`. The TLD module is standalone and tested on its own; qnnt.zig
