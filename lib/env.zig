@@ -19,6 +19,7 @@
 //!   QNNT_CLUSTER_KEY       enables federation; required for it
 //!   QNNT_FEDERATION_PORT   federation's port (default 2223, 0 disables)
 //!   QNNT_PEERS             host[:port],... to dial; host may be an address or a name
+//!   QNNT_RT_PRIORITY       SCHED_FIFO priority for worker threads (Linux only)
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -122,6 +123,12 @@ pub fn configureFromEnvironment() void {
     if (get("QNNT_CLUSTER_KEY")) |text| {
         // The value itself is never echoed, rejected or not: it is a secret.
         if (!federation.setClusterKey(text)) reject("QNNT_CLUSTER_KEY", "<value withheld>");
+    }
+
+    if (get("QNNT_RT_PRIORITY")) |text| {
+        if (std.fmt.parseInt(u8, text, 10)) |value| {
+            if (!qnnt.Qnnt.setRealtimePriority(value)) reject("QNNT_RT_PRIORITY", text);
+        } else |_| reject("QNNT_RT_PRIORITY", text);
     }
 
     if (get("QNNT_PEERS")) |list| {

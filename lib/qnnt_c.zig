@@ -50,6 +50,20 @@ export fn qnnt_set_registry_port(port: u16) callconv(.c) Status {
     return if (qnnt.setRegistryPortFn(port)) .ok else .failed;
 }
 
+/// Run worker threads on SCHED_FIFO at `priority`; 0 (the default) leaves them alone.
+/// Linux only -- elsewhere this returns failed and says why.
+///
+/// `ok` means the request was accepted, not that it will succeed: whether the process may
+/// actually take a real-time priority is only discoverable when a thread tries, and a
+/// refusal is reported on stderr then. Check for that line if a latency bound matters.
+export fn qnnt_set_realtime_priority(priority: u8) callconv(.c) Status {
+    return if (qnnt.setRealtimePriorityFn(priority)) .ok else .failed;
+}
+
+export fn qnnt_realtime_priority() callconv(.c) u8 {
+    return qnnt.realtimePriorityFn();
+}
+
 /// The address remote subscribers should dial. Optional: leave it unset and observers
 /// fill it in from the connection they reached this host on, which is what lets a node
 /// behind a gateway work without knowing its own public address.

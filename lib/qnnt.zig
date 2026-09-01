@@ -146,6 +146,113 @@ pub fn isShuttingDown() bool {
     return shutting_down.load(.monotonic);
 }
 
+// ---------------------------------------------------------------- realtime scheduling
+
+// SCHED_FIFO priority for worker threads; 0 leaves them wherever the kernel put them.
+//
+// Linux only, and deliberately so. macOS grants real-time behaviour through
+// thread_policy_set with a time-constraint policy, not through POSIX priorities, so
+// accepting a priority there and calling pthread_setschedparam would report success while
+// changing nothing that matters to a deadline. Refusing says more than pretending.
+//
+// Why this exists: benchmarking on an i.MX board with a low-latency (SMP PREEMPT) kernel
+// gave a round trip bounded under 1.1 ms across 18,000 trips while the CPU was free, and
+// a p99 seven times worse the moment four spinners contended for the cores. Low preemption
+// latency is not a scheduling guarantee, and SCHED_OTHER threads wait their turn. See
+// BENCHMARK.txt section B.5.
+var rt_priority: std.atomic.Value(u8) = .init(0);
+
+// Set once a worker has failed to obtain the policy, so the complaint is made exactly
+// once. It is made loudly: a node that quietly keeps running at default priority after
+// being asked for real-time is the worst possible outcome here, because the latency bound
+// it was configured for simply will not be there and nothing will have said so.
+var rt_failure_reported = std.atomic.Value(bool).init(false);
+
+/// Ask for worker threads to run on SCHED_FIFO at `priority`. 0 disables, which is the
+/// default. Must be called before `run()`, since it applies to threads as they start.
+///
+/// Returns false, having explained itself, if the platform cannot honour it or the
+/// priority is out of the kernel's range. It does NOT return false for lack of privilege:
+/// that is only discoverable when a thread actually tries, and is reported then.
+///
+/// The calling thread is left alone. A library that silently changed its caller's
+/// scheduling policy would be overstepping; if the application's own thread needs
+/// real-time it should say so itself.
+pub fn setRealtimePriorityFn(priority: u8) bool {
+    if (node_running) return false;
+
+    if (priority == 0) {
+        rt_priority.store(0, .monotonic);
+        return true;
+    }
+
+    if (@import("builtin").os.tag != .linux) {
+        std.debug.print(
+            "realtime priority ignored: SCHED_FIFO is honoured on Linux, and this is {s}. " ++
+                "Worker threads stay at default priority.\n",
+            .{@tagName(@import("builtin").os.tag)},
+        );
+        return false;
+    }
+
+    const linux = std.os.linux;
+    const fifo: linux.SCHED = .{ .mode = .FIFO };
+
+    // Ask the kernel for its range rather than assuming 1..99: it is stable on Linux, but
+    // an out-of-range priority fails per-thread later, which is a much worse place to
+    // discover a typo than the configuration call.
+    const min_rc = linux.sched_get_priority_min(fifo);
+    const max_rc = linux.sched_get_priority_max(fifo);
+    if (linux.errno(min_rc) != .SUCCESS or linux.errno(max_rc) != .SUCCESS) {
+        std.debug.print("realtime priority ignored: kernel would not report the SCHED_FIFO range\n", .{});
+        return false;
+    }
+
+    const min: u8 = @intCast(min_rc);
+    const max: u8 = @intCast(max_rc);
+    if (priority < min or priority > max) {
+        std.debug.print(
+            "realtime priority {d} out of range: this kernel accepts {d}..{d} for SCHED_FIFO\n",
+            .{ priority, min, max },
+        );
+        return false;
+    }
+
+    rt_priority.store(priority, .monotonic);
+    return true;
+}
+
+pub fn realtimePriorityFn() u8 {
+    return rt_priority.load(.monotonic);
+}
+
+// Promote the calling thread. Runs first in every worker, before it touches a socket or a
+// callback, so a worker is at its final priority for the whole of its life.
+fn applyRealtimePriority() void {
+    const priority = rt_priority.load(.monotonic);
+    if (priority == 0) return;
+    if (@import("builtin").os.tag != .linux) return;
+
+    const linux = std.os.linux;
+    const param: linux.sched_param = .{ .priority = priority };
+
+    // pid 0 means the calling thread, which is the point: each worker promotes itself, so
+    // the caller's thread and any thread the application owns are untouched.
+    const rc = linux.sched_setscheduler(0, .{ .mode = .FIFO }, &param);
+    const err = linux.errno(rc);
+    if (err == .SUCCESS) return;
+
+    if (!rt_failure_reported.swap(true, .monotonic)) {
+        std.debug.print(
+            "realtime priority {d} REFUSED by the kernel ({s}); worker threads are running " ++
+                "at default priority and the latency bound you configured is not in effect. " ++
+                "SCHED_FIFO needs CAP_SYS_NICE (setcap cap_sys_nice+ep on the binary), root, " ++
+                "or an RLIMIT_RTPRIO ceiling at least this high (ulimit -r).\n",
+            .{ priority, @tagName(err) },
+        );
+    }
+}
+
 // Spawn a worker and record it so shutdown can join it, returning false if it must not
 // be started. Capacity is reserved before the thread starts, because a thread that
 // starts but fails to be recorded is a thread that can never be joined — the exact leak
@@ -162,7 +269,20 @@ pub fn spawnWorker(comptime function: anytype, args: anytype) bool {
     if (isShuttingDown()) return false;
 
     workers.ensureUnusedCapacity(allocator, 1) catch return false;
-    const thread = std.Thread.spawn(.{}, function, args) catch return false;
+
+    // Every worker enters through this shim so it can promote itself before doing any
+    // work. Setting the policy from inside the thread, rather than on it from outside,
+    // means there is no window where a worker is already reading a socket at default
+    // priority. The return type is preserved so error-returning workers behave exactly
+    // as they did before.
+    const Shim = struct {
+        fn run(a: @TypeOf(args)) @typeInfo(@TypeOf(function)).@"fn".return_type.? {
+            applyRealtimePriority();
+            return @call(.auto, function, a);
+        }
+    };
+
+    const thread = std.Thread.spawn(.{}, Shim.run, .{args}) catch return false;
     workers.appendAssumeCapacity(thread);
     return true;
 }
@@ -318,6 +438,8 @@ pub const Qnnt = struct {
     /// Registry port control. Set before `run()`; see `setRegistryPort`.
     pub const setRegistryPort = &setRegistryPortFn;
     pub const registryPort = &currentRegistryPort;
+    pub const setRealtimePriority = &setRealtimePriorityFn;
+    pub const realtimePriority = &realtimePriorityFn;
 
     /// Addressing. Both must be set before `run()`. Defaults keep everything on
     /// loopback, so a local deployment is unchanged and nothing is exposed unasked.
@@ -1872,6 +1994,12 @@ pub fn nodeRun() bool {
         return false;
     }
 
+    if (rt_priority.load(.monotonic) != 0) {
+        std.debug.print("worker threads requesting SCHED_FIFO priority {d}\n", .{
+            rt_priority.load(.monotonic),
+        });
+    }
+
     federation.start();
 
     sleepMsFn(5);
@@ -1901,6 +2029,18 @@ pub fn publisherRun(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: ?
     const period = period_us orelse 0;
     if (source != null and period == 0) {
         std.debug.print("publisher {s}: unpaced (period 0), will busy one core\n", .{topic});
+        // At real-time priority that stops being merely wasteful: a SCHED_FIFO thread in a
+        // tight loop outranks every SCHED_OTHER thread on its core, including the ones the
+        // system needs. Linux's RT throttle (sched_rt_runtime_us, 950 ms of each second by
+        // default) is what keeps the machine reachable, and leaning on it is not a design.
+        if (rt_priority.load(.monotonic) != 0) {
+            std.debug.print(
+                "publisher {s}: WARNING -- unpaced AND SCHED_FIFO priority {d}. This will " ++
+                    "monopolise a core and is held back only by the kernel's RT throttle. " ++
+                    "Give the publisher a period, or leave it at default priority.\n",
+                .{ topic, rt_priority.load(.monotonic) },
+            );
+        }
     }
 
     if (!spawnWorker(nodePublish, .{ topic, source, period, context })) {

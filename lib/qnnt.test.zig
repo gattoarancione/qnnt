@@ -283,3 +283,28 @@ test "a full queue drops the newest and counts it" {
     try testing.expect(got.len <= 2);
     for (got) |msg| try testing.expectEqualStrings("tick\n", msg.data);
 }
+
+test "realtime priority is accepted only where it can be honoured" {
+    const builtin = @import("builtin");
+
+    if (builtin.os.tag == .linux) {
+        // Accepted here means "the request is valid", not "the kernel will grant it":
+        // privilege is only discoverable when a thread tries, and is reported then.
+        try testing.expect(qnnt.setRealtimePriority(10));
+        try testing.expectEqual(@as(u8, 10), qnnt.realtimePriority());
+
+        // Out of the SCHED_FIFO range, which the kernel is asked for rather than assumed.
+        try testing.expect(!qnnt.setRealtimePriority(200));
+        try testing.expectEqual(@as(u8, 10), qnnt.realtimePriority());
+    } else {
+        // Refused rather than silently doing nothing useful: on macOS a POSIX priority
+        // would not deliver what a caller asking for SCHED_FIFO is asking for.
+        try testing.expect(!qnnt.setRealtimePriority(10));
+        try testing.expectEqual(@as(u8, 0), qnnt.realtimePriority());
+    }
+
+    // Leave it off: every later test spawns workers, and they would each try to promote
+    // themselves and complain about it.
+    try testing.expect(qnnt.setRealtimePriority(0));
+    try testing.expectEqual(@as(u8, 0), qnnt.realtimePriority());
+}

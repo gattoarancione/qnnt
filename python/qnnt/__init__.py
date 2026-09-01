@@ -107,6 +107,7 @@ class Node:
         federation_port: int | None = None,
         cluster_key: str | None = None,
         peers: Sequence[str] | None = None,
+        realtime_priority: int | None = None,
         queue_capacity: int = 4096,
         handle_signals: bool = False,
     ) -> None:
@@ -128,6 +129,11 @@ class Node:
         if registry_port is not None:
             _check(self._lib, self._lib.qnnt_set_registry_port(registry_port),
                    f"set_registry_port({registry_port})")
+        if realtime_priority is not None:
+            # Linux only, and acceptance is not success: the library prints a refusal to
+            # stderr if the process may not take a real-time priority. See qnnt.h.
+            _check(self._lib, self._lib.qnnt_set_realtime_priority(realtime_priority),
+                   f"set_realtime_priority({realtime_priority})")
         if advertise_addr:
             _check(self._lib, self._lib.qnnt_set_advertise_address(advertise_addr.encode()),
                    "set_advertise_address")

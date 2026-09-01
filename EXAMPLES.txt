@@ -264,6 +264,7 @@ it does not:
 
     QNNT_CLUSTER_KEY=some-secret   shared by every node in the cluster -- REQUIRED
     QNNT_PEERS=10.0.0.8,nodeb.local  address or hostname, optional :port, comma-separated
+    QNNT_RT_PRIORITY=40             SCHED_FIFO priority for worker threads (Linux)
     QNNT_FEDERATION_PORT=2223      optional; 2223 by default, and 0 disables
 
 The key is not optional because an unauthenticated directory reachable from a
@@ -438,3 +439,32 @@ Everything else `zig build` can do:
     zig build wheel-test   install that wheel in a throwaway venv and test it
     zig build run-c        the C node, role 0..4 as the first argument
     zig build run-cpp      the C++ node, likewise
+
+
+Real-time worker threads
+------------------------
+
+On Linux, QNNT_RT_PRIORITY puts every qnnt worker thread on SCHED_FIFO at that priority:
+
+    QNNT_RT_PRIORITY=40 ./zig-out/bin/qnnt-node-0
+
+The node says so on startup ("worker threads requesting SCHED_FIFO priority 40"), and the
+threads can be checked with:
+
+    ps -Lo pid,tid,cls,rtprio,comm -p $(pgrep -f qnnt-node-0 | head -1)
+
+CLS is FF for the workers. The process's own main thread stays TS on purpose -- the library
+does not change the scheduling of a thread it did not create.
+
+It needs privilege: root, CAP_SYS_NICE (setcap cap_sys_nice+ep on the binary), or an
+RLIMIT_RTPRIO ceiling at least that high (ulimit -r). Without it the node prints one line
+naming the errno and carries on at default priority, so watch for that line -- the whole
+point of the feature is a latency bound, and losing it silently would be worse than not
+asking. It is refused outright on macOS, where POSIX priorities are not how real-time
+scheduling is expressed.
+
+Do not combine it with an unpaced publisher (period 0): that is a busy loop outranking
+everything else on its core. The library warns if you ask for both.
+
+Measured effect on an i.MX A53 board, 1 kHz round trip with all four cores contended:
+p99 5 ms at default priority, 128 us on SCHED_FIFO. See BENCHMARK.txt B.5 and B.7.

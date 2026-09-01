@@ -50,6 +50,25 @@ const char *qnnt_status_name(qnnt_status status);
  * default is 2222. The library reads no environment of its own: if you want the port to
  * come from one, read it and pass it. */
 qnnt_status qnnt_set_registry_port(uint16_t port);
+
+/*
+ * Run qnnt's worker threads on SCHED_FIFO at `priority` (Linux only; 0 disables, and is
+ * the default). Call before qnnt_init.
+ *
+ * Returns qnnt_ok if the request was accepted, which is not the same as it working: the
+ * process needs CAP_SYS_NICE, root, or an RLIMIT_RTPRIO ceiling at least this high, and
+ * that is only discovered when a worker thread tries. A refusal is printed once, to
+ * stderr, naming the errno -- watch for it, because otherwise the threads run at default
+ * priority and the latency bound is silently absent.
+ *
+ * The calling thread is never touched. If your own thread needs a real-time priority, set
+ * it yourself.
+ *
+ * Do not combine a high priority with an unpaced publisher (period_us 0): that is a busy
+ * loop outranking everything else on its core.
+ */
+qnnt_status qnnt_set_realtime_priority(uint8_t priority);
+uint8_t qnnt_realtime_priority(void);
 uint16_t    qnnt_registry_port(void);
 
 /* Addressing. Both optional and both must precede qnnt_init.

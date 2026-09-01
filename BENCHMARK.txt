@@ -1,18 +1,42 @@
-qnnt transport benchmark -- two real hosts on a real LAN
-========================================================
+qnnt transport benchmark -- real hosts, real links
+==================================================
 
-Measured 2026-09-01 between the development mac and the LAN linux machine, both running
-the same commit built with -Doptimize=ReleaseFast. Numbers from a loopback run on one box
-are included, not as the headline but because without them there is no way to tell whether
-a LAN figure is reporting the library or the network.
+Two targets, measured 2026-09-01, each against the same commit built with
+-Doptimize=ReleaseFast:
 
-Short version: on this path the library is not the bottleneck and cannot be seen. qnnt
-carries 94-99% of what raw TCP carries between the same two hosts, and its round trip
-bottoms out at or below ICMP's. The loopback ceiling on the same hardware is roughly 1200x
-the LAN's capacity, so every LAN figure below is a measurement of the link.
+  A   x86_64 desktop linux, reached from the development mac over Wi-Fi + 100 Mb ethernet
+  B   NXP i.MX gateway, aarch64 Cortex-A53 x4, kernel 6.6.52 SMP PREEMPT ("semi-realtime"),
+      measured twice: over Wi-Fi (B.1-B.5) and over gigabit wired (B.6)
 
+Loopback figures are included for both, not as the headline but because without them there
+is no way to tell whether a LAN figure is reporting the library or the network. On both
+targets the answer over the LAN was the network, every time.
 
-1. what was measured against
+Short version:
+
+  * qnnt reaches the link's capacity on every path measured -- 94-99% of raw TCP on target
+    A, within the link's own run-to-run variance on target B over Wi-Fi, and exactly line
+    rate (117.67 of 117.60 MB/s) on target B over gigabit wired, in both directions, with
+    a Cortex-A53 on one end.
+  * on that gigabit path, at 64 B frames, the transport finally becomes the bottleneck
+    instead of the network -- and the board's send path turns out to cost 3.1x its receive
+    path, because publishing writes once per frame while receiving amortises one read
+    across many. Section B.6; it is the most informative measurement in the file.
+  * on-board and uncontended, the round trip is bounded under 1.1 ms across 18,000 trips
+    for 9% of one of four cores. Under CPU contention that bound needs SCHED_FIFO, which
+    QNNT_RT_PRIORITY now provides: p99 goes from ~5 ms back to 128 us. Sections B.5, B.7.
+  * its round trip bottoms out below ICMP's minimum on both paths, so the transport adds
+    nothing measurable to a network round trip.
+  * on target B, entirely on-board, the round trip is bounded under 1.1 ms across 18,000
+    consecutive trips at ~900 Hz, for 9% of one of four cores. That bound survives only
+    while the CPU is uncontended: saturate all four cores and p99 goes from 768 us to
+    ~5 ms. See section B.5 -- it is the one result with an action attached.
+  * not one gap, and not one corrupt payload, in any run on either target.
+
+TARGET A -- x86_64 desktop linux over Wi-Fi and 100 Mb ethernet
+===============================================================
+
+A.1  the path
 ----------------------------
 
   mac      192.168.16.204, Wi-Fi (en0), 802.11ax on channel 11 -- 2.4 GHz, 20 MHz wide
@@ -36,7 +60,7 @@ limit, and it is asymmetric by 3.2x. This is the number every LAN figure below i
 against, because it is what the path can carry at all.
 
 
-2. the clocks disagree, which decides how latency is measured
+A.2  the clocks disagree, which decides how latency is measured
 ------------------------------------------------------------
 
   clock offset, linux minus mac:   +86.396 ms      (best of 200 probes, best RTT 2.774 ms)
@@ -53,7 +77,7 @@ The result is a round trip rather than one way, which is the honest thing to rep
 link whose two directions differ by 3.2x anyway.
 
 
-3. loopback ceiling -- the library with no network in the way
+A.3  loopback ceiling -- the library with no network in the way
 ------------------------------------------------------------
 
 linux box, node-3 -> node-4 on 127.0.0.1, publisher unpaced, ReleaseFast:
@@ -71,7 +95,7 @@ or 64 KiB -- because decoding walks fields, not bytes. The 64 KiB frame decodes 
 per frame than the 88 B one: same field count, and the cost is dominated by per-frame work.
 
 
-4. over the LAN, linux publishing, mac subscribing
+A.4  over the LAN, linux publishing, mac subscribing
 -------------------------------------------------
 
 Publisher unpaced, so the link saturates and these are ceiling measurements. Compare the
@@ -99,7 +123,7 @@ Reverse direction, 1 KiB, against the 0.361 MB/s ceiling that way:
 Not one gap or corrupt payload was seen in any run, in either direction, at any frame size.
 
 
-5. round trip latency, measured on one clock
+A.5  round trip latency, measured on one clock
 --------------------------------------------
 
 node-6 <-> node-5, 1 KiB frames at 20 Hz. That is 20 KB/s, under 2% of the link, so this
@@ -132,12 +156,309 @@ A publisher that must bound latency has to pace itself below the link rate; qnnt
 happily fill the pipe if asked to.
 
 
-6. reproducing it
------------------
+
+TARGET B -- NXP i.MX gateway, aarch64 Cortex-A53, semi-realtime kernel
+======================================================================
+
+B.1  the target and the path
+----------------------------
+
+  board    NXP i.MX, "NXP i.MX Release Distro" (Yocto scarthgap, fsl-imx-xwayland)
+           kernel 6.6.52 SMP PREEMPT, aarch64 Cortex-A53 (part 0xd03) x4, glibc 2.39
+           1.8 GB RAM, 942 MB tmpfs on /tmp, hostname gw-lastMed-bench
+           br0 192.168.3.1/24 bridging end0 (1 Gb/s) and end1; a cellular WWAN interface
+           alongside it, not on this path
+
+  mac      192.168.3.37 on Wi-Fi, associated to an access point bridged into br0
+
+Note "SMP PREEMPT", not PREEMPT_RT: this is the low-latency preemption model, and there is
+no /sys/kernel/realtime. It shortens preemption latency without giving any thread a
+priority guarantee, which is exactly what section B.5 runs into.
+
+The board has no zig, so everything was cross-compiled on the mac for its precise runtime
+and CPU and copied over:
+
+    zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu.2.39 -Dcpu=cortex_a53
+
+  ICMP mac <-> board, 30 packets:   min 4.46  avg 11.78  max 26.54 ms, 0% loss
+  ICMP again, later, 15 packets:    min 4.18  avg  7.48  max 19.02 ms, 0% loss
+
+  raw TCP, single stream, 20 s:     mac -> board   9.26 MB/s
+                                    board -> mac   9.65 MB/s
+
+  clock offset, board minus mac:    +75.588 ms   (best of 200 probes, best RTT 3.97 ms)
+
+Symmetric and about 26x target A's path, but still Wi-Fi on the mac's side: three
+consecutive 12 s raw-TCP runs board -> mac gave 6.97, 7.93 and 9.09 MB/s. The link varies by
+30% between measurements taken a minute apart, which sets the resolution of anything
+measured across it. And the 75 ms clock offset is the same story as target A -- one-way
+cross-host latency is not measurable, so latency here is again a round trip on one clock.
+
+
+B.2  loopback ceiling -- the library on a Cortex-A53
+---------------------------------------------------
+
+node-3 -> node-4 on 127.0.0.1, publisher unpaced:
+
+  payload    frame     frames/s     wire         payload      decode      gaps
+  64 B       88 B      253,500      23.1 MB/s    16.2 MB/s    429 ns      0
+  1 KiB      1050 B    158,900      167.4 MB/s   162.8 MB/s   435 ns      0
+  64 KiB     65564 B   3,523        231.0 MB/s   230.9 MB/s   434 ns      0
+
+Against target A's x86_64 box, same code and build flags:
+
+                      x86_64          A53           ratio
+  64 B frames         700,000/s       253,500/s     2.8x
+  1 KiB frames        527,000/s       158,900/s     3.3x
+  64 KiB throughput   1426 MB/s       231 MB/s      6.2x
+  decode per frame    75-126 ns       429-435 ns    3.5-5.8x
+
+Decode cost is flat in payload size here too -- 429 to 435 ns whether the frame is 88 bytes
+or 64 KiB -- which is the property TLD framing exists for: decoding walks fields, not bytes.
+The A53 is 3.5x slower per frame but the shape is identical.
+
+The 6.2x gap at 64 KiB, wider than the 3.3x at 1 KiB, is memory bandwidth rather than
+framing: at that size the work is moving 64 KiB through a loopback socket, and that is what
+a 4-core A53 does 6x slower than a desktop x86.
+
+
+B.3  on-board round trip -- the number this target is for
+--------------------------------------------------------
+
+node-6 <-> node-5 on the board, over loopback. No network, no second clock, no Wi-Fi:
+
+  20 Hz, 1 KiB payload:
+      min 148-461 us   p50 832 us   p90 832 us   p99 896 us   max 852-888 us
+
+  1 kHz requested (912 Hz achieved), 256 B payload, one 20 s window of 18,248 trips:
+      min 83 us        p50 448 us   p90 768 us   p99 768 us   max 1077 us
+
+      cpu: node-6 5.0% and node-5 4.0% of one core, on a 4-core board
+
+Zero lost, zero corrupt, in every window.
+
+Two things worth reading twice. The tail is tight: p99 768 us and a worst case of 1.08 ms
+across 18,000 consecutive round trips, each one a full publish, TCP hop, decode, republish,
+TCP hop and decode through two registries. And the whole loop costs 9% of one of four
+cores at ~900 Hz, so a control loop at this rate leaves the board essentially idle.
+
+The mean is *lower* at 1 kHz (410 us) than at 20 Hz (745 us), and the minimum is half.
+That is the sleep-wake path, not the transport: at 20 Hz each round trip pays for waking a
+descheduled thread with cold caches, and at 1 kHz the path stays hot. qnnt is faster when
+it is busy, which is worth knowing if you are sizing a slow control loop by measuring a
+fast one, or the reverse.
+
+
+B.4  across the LAN, board publishing, mac subscribing
+-----------------------------------------------------
+
+Publisher unpaced, so these saturate the link:
+
+  payload    frames/s      wire              gaps    badpay
+  1 KiB      6,166-7,888   6.49-8.31 MB/s    0       0
+  64 KiB     96-128        6.30-8.41 MB/s    0       0
+
+  raw TCP measured immediately afterwards, three runs:  6.97, 7.93, 9.09 MB/s
+
+qnnt's range and raw TCP's range are the same range. Quoting a percentage would be
+false precision: the Wi-Fi link varies more between consecutive 12 s runs than qnnt differs
+from raw TCP, so the honest statement is that the transport reaches the link's capacity and
+the link is what moves.
+
+  round trip, mac <-> board, 1 KiB at 20 Hz (~2% of the link), nine 5 s windows:
+      min 3.15 - 4.04 ms
+      p50 7.23 - 10.88 ms
+      p90 21.1 - 45.6 ms
+      p99 40.9 - 210.5 ms
+      max 46.4 - 264.6 ms
+      lost 0 (two windows showed 1-2 frames still in flight at the boundary)
+
+The best round trip, 3.15 ms, is again below ICMP's own minimum on the same path (4.18 ms
+measured minutes earlier). Everything above it is the radio: compare the on-board figures
+in B.3, where the same code on the same board answers in 768 us at p99. Crossing Wi-Fi
+costs four to three-hundred times the transport itself.
+
+
+B.5  the bound does not survive CPU contention
+----------------------------------------------
+
+Same on-board 1 kHz / 256 B round trip, with four shell spinners saturating all four cores:
+
+                       idle              all 4 cores busy
+      min              83-106 us         75-80 us
+      p50              448 us            128 us
+      p90              768 us            128 us
+      p99              768 us            3,648-5,376 us
+      max              785-1,077 us      6,312-47,132 us
+      lost             0                 0
+
+Nothing is lost, and the median actually improves by 3.5x -- with the cores pinned busy
+there is no idle state to come out of and no frequency ramp, so the fast path gets faster.
+But the tail collapses: p99 rises about 7x and the worst case about 45x, to 47 ms.
+
+This is the SMP PREEMPT kernel behaving exactly as documented. Preemption latency is low,
+but qnnt's threads run at default priority under SCHED_OTHER, so under contention they wait
+their turn like anything else. Low preemption latency is not a scheduling guarantee.
+
+This is what QNNT_RT_PRIORITY was added for -- see B.7, which repeats the experiment with
+the worker threads on SCHED_FIFO and gets the bound back.
+
+B.6  the same board on gigabit wired -- where the transport becomes the limit
+----------------------------------------------------------------------------
+
+Everything above for target B crossed Wi-Fi on the mac's side. Repeated with the mac moved
+to wired gigabit (en7, 1000baseT full duplex, 192.168.3.44), talking to the same board over
+the same bridge. This is the first path measured here that is fast enough for qnnt to be
+the bottleneck rather than the network, so it is the most informative section in the file.
+
+  ICMP, 30 packets:      min 1.816  avg 2.031  max 2.218 ms, stddev 0.069, 0% loss
+  raw TCP, 3 x 12 s:     mac -> board   117.62, 117.61, 117.60 MB/s
+                         board -> mac   117.30, 117.54, 117.57 MB/s
+
+Line rate, symmetric, and stable to within 0.02 MB/s between runs -- so unlike the Wi-Fi
+sections, a percentage here means something.
+
+  clock offset, board minus mac:  +126.549 ms   (best RTT 1.073 ms)
+
+It was +75.588 ms forty minutes earlier. The board's clock is drifting about 50 ms per
+hour, which is what an embedded target with no time sync does, and is another reason the
+latency figures here are round trips on one clock rather than one-way on two.
+
+throughput, publisher unpaced, both directions:
+
+                        board -> mac                      mac -> board
+  payload   frames/s    wire        of link   frames/s    wire        of link
+  64 B      270,000     24.9 MB/s   21%       845,800     77.8 MB/s   66%
+  1 KiB     111,750     117.67 MB/s 100%      111,650     117.67 MB/s 100%
+  64 KiB    1,795       117.68 MB/s 100%      1,795       117.67 MB/s 100%
+
+  gaps 0 and badpay 0 in every run; board-side decode 426-435 ns/frame throughout
+
+At 1 KiB and above qnnt saturates gigabit exactly: 117.67 MB/s against a 117.60 MB/s raw
+TCP measurement, in both directions, with the A53 on one end. Frame size is irrelevant once
+frames are large enough that per-frame cost stops mattering.
+
+At 64 B frames it is not the link any more, and the two directions differ by 3.1x:
+
+  * the board *sends* 270,000 frames/s (24.9 MB/s, 21% of the link)
+  * the board *receives and decodes* 845,800 frames/s (77.8 MB/s, 66% of the link)
+
+Receiving is three times cheaper than sending on the same CPU. The receive path reads
+whatever the kernel has buffered and decodes many frames per read, so its syscall cost
+amortises across frames; the publish path writes once per frame per subscriber, so it pays
+a syscall per message and that is what caps it. Decode is not the constraint -- 426 ns per
+frame is 2.3 M frames/s, well above what either direction reached.
+
+The practical consequence: a publisher of small messages on this class of CPU is
+syscall-bound at a few hundred thousand messages per second, and the fix is batching
+several logical messages into one frame rather than anything to do with the codec. At 1 KiB
+the same publisher reaches line rate, so the ceiling only bites below roughly 300 bytes.
+
+round trip, node-6 on the mac and node-5 on the board:
+
+                    20 Hz, 1 KiB          ~800 Hz, 256 B
+      min           877 - 1,439 us        288 - 342 us
+      p50           2,240 - 2,304 us      2,816 - 3,072 us
+      p90           2,368 - 2,432 us      3,584 - 3,648 us
+      p99           2,432 - 2,560 us      3,904 - 3,968 us
+      max           2,423 - 3,048 us      4,154 - 5,050 us
+      lost          0                     2 (in flight at the window boundary)
+
+At 20 Hz the median round trip is 2.24 ms against an ICMP average of 2.03 ms on the same
+path: the entire qnnt round trip -- two registries, two TCP hops, an encode, two decodes
+and a re-publish -- costs about 210 us more than ping. The minimum, 877 us, is below ICMP's
+own minimum.
+
+Unlike the on-board case in B.3, here the faster rate is *slower*: p50 rises from 2.24 to
+3.0 ms at 800 Hz. On loopback a hot path won; across the wire round trips start overlapping
+and each one queues behind the ones before it, since node-5 decodes and republishes on a
+single subscriber thread. The minimum still drops to 288 us, three times lower than at
+20 Hz, so the fast path does get faster -- it just is not what the median sees.
+
+against the same board over Wi-Fi (sections B.1-B.4):
+
+                        Wi-Fi              wired            improvement
+  throughput            6.5-8.4 MB/s       117.67 MB/s      14-18x
+  round trip p50        7.2-10.9 ms        2.24 ms          3-5x
+  round trip p99        40.9-210.5 ms      2.43-2.56 ms     17-82x
+
+The tail is the headline. Wi-Fi's p99 varied by a factor of five between windows and reached
+210 ms; wired, p99 sits in a 130 us band across every window measured. Nothing about qnnt
+changed between those two rows.
+
+One aside, observed by accident. Restarting node-6 while node-5 kept running reproduced the
+publisher-restart path on a third platform: the new process gets a new NodeId, the board
+held the old entry under first-wins, and node-5 stayed pointed at the dead endpoint until
+the stale entry aged out. Recovery took longer than the 32 s test window, consistent with
+the ~30-40 s measured on target A. Restarting both sides, or waiting, clears it.
+
+
+B.7  the same contention, with worker threads on SCHED_FIFO
+----------------------------------------------------------
+
+B.5 measured the tail collapsing under CPU contention because qnnt's threads ran at default
+priority. QNNT_RT_PRIORITY (qnnt_set_realtime_priority, Qnnt.setRealtimePriority,
+realtime_priority= in python) puts every worker thread on SCHED_FIFO at a chosen priority.
+Same board, same 1 kHz / 256 B on-board round trip, priority 40:
+
+                    default priority            SCHED_FIFO 40
+                    idle        4 cores busy    idle        4 cores busy
+      min           83-106 us   75-80 us        74-99 us    78 us
+      mean          410 us      219-461 us      327-363 us  85-87 us
+      p50           448 us      128 us          448 us      128 us
+      p90           768 us      128 us          448-768 us  128 us
+      p99           768 us      3,648-5,376 us  768 us      128 us
+      max           785-1,077   6,312-47,132 us 769-951 us  155-445 us
+      lost          0           0               0           0
+
+Under contention, p99 goes from about 5 ms to 128 us and the worst case from 47 ms to
+445 us -- a factor of 40 at p99 and 100 at the tail. The bound is not merely restored, it is
+better than the idle case: with four cores pinned busy there is no idle state to leave and
+no frequency ramp to wait for, and a SCHED_FIFO thread preempts the spinners immediately.
+The idle column is unchanged by the priority, which is the expected result -- there is
+nothing to preempt on an idle board.
+
+Verified that the policy is actually in force rather than merely requested:
+
+    PID     TID CLS RTPRIO COMMAND
+   2546    2546  TS      - qnnt-node-0     <- the caller's own thread, deliberately untouched
+   2546    2548  FF     40 qnnt-node-0
+   2546    2549  FF     40 qnnt-node-0     <- seven workers, all FF at 40
+   ...
+
+Three things to know before using it.
+
+It needs privilege: CAP_SYS_NICE (setcap cap_sys_nice+ep on the binary), root, or an
+RLIMIT_RTPRIO ceiling at least as high as the priority requested (ulimit -r). Acceptance of
+the setting is not the same as the kernel granting it, so the library prints a single loud
+line naming the errno if a worker is refused, and keeps running at default priority. Watch
+for that line: silently missing the bound you configured is the failure mode this is
+designed to make impossible.
+
+It is Linux only. macOS delivers real-time behaviour through thread_policy_set with a
+time-constraint policy, not POSIX priorities, so the call is refused there with a message
+rather than accepted and quietly doing nothing that helps.
+
+Do not combine it with an unpaced publisher (period_us 0). That is a busy loop at a
+priority above everything else on its core, held back only by the kernel's RT throttle
+(sched_rt_runtime_us, 950 ms of each second by default). The library warns if asked to do
+both.
+
+
+C.  reproducing any of it
+-------------------------
 
 Both hosts, same commit, ReleaseFast:
 
     zig build -Doptimize=ReleaseFast
+
+For a target with no toolchain of its own, cross-compile for its runtime and copy the
+binaries over -- this is how target B was measured:
+
+    zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-gnu.2.39 -Dcpu=cortex_a53
+
+Check the target's loader and libc first (ls /lib/ld-*, ldd --version); a mismatched glibc
+version fails at exec, and a static build silently ignores every QNNT_* variable.
 
 Link ceiling and clock offset (the helper lives in the scratch dir, not the repo -- it is
 30 lines of python doing a byte count and an NTP-style offset probe):
