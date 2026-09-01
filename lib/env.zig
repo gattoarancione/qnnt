@@ -20,6 +20,7 @@
 //!   QNNT_FEDERATION_PORT   federation's port (default 2223, 0 disables)
 //!   QNNT_PEERS             host[:port],... to dial; host may be an address or a name
 //!   QNNT_RT_PRIORITY       SCHED_FIFO priority for worker threads (Linux only)
+//!   QNNT_LOCK_MEMORY       1 to pin pages with mlockall (Linux only)
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -129,6 +130,16 @@ pub fn configureFromEnvironment() void {
         if (std.fmt.parseInt(u8, text, 10)) |value| {
             if (!qnnt.Qnnt.setRealtimePriority(value)) reject("QNNT_RT_PRIORITY", text);
         } else |_| reject("QNNT_RT_PRIORITY", text);
+    }
+
+    if (get("QNNT_LOCK_MEMORY")) |text| {
+        // Anything that plainly means "on"; anything else is a mistake worth naming rather
+        // than quietly reading as off.
+        if (qnnt.eqlAny(text, &.{ "1", "yes", "true", "on" })) {
+            if (!qnnt.Qnnt.setLockMemory(true)) reject("QNNT_LOCK_MEMORY", text);
+        } else if (qnnt.eqlAny(text, &.{ "0", "no", "false", "off" })) {
+            _ = qnnt.Qnnt.setLockMemory(false);
+        } else reject("QNNT_LOCK_MEMORY", text);
     }
 
     if (get("QNNT_PEERS")) |list| {

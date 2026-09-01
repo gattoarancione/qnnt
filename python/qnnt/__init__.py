@@ -108,6 +108,7 @@ class Node:
         cluster_key: str | None = None,
         peers: Sequence[str] | None = None,
         realtime_priority: int | None = None,
+        lock_memory: bool = False,
         queue_capacity: int = 4096,
         handle_signals: bool = False,
     ) -> None:
@@ -134,6 +135,9 @@ class Node:
             # stderr if the process may not take a real-time priority. See qnnt.h.
             _check(self._lib, self._lib.qnnt_set_realtime_priority(realtime_priority),
                    f"set_realtime_priority({realtime_priority})")
+        if lock_memory:
+            # The companion to realtime_priority: no scheduling policy stops a page fault.
+            _check(self._lib, self._lib.qnnt_set_lock_memory(1), "set_lock_memory")
         if advertise_addr:
             _check(self._lib, self._lib.qnnt_set_advertise_address(advertise_addr.encode()),
                    "set_advertise_address")

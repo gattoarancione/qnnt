@@ -64,6 +64,21 @@ export fn qnnt_realtime_priority() callconv(.c) u8 {
     return qnnt.realtimePriorityFn();
 }
 
+/// Pin the process's pages into RAM with mlockall before workers start (Linux only).
+/// The companion to qnnt_set_realtime_priority: a thread that cannot be preempted can
+/// still be stalled by a page fault.
+///
+/// As with the priority, `ok` means accepted, not granted -- a kernel refusal is printed
+/// once, to stderr, naming the errno. Note that this locks future mappings too, so an
+/// RLIMIT_MEMLOCK that is too low shows up as an allocation failure elsewhere.
+export fn qnnt_set_lock_memory(enabled: u8) callconv(.c) Status {
+    return if (qnnt.setLockMemoryFn(enabled != 0)) .ok else .failed;
+}
+
+export fn qnnt_lock_memory() callconv(.c) u8 {
+    return if (qnnt.lockMemoryFn()) 1 else 0;
+}
+
 /// The address remote subscribers should dial. Optional: leave it unset and observers
 /// fill it in from the connection they reached this host on, which is what lets a node
 /// behind a gateway work without knowing its own public address.

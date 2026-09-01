@@ -69,6 +69,24 @@ qnnt_status qnnt_set_registry_port(uint16_t port);
  */
 qnnt_status qnnt_set_realtime_priority(uint8_t priority);
 uint8_t qnnt_realtime_priority(void);
+
+/*
+ * Pin this process's memory into RAM with mlockall(MCL_CURRENT | MCL_FUTURE) before worker
+ * threads start (Linux only; off by default). Call before qnnt_init.
+ *
+ * The companion to qnnt_set_realtime_priority. A SCHED_FIFO thread cannot be preempted by
+ * another thread, but it can still be stopped for milliseconds by a major page fault, and
+ * no scheduling policy prevents that.
+ *
+ * Needs CAP_IPC_LOCK, root, or an RLIMIT_MEMLOCK ceiling above the process's size
+ * (ulimit -l). Returns qnnt_ok if accepted; a kernel refusal is printed once to stderr.
+ *
+ * Two consequences to weigh. MCL_FUTURE locks every later mapping, so if RLIMIT_MEMLOCK is
+ * too low the failure surfaces as an allocation error somewhere unrelated. And locked pages
+ * cannot be reclaimed, which on a small board is memory the rest of the system loses.
+ */
+qnnt_status qnnt_set_lock_memory(uint8_t enabled);
+uint8_t qnnt_lock_memory(void);
 uint16_t    qnnt_registry_port(void);
 
 /* Addressing. Both optional and both must precede qnnt_init.

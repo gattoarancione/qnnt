@@ -308,3 +308,21 @@ test "realtime priority is accepted only where it can be honoured" {
     try testing.expect(qnnt.setRealtimePriority(0));
     try testing.expectEqual(@as(u8, 0), qnnt.realtimePriority());
 }
+
+test "memory locking is accepted only where it is implemented" {
+    const builtin = @import("builtin");
+
+    if (builtin.os.tag == .linux) {
+        try testing.expect(qnnt.setLockMemory(true));
+        try testing.expect(qnnt.lockMemory());
+    } else {
+        try testing.expect(!qnnt.setLockMemory(true));
+        try testing.expect(!qnnt.lockMemory());
+    }
+
+    // Leave it off. MCL_FUTURE would apply to every allocation the rest of the suite makes,
+    // and on a machine with a low RLIMIT_MEMLOCK that turns into allocation failures in
+    // tests that have nothing to do with this one.
+    try testing.expect(qnnt.setLockMemory(false));
+    try testing.expect(!qnnt.lockMemory());
+}

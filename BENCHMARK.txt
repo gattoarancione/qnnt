@@ -393,30 +393,50 @@ the stale entry aged out. Recovery took longer than the 32 s test window, consis
 the ~30-40 s measured on target A. Restarting both sides, or waiting, clears it.
 
 
-B.7  the same contention, with worker threads on SCHED_FIFO
-----------------------------------------------------------
+B.7  the same contention, with a real-time configuration
+--------------------------------------------------------
 
 B.5 measured the tail collapsing under CPU contention because qnnt's threads ran at default
-priority. QNNT_RT_PRIORITY (qnnt_set_realtime_priority, Qnnt.setRealtimePriority,
-realtime_priority= in python) puts every worker thread on SCHED_FIFO at a chosen priority.
+priority. Two settings address it, and they are separate concerns:
+
+  QNNT_RT_PRIORITY=40     SCHED_FIFO for every worker thread, so nothing at default
+                          priority can preempt them
+  QNNT_LOCK_MEMORY=1      mlockall, so a page fault cannot stall a thread that scheduling
+                          alone has made unpreemptable
+
+(qnnt_set_realtime_priority / qnnt_set_lock_memory in C, Qnnt.setRealtimePriority /
+Qnnt.setLockMemory in Zig, realtime_priority= / lock_memory= in python.)
+
 Same board, same 1 kHz / 256 B on-board round trip, priority 40:
 
-                    default priority            SCHED_FIFO 40
-                    idle        4 cores busy    idle        4 cores busy
-      min           83-106 us   75-80 us        74-99 us    78 us
-      mean          410 us      219-461 us      327-363 us  85-87 us
-      p50           448 us      128 us          448 us      128 us
-      p90           768 us      128 us          448-768 us  128 us
-      p99           768 us      3,648-5,376 us  768 us      128 us
-      max           785-1,077   6,312-47,132 us 769-951 us  155-445 us
-      lost          0           0               0           0
+                    default         SCHED_FIFO 40   FIFO 40 + mlockall
+                    4 cores busy    4 cores busy    4 cores busy
+      min           75-80 us        78 us           78-82 us
+      mean          219-461 us      85-87 us        85-87 us
+      p50           128 us          128 us          128 us
+      p90           128 us          128 us          128 us
+      p99           3,648-5,376 us  128 us          128 us
+      max           6,312-47,132 us 155-445 us      117-170 us
+      lost          0               0               0
 
-Under contention, p99 goes from about 5 ms to 128 us and the worst case from 47 ms to
-445 us -- a factor of 40 at p99 and 100 at the tail. The bound is not merely restored, it is
-better than the idle case: with four cores pinned busy there is no idle state to leave and
-no frequency ramp to wait for, and a SCHED_FIFO thread preempts the spinners immediately.
-The idle column is unchanged by the priority, which is the expected result -- there is
-nothing to preempt on an idle board.
+and idle, for reference, where there is nothing to preempt and little to fault:
+
+                    default         SCHED_FIFO 40   FIFO 40 + mlockall
+      p50 / p99     448 / 768 us    448 / 768 us    448 / 448-768 us
+      max           785-1,077 us    769-951 us      694-1,013 us
+
+SCHED_FIFO does the heavy lifting: under contention p99 goes from about 5 ms to 128 us and
+the worst case from 47 ms to 445 us, a factor of 40 at p99 and 100 at the tail. The bound is
+not merely restored, it is better than the idle case -- with four cores pinned busy there is
+no idle state to leave and no frequency ramp to wait for, and a real-time thread preempts
+the spinners immediately.
+
+mlockall then takes the residual tail: the worst case drops again from 445 us to 170 us
+without moving p50 or p99, which is exactly the signature of removing occasional page
+faults rather than a systematic cost. Neither setting changes the idle columns, as expected.
+
+So the full configuration on this board, with all four cores contended, is p99 128 us and a
+worst case of 170 us -- against 5 ms and 47 ms unconfigured.
 
 Verified that the policy is actually in force rather than merely requested:
 
@@ -426,18 +446,42 @@ Verified that the policy is actually in force rather than merely requested:
    2546    2549  FF     40 qnnt-node-0     <- seven workers, all FF at 40
    ...
 
-Three things to know before using it.
+One measurement worth repeating, because it decided how locking is implemented. qnnt
+reserves far more address space than it uses -- about 440 MB of mostly untouched allocator
+arenas -- and a plain mlockall(MCL_CURRENT | MCL_FUTURE) populates all of it:
 
-It needs privilege: CAP_SYS_NICE (setcap cap_sys_nice+ep on the binary), root, or an
-RLIMIT_RTPRIO ceiling at least as high as the priority requested (ulimit -r). Acceptance of
+      resident, no locking                       8.8 MB
+      resident and pinned, CURRENT|FUTURE         184 MB
+      resident and pinned, +ONFAULT              10.5 MB
+
+184 MB of unevictable memory on a 1.8 GB board, to protect a hot path needing about 9 MB.
+So qnnt asks for MCL_ONFAULT as well: a page is locked the first time it is touched and
+never faults again, which gives the same fault-free steady state for the memory actually
+in use. System-wide Mlocked confirms it -- 10.5 MB per node, released on exit. Kernels
+older than 4.4 reject the flag, and the library falls back to CURRENT|FUTURE and says so.
+
+The consequence of ONFAULT is that warm-up still faults. Let a real-time path run once
+before trusting its tail.
+
+Four things to know before using either setting.
+
+They need privilege, and different privileges: CAP_SYS_NICE, root, or RLIMIT_RTPRIO
+(ulimit -r) for the priority; CAP_IPC_LOCK, root, or RLIMIT_MEMLOCK (ulimit -l) for the
+locking. On the board both were available because the nodes ran as root; the shell's
+RLIMIT_MEMLOCK was 8 MB, which root's CAP_IPC_LOCK bypasses -- an unprivileged user with
+that limit would be refused. Acceptance of
 the setting is not the same as the kernel granting it, so the library prints a single loud
 line naming the errno if a worker is refused, and keeps running at default priority. Watch
 for that line: silently missing the bound you configured is the failure mode this is
 designed to make impossible.
 
-It is Linux only. macOS delivers real-time behaviour through thread_policy_set with a
-time-constraint policy, not POSIX priorities, so the call is refused there with a message
-rather than accepted and quietly doing nothing that helps.
+Both are Linux only. macOS delivers real-time behaviour through thread_policy_set with a
+time-constraint policy rather than POSIX priorities, and Zig's standard library does not
+even declare MCL for it, so both calls are refused there with a message rather than
+accepted and quietly doing nothing that helps.
+
+MCL_FUTURE covers later mappings too, so if RLIMIT_MEMLOCK is too low the failure appears
+as an allocation error somewhere unrelated to this call rather than here.
 
 Do not combine it with an unpaced publisher (period_us 0). That is a busy loop at a
 priority above everything else on its core, held back only by the kernel's RT throttle

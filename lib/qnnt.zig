@@ -146,6 +146,105 @@ pub fn isShuttingDown() bool {
     return shutting_down.load(.monotonic);
 }
 
+// ---------------------------------------------------------------- memory locking
+
+// Whether to pin the process's pages into RAM with mlockall, so a latency-critical path
+// cannot be interrupted by a page fault. Off by default.
+//
+// Linux only, like the priority setting above, and this time std says so too: it declares
+// MCL only for Linux and the BSDs, and mlockall is reachable as a raw syscall on Linux
+// without needing libc.
+//
+// Its scope is the process, not a thread, which is why it is applied once in `nodeRun`
+// rather than per worker. MCL_CURRENT pins everything already mapped -- worker stacks
+// included, whenever they were created -- and MCL_FUTURE pins whatever gets mapped later.
+var lock_memory_requested = false;
+
+/// Ask for the process's memory to be locked into RAM before workers start. Must be called
+/// before `run()`.
+///
+/// This is the second half of a real-time configuration, the first being
+/// `setRealtimePriority`: a thread that cannot be preempted can still be stopped for
+/// milliseconds by a major page fault, and no scheduling policy prevents that.
+///
+/// Pages are locked as they are first touched (MCL_ONFAULT), not pre-populated, so the
+/// cost is only the memory actually used -- see the note in `applyMemoryLocking` for the
+/// measurement that decided this. The consequence is that warm-up still faults; run the
+/// path once before trusting its tail.
+///
+/// Be deliberate about it anyway. MCL_FUTURE means every later mapping is locked too, so a
+/// process that grows can hit ENOMEM in an allocation far from here if RLIMIT_MEMLOCK is
+/// not high enough, and locked pages cannot be reclaimed under pressure -- on a small
+/// board that is memory the rest of the system no longer has.
+pub fn setLockMemoryFn(enabled: bool) bool {
+    if (node_running) return false;
+
+    if (enabled and @import("builtin").os.tag != .linux) {
+        std.debug.print(
+            "memory locking ignored: mlockall is used here on Linux, and this is {s}\n",
+            .{@tagName(@import("builtin").os.tag)},
+        );
+        return false;
+    }
+
+    lock_memory_requested = enabled;
+    return true;
+}
+
+pub fn lockMemoryFn() bool {
+    return lock_memory_requested;
+}
+
+// Applied once, at the top of nodeRun, before anything is spawned or allocated.
+fn applyMemoryLocking() void {
+    if (!lock_memory_requested) return;
+    if (@import("builtin").os.tag != .linux) return;
+
+    const linux = std.os.linux;
+
+    // ONFAULT matters more than it looks. Without it, mlockall populates every mapping,
+    // and this process reserves far more address space than it uses -- the allocator holds
+    // ~440 MB of mostly untouched arenas. Measured on the i.MX board: 8.8 MB resident
+    // normally, 184 MB with CURRENT|FUTURE, all of it unevictable, for a hot path that
+    // needs about 9 MB. That is 10% of a 1.8 GB board pinned to no purpose.
+    //
+    // With ONFAULT a page is locked the first time it is touched and never faults again,
+    // so the steady state is fault-free -- which is what a deadline needs -- without
+    // pinning memory the process never uses. The cost is one minor fault per page during
+    // warm-up, so let a real-time path run once before trusting its tail.
+    var rc = linux.mlockall(.{ .CURRENT = true, .FUTURE = true, .ONFAULT = true });
+    var err = linux.errno(rc);
+    var on_fault = true;
+
+    // ONFAULT arrived in Linux 4.4; older kernels reject the flag rather than ignore it.
+    if (err == .INVAL) {
+        rc = linux.mlockall(.{ .CURRENT = true, .FUTURE = true });
+        err = linux.errno(rc);
+        on_fault = false;
+    }
+
+    if (err == .SUCCESS) {
+        if (on_fault) {
+            std.debug.print("memory locked into RAM (mlockall CURRENT|FUTURE|ONFAULT: " ++
+                "pages lock as they are first touched)\n", .{});
+        } else {
+            std.debug.print("memory locked into RAM (mlockall CURRENT|FUTURE; this kernel " ++
+                "has no ONFAULT, so every mapping is resident and pinned)\n", .{});
+        }
+        return;
+    }
+
+    // Reported the same way a refused priority is, and for the same reason: a node that
+    // silently runs unlocked after being asked to lock has lost a guarantee nobody will
+    // notice is missing until a page fault lands in the middle of a deadline.
+    std.debug.print(
+        "memory locking REFUSED by the kernel ({s}); pages are NOT pinned and a page fault " ++
+            "can still stall a worker. mlockall needs CAP_IPC_LOCK (setcap cap_ipc_lock+ep), " ++
+            "root, or an RLIMIT_MEMLOCK ceiling above this process's size (ulimit -l).\n",
+        .{@tagName(err)},
+    );
+}
+
 // ---------------------------------------------------------------- realtime scheduling
 
 // SCHED_FIFO priority for worker threads; 0 leaves them wherever the kernel put them.
@@ -440,6 +539,8 @@ pub const Qnnt = struct {
     pub const registryPort = &currentRegistryPort;
     pub const setRealtimePriority = &setRealtimePriorityFn;
     pub const realtimePriority = &realtimePriorityFn;
+    pub const setLockMemory = &setLockMemoryFn;
+    pub const lockMemory = &lockMemoryFn;
 
     /// Addressing. Both must be set before `run()`. Defaults keep everything on
     /// loopback, so a local deployment is unchanged and nothing is exposed unasked.
@@ -1981,6 +2082,10 @@ pub fn nodeRun() bool {
     shutting_down.store(false, .monotonic);
     registry_since_us.store(0, .monotonic);
     node_running = true;
+
+    // Before the allocator and the workers, so there is as little already-faulted memory
+    // as possible and MCL_FUTURE covers everything that follows.
+    applyMemoryLocking();
 
     io_impl = .init(allocator, .{});
     io = io_impl.io();

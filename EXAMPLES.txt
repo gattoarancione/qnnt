@@ -265,6 +265,7 @@ it does not:
     QNNT_CLUSTER_KEY=some-secret   shared by every node in the cluster -- REQUIRED
     QNNT_PEERS=10.0.0.8,nodeb.local  address or hostname, optional :port, comma-separated
     QNNT_RT_PRIORITY=40             SCHED_FIFO priority for worker threads (Linux)
+    QNNT_LOCK_MEMORY=1              pin pages with mlockall (Linux)
     QNNT_FEDERATION_PORT=2223      optional; 2223 by default, and 0 disables
 
 The key is not optional because an unauthenticated directory reachable from a
@@ -444,9 +445,10 @@ Everything else `zig build` can do:
 Real-time worker threads
 ------------------------
 
-On Linux, QNNT_RT_PRIORITY puts every qnnt worker thread on SCHED_FIFO at that priority:
+On Linux, QNNT_RT_PRIORITY puts every qnnt worker thread on SCHED_FIFO at that priority,
+and QNNT_LOCK_MEMORY pins the process's pages so a page fault cannot stall one:
 
-    QNNT_RT_PRIORITY=40 ./zig-out/bin/qnnt-node-0
+    QNNT_RT_PRIORITY=40 QNNT_LOCK_MEMORY=1 ./zig-out/bin/qnnt-node-0
 
 The node says so on startup ("worker threads requesting SCHED_FIFO priority 40"), and the
 threads can be checked with:
@@ -454,17 +456,29 @@ threads can be checked with:
     ps -Lo pid,tid,cls,rtprio,comm -p $(pgrep -f qnnt-node-0 | head -1)
 
 CLS is FF for the workers. The process's own main thread stays TS on purpose -- the library
-does not change the scheduling of a thread it did not create.
+does not change the scheduling of a thread it did not create. Locking shows up as:
 
-It needs privilege: root, CAP_SYS_NICE (setcap cap_sys_nice+ep on the binary), or an
-RLIMIT_RTPRIO ceiling at least that high (ulimit -r). Without it the node prints one line
-naming the errno and carries on at default priority, so watch for that line -- the whole
-point of the feature is a latency bound, and losing it silently would be worse than not
-asking. It is refused outright on macOS, where POSIX priorities are not how real-time
-scheduling is expressed.
+    grep -E "VmLck|VmRSS" /proc/$(pgrep -f qnnt-node-0 | head -1)/status
+    grep Mlocked /proc/meminfo        # system-wide, and the honest number
+
+VmLck counts locked address space, most of which is untouched allocator reservation;
+Mlocked is the RAM actually pinned, about 10 MB per node. Pages are locked as they are
+first touched (MCL_ONFAULT), so warm-up still faults -- run a real-time path once before
+trusting its tail.
+
+They need privilege, and different privileges: root, CAP_SYS_NICE or ulimit -r for the
+priority; root, CAP_IPC_LOCK or ulimit -l for the locking. Without it the node prints one
+line naming the errno and carries on unconfigured, so watch for that line -- the whole
+point is a latency bound, and losing it silently would be worse than not asking. Both are
+refused outright on macOS, where neither is how real-time behaviour is expressed.
 
 Do not combine it with an unpaced publisher (period 0): that is a busy loop outranking
 everything else on its core. The library warns if you ask for both.
 
 Measured effect on an i.MX A53 board, 1 kHz round trip with all four cores contended:
-p99 5 ms at default priority, 128 us on SCHED_FIFO. See BENCHMARK.txt B.5 and B.7.
+
+    default priority        p99 5 ms      worst case 47 ms
+    SCHED_FIFO 40           p99 128 us    worst case 445 us
+    + mlockall              p99 128 us    worst case 170 us
+
+See BENCHMARK.txt B.5 and B.7.
