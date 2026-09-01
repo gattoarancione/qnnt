@@ -251,6 +251,10 @@ pub fn build(b: *Build) void {
         .{ .name = "qnnt-node-2", .src = "src/node-2.zig", .step = "run-2" },
         .{ .name = "qnnt-node-3", .src = "src/node-3.zig", .step = "run-3" },
         .{ .name = "qnnt-node-4", .src = "src/node-4.zig", .step = "run-4" },
+        // The round-trip pair: node-6 probes, node-5 echoes. Separate from the one-way
+        // pair above because a round trip needs one clock, not two agreeing ones.
+        .{ .name = "qnnt-node-5", .src = "src/node-5.zig", .step = "run-5" },
+        .{ .name = "qnnt-node-6", .src = "src/node-6.zig", .step = "run-6" },
     };
 
     for (nodes) |node| {

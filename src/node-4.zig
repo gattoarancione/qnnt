@@ -12,6 +12,15 @@
 //!   * latency is measured from the timestamp node-3 wrote while encoding to the
 //!     moment the frame finished decoding here, so it covers encode, publish, the
 //!     kernel's loopback, the read and the decode. It is not decode cost alone.
+//!   * that latency figure is only valid when publisher and subscriber share a clock,
+//!     i.e. on one host. Across two it is offset + latency, and the offset wins: the two
+//!     machines this was last run on differed by 86 ms, which is an order of magnitude
+//!     more than the delay being measured, and in the other direction the subtraction
+//!     goes negative and clamps to zero. For a cross-host figure use node-6/node-5, which
+//!     measure a round trip against a single clock.
+//!   * the latency histogram spans bucket_us * bucket_count = 16.4 ms. On a path slower
+//!     than that -- any real LAN under load -- p50 and p99 pin to the top bucket and only
+//!     min/mean/max stay meaningful.
 //!   * the decoder microbenchmark re-decodes one captured frame in a tight loop, which
 //!     isolates decode cost from everything else. Build with -Doptimize=ReleaseFast
 //!     for that figure to mean anything.
@@ -140,7 +149,7 @@ fn report(now_us: u64) void {
     const frames_f = @as(f64, @floatFromInt(window_frames));
 
     std.debug.print(
-        "node-4 {d:.0} frames/s | wire {d:.1} KB/s payload {d:.1} KB/s | lat us min {d} mean {d:.0} p50 {d} p99 {d} max {d} | gaps {d} badpay {d} err {d} | {d} total\n",
+        "node-4 {d:.0} frames/s | wire {d:.1} KiB/s payload {d:.1} KiB/s | lat us min {d} mean {d:.0} p50 {d} p99 {d} max {d} | gaps {d} badpay {d} err {d} | {d} total\n",
         .{
             frames_f / elapsed_s,
             @as(f64, @floatFromInt(window_wire_bytes)) / elapsed_s / 1024.0,

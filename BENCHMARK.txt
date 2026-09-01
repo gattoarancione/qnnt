@@ -1,0 +1,177 @@
+qnnt transport benchmark -- two real hosts on a real LAN
+========================================================
+
+Measured 2026-09-01 between the development mac and the LAN linux machine, both running
+the same commit built with -Doptimize=ReleaseFast. Numbers from a loopback run on one box
+are included, not as the headline but because without them there is no way to tell whether
+a LAN figure is reporting the library or the network.
+
+Short version: on this path the library is not the bottleneck and cannot be seen. qnnt
+carries 94-99% of what raw TCP carries between the same two hosts, and its round trip
+bottoms out at or below ICMP's. The loopback ceiling on the same hardware is roughly 1200x
+the LAN's capacity, so every LAN figure below is a measurement of the link.
+
+
+1. what was measured against
+----------------------------
+
+  mac      192.168.16.204, Wi-Fi (en0), 802.11ax on channel 11 -- 2.4 GHz, 20 MHz wide
+           signal -44 dBm (strong), PHY transmit rate 229 Mb/s
+  linux    192.168.16.211 (eth0), 100 Mb/s full duplex, MTU 1500, x86_64
+           the same host also has wlan0 on .210; eth0 carries this traffic
+
+  ICMP round trip, mac -> linux, 30 packets:  min 3.24  avg 14.35  max 55.85 ms, 0% loss
+
+The path is Wi-Fi to an access point, then wired to the linux box. There is no packet loss
+on it, but the delay varies by a factor of twenty, which is 2.4 GHz airtime contention and
+radio power save rather than anything qnnt does.
+
+  raw TCP, single stream, 20 s, measured with the sink counting bytes:
+
+      mac   -> linux     0.361 MB/s     (2.9 Mb/s)
+      linux -> mac       1.157 MB/s     (9.3 Mb/s)
+
+Both far below the 100 Mb/s wire and the 229 Mb/s radio: the mac's Wi-Fi uplink is the
+limit, and it is asymmetric by 3.2x. This is the number every LAN figure below is compared
+against, because it is what the path can carry at all.
+
+
+2. the clocks disagree, which decides how latency is measured
+------------------------------------------------------------
+
+  clock offset, linux minus mac:   +86.396 ms      (best of 200 probes, best RTT 2.774 ms)
+
+That matters more than it sounds. node-4 measures one-way latency by subtracting the
+timestamp the publisher wrote from its own clock, which is exact on one host and useless
+across two: 86 ms of offset against a few ms of real delay. In the linux -> mac direction
+the subtraction even goes negative and clamps to zero.
+
+So the latency figures here come from node-6 and node-5 instead. node-6 publishes a frame
+stamped with its own clock, node-5 echoes it back unchanged, and node-6 subtracts using the
+same clock that issued the stamp. No synchronisation is needed, or even a correct clock.
+The result is a round trip rather than one way, which is the honest thing to report on a
+link whose two directions differ by 3.2x anyway.
+
+
+3. loopback ceiling -- the library with no network in the way
+------------------------------------------------------------
+
+linux box, node-3 -> node-4 on 127.0.0.1, publisher unpaced, ReleaseFast:
+
+  payload    frame     frames/s     wire         payload      decode      gaps
+  64 B       88 B      ~700,000     64.6 MB/s    45.0 MB/s    119 ns      0
+  1 KiB      1050 B    ~527,000     562.7 MB/s   546.6 MB/s   126 ns      0
+  64 KiB     65564 B   ~21,300      1426 MB/s    1425 MB/s     75 ns      0
+
+Zero gaps and zero payload mismatches throughout; the payload is a 0..255 pattern checked
+byte for byte, so a framing slip would show up as corruption rather than being missed.
+
+Decode cost is flat in payload size -- 75 to 126 ns per frame whether the frame is 88 bytes
+or 64 KiB -- because decoding walks fields, not bytes. The 64 KiB frame decodes *faster*
+per frame than the 88 B one: same field count, and the cost is dominated by per-frame work.
+
+
+4. over the LAN, linux publishing, mac subscribing
+-------------------------------------------------
+
+Publisher unpaced, so the link saturates and these are ceiling measurements. Compare the
+wire column against the 1.157 MB/s raw TCP figure from section 1.
+
+  payload    frame     frames/s   wire         payload goodput   framing   gaps
+  64 B       88 B      ~12,700    1.16 MB/s    0.83 MB/s         72.7%     0
+  1 KiB      1050 B    ~1,100     1.18 MB/s    1.15 MB/s         97.5%     0
+  64 KiB     65564 B   ~18        1.18 MB/s    1.17 MB/s         99.96%    0
+
+Wire throughput is the same at all three frame sizes and equal to raw TCP within the
+variance of the radio -- the best 1 KiB window came out slightly above the raw figure taken
+minutes earlier, which is Wi-Fi drifting, not qnnt beating TCP. The transport reaches the
+link's limit regardless of frame size.
+
+What frame size does change is goodput, and only through fixed framing overhead: 24 bytes
+at 64 B payload, 26 at 1 KiB, 28 at 64 KiB. At 64 B payload more than a quarter of the wire
+is envelope; at 1 KiB it is 2.5%; at 64 KiB it is not measurable. If a workload sends small
+messages over a slow link, batching them into one frame is the only lever that matters.
+
+Reverse direction, 1 KiB, against the 0.361 MB/s ceiling that way:
+
+      mac -> linux       0.341 - 0.355 MB/s wire      94 - 98% of raw TCP,  0 gaps
+
+Not one gap or corrupt payload was seen in any run, in either direction, at any frame size.
+
+
+5. round trip latency, measured on one clock
+--------------------------------------------
+
+node-6 <-> node-5, 1 KiB frames at 20 Hz. That is 20 KB/s, under 2% of the link, so this
+measures the path rather than the queue it builds when saturated.
+
+  mac loopback (same host, for reference):
+      min 83 us    p50 192 us    p90 256 us    p99 320 us    max 874 us
+
+  mac <-> linux over the LAN, ten consecutive 5 s windows:
+      min 2.66 - 4.02 ms
+      p50 4.29 - 13.6 ms
+      p90 23.0 - 79.8 ms
+      p99 37.2 - 233 ms
+      max 41.5 - 285 ms
+      lost 0
+
+The best round trip, 2.66 ms, is below ICMP's own minimum on the same path (3.09 ms
+measured separately), so a full publish-subscribe round trip through two registries, two
+TCP connections, an encode, two decodes and a re-publish costs less than the noise floor of
+the network. The library's contribution is the loopback line: about 0.2 ms.
+
+Everything above that is the radio. p90 to p99 spanning 23 to 233 ms with no packet loss is
+2.4 GHz airtime contention, and it is the same shape ping shows (3 to 56 ms). Any latency
+budget on a Wi-Fi LAN has to be written around this, not around the transport.
+
+Under saturation the picture is different and worth stating plainly: with an unpaced
+publisher, one-way delay grows to 145 ms at 64 B frames, ~550 ms at 1 KiB and ~950 ms at
+64 KiB. That is queueing in the sender's socket buffer -- bufferbloat -- not transport cost.
+A publisher that must bound latency has to pace itself below the link rate; qnnt will
+happily fill the pipe if asked to.
+
+
+6. reproducing it
+-----------------
+
+Both hosts, same commit, ReleaseFast:
+
+    zig build -Doptimize=ReleaseFast
+
+Link ceiling and clock offset (the helper lives in the scratch dir, not the repo -- it is
+30 lines of python doing a byte count and an NTP-style offset probe):
+
+    python3 netprobe.py serve-tput 5302 20          # on the receiver
+    python3 netprobe.py send-tput  <host> 5302 20   # on the sender
+    python3 netprobe.py serve-clock 5301 60         # on one host
+    python3 netprobe.py probe-clock <host> 5301 200 # on the other
+
+Throughput, publisher on host A and subscriber on host B:
+
+    # host A
+    QNNT_CLUSTER_KEY=bench QNNT_REGISTRY_PORT=2222 QNNT_FEDERATION_PORT=2223 \
+      ./zig-out/bin/qnnt-node-3 0 1024          # period_us=0 (unpaced), 1024 B payload
+
+    # host B
+    QNNT_CLUSTER_KEY=bench QNNT_REGISTRY_PORT=2222 QNNT_FEDERATION_PORT=2223 \
+      QNNT_PEERS=<host A>:2223 ./zig-out/bin/qnnt-node-4 5000
+
+Round trip, prober on A and echo on B:
+
+    # host B
+    QNNT_CLUSTER_KEY=bench QNNT_REGISTRY_PORT=2222 QNNT_FEDERATION_PORT=2223 \
+      ./zig-out/bin/qnnt-node-5
+
+    # host A
+    QNNT_CLUSTER_KEY=bench QNNT_REGISTRY_PORT=2222 QNNT_FEDERATION_PORT=2223 \
+      QNNT_PEERS=<host B>:2223 ./zig-out/bin/qnnt-node-6 50000 1024 5000
+
+Neither host needs to know its own address: the subscriber learns the publisher's endpoint
+through federation, and the address it records is the one its own connection arrived on.
+
+Two things to know when reading the output. node-3's frames/s counts source-callback
+invocations, not deliveries, so an unpaced publisher with no subscriber attached spins at
+millions per second and its rate drops to the network rate once one connects. And node-4's
+latency columns are only valid on one host, for the reason in section 2 -- across hosts,
+read node-6 instead.

@@ -93,7 +93,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("unpaced (no target rate)\n", .{});
     } else {
         const rate = 1_000_000.0 / @as(f64, @floatFromInt(period_us));
-        std.debug.print("{d}us period ({d:.1} Hz), target {d:.1} KB/s\n", .{
+        std.debug.print("{d}us period ({d:.1} Hz), target {d:.1} KiB/s\n", .{
             period_us,
             rate,
             rate * @as(f64, @floatFromInt(frame_bytes)) / 1024.0,
@@ -122,7 +122,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const d_sent = now_sent - last_sent;
         const d_bytes = now_bytes - last_bytes;
 
-        std.debug.print("node-3 sent {d:.0} frames/s ({d:.1} KB/s), {d} total\n", .{
+        std.debug.print("node-3 sent {d:.0} frames/s ({d:.1} KiB/s), {d} total\n", .{
             @as(f64, @floatFromInt(d_sent)) / elapsed_s,
             @as(f64, @floatFromInt(d_bytes)) / elapsed_s / 1024.0,
             now_sent,
