@@ -76,6 +76,8 @@ pub fn build(b: *Build) void {
         if (linkage == .static) qnnt_c_static = lib else qnnt_c_dynamic = lib;
     }
 
+    const mesh_step = b.step("mesh", "Build the interop mesh nodes (examples/mesh/)");
+
     // The Qt interface proposal, built only when told where Qt is. Qt is not a dependency
     // of qnnt and `zig build test` must work without it, so this is opt-in rather than
     // detected: -Dqt=/path/to/Qt/6.10.3/macos (a kit directory containing lib/ and
@@ -134,6 +136,120 @@ pub fn build(b: *Build) void {
         const run_qt_demo = b.addRunArtifact(qt_demo);
         const qt_step = b.step("qt-demo", "Build and run the Qt interface example (needs -Dqt=...)");
         qt_step.dependOn(&run_qt_demo.step);
+
+        // The cross-language pairs. Each is two processes, so a step runs only the Qt half
+        // -- start the Python side in another terminal.
+        //
+        //   qt-telemetry : Qt packs a struct, examples/telemetry_receiver.py unpacks it
+        //   qt-receiver  : examples/telemetry_sender.py packs it, Qt unpacks it
+        const qt_examples = [_]struct {
+            name: []const u8,
+            src: []const u8,
+            step: []const u8,
+            help: []const u8,
+        }{
+            .{
+                .name = "mesh-qt",
+                .src = "examples/mesh/node_qt.cpp",
+                .step = "mesh-qt",
+                .help = "Build the Qt node of the interop mesh (needs -Dqt=...)",
+            },
+        };
+
+        for (qt_examples) |ex| {
+            // Each declares its own QObject in the .cpp and includes the moc output at the
+            // bottom, so each needs its own moc run.
+            const ex_moc = b.addSystemCommand(&.{b.pathJoin(&.{ qt_path, "libexec", "moc" })});
+            ex_moc.addArgs(&.{"-I"});
+            ex_moc.addDirectoryArg(b.path("include"));
+            ex_moc.addFileArg(b.path(ex.src));
+            ex_moc.addArg("-o");
+            const ex_moc_out = ex_moc.addOutputFileArg(b.fmt("{s}.moc", .{std.fs.path.stem(ex.src)}));
+
+            const ex_mod = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+                .link_libcpp = true,
+            });
+            ex_mod.addCSourceFile(.{ .file = b.path(ex.src), .flags = &.{ "-std=c++20", "-Wall" } });
+            ex_mod.addCSourceFile(.{ .file = moc_out, .flags = &.{"-std=c++20"} });
+            ex_mod.addIncludePath(b.path("include"));
+            ex_mod.addIncludePath(ex_moc_out.dirname());
+            ex_mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "include" }) });
+            ex_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "lib" }) });
+            if (target.result.os.tag == .macos) {
+                ex_mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "lib", "QtCore.framework", "Headers" }) });
+                ex_mod.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "lib" }) });
+                ex_mod.linkFramework("QtCore", .{});
+            } else {
+                ex_mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "include", "QtCore" }) });
+                ex_mod.linkSystemLibrary("Qt6Core", .{});
+            }
+            ex_mod.linkLibrary(qnnt_c_static);
+
+            const exe = b.addExecutable(.{ .name = ex.name, .root_module = ex_mod });
+            b.installArtifact(exe);
+
+            const step = b.step(ex.step, ex.help);
+            step.dependOn(&exe.step);
+
+            // So that `zig build mesh -Dqt=...` builds all five rather than four.
+            if (std.mem.eql(u8, ex.name, "mesh-qt")) {
+                mesh_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- the interop mesh
+    //
+    // examples/mesh/ holds one node per language, all publishing the same struct on their
+    // own topic and receiving it from the other four. `zig build mesh` builds the four that
+    // need a toolchain; the Python node needs none, and the Qt node appears when -Dqt is
+    // given (see below). examples/mesh/run.sh starts them all.
+    const mesh_zig_mod = b.createModule(.{
+        .root_source_file = b.path("examples/mesh/node.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mesh_zig_mod.addImport("qnnt", qnnt_lib_mod);
+    const mesh_zig = b.addExecutable(.{ .name = "mesh-zig", .root_module = mesh_zig_mod });
+    mesh_zig.root_module.linkLibrary(qnnt_lib);
+    b.installArtifact(mesh_zig);
+    // The install step, not the compile step: `zig build mesh` has to leave the binaries in
+    // zig-out/bin where run.sh looks for them.
+    mesh_step.dependOn(&b.addInstallArtifact(mesh_zig, .{}).step);
+
+    const mesh_natives = [_]struct {
+        name: []const u8,
+        src: []const u8,
+        cpp: bool,
+    }{
+        .{ .name = "mesh-c", .src = "examples/mesh/node.c", .cpp = false },
+        .{ .name = "mesh-cpp", .src = "examples/mesh/node.cpp", .cpp = true },
+    };
+
+    for (mesh_natives) |node| {
+        const mod = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .link_libcpp = node.cpp,
+        });
+        mod.addCSourceFile(.{
+            .file = b.path(node.src),
+            .flags = if (node.cpp)
+                &.{ "-std=c++20", "-Wall", "-Wextra", "-Werror" }
+            else
+                &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+        });
+        mod.addIncludePath(b.path("include"));
+        mod.linkLibrary(qnnt_c_static);
+
+        const exe = b.addExecutable(.{ .name = node.name, .root_module = mod });
+        b.installArtifact(exe);
+        mesh_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
 
     const test_step = b.step("test", "Run unit tests");

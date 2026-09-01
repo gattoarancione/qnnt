@@ -602,3 +602,157 @@ What it does NOT declare, because the library cannot do it yet: request/reply
 (addResponder, request, requestAvailable), per-topic teardown (removePublisher,
 removeSubscriber) and connection-lifecycle signals (publisherConnected and friends). Each
 is listed at the bottom of the header with what implementing it would take.
+
+
+A Qt node sending a struct to a Python node
+-------------------------------------------
+
+examples/qt_telemetry.cpp publishes a struct; examples/telemetry_receiver.py receives it as
+a dataclass. Two terminals:
+
+  Terminal 1 -- the receiver, started first so it sees every message:
+
+    export QNNT_LIBRARY=$PWD/zig-out/lib/libqnnt_c.dylib      # .so on Linux
+    python3 -u examples/telemetry_receiver.py
+
+  Terminal 2 -- the Qt publisher:
+
+    zig build qt-telemetry -Dqt=/Users/you/Qt/6.10.3/macos
+
+The C++ side declares:
+
+    enum class Mode : int { idle = 0, running = 1, faulted = 2 };
+
+    struct Telemetry {
+        quint64 seq;
+        QString name;
+        Mode mode;
+        QList<double> samples;
+        QByteArray blob;
+        QMap<QString, int> tags;
+        TLD_DEFINE_MAP(seq, name, mode, samples, blob, tags)
+    };
+
+and the Python side, independently:
+
+    @dataclass
+    class Telemetry:
+        seq: int
+        name: str
+        mode: Mode              # an IntEnum
+        samples: list[float]
+        blob: bytes
+        tags: dict[str, int]
+
+Nothing generates one from the other. The whole contract is the topic name, a registry port
+both agree on, and matching field names -- which is why TLD_DEFINE_MAP rather than
+TLD_DEFINE: with names on the wire, either side can add a field without breaking the other,
+and a reordering cannot silently swap two values.
+
+What actually arrives:
+
+    got seq=7 name='qt-node' mode=running samples=[0.141, -0.99, 9.0] blob=00ff0a
+        tags={'rev': 6, 'site': 4}
+
+    received 10 of 10, dropped 0
+    all checks passed: the Qt struct arrived intact in Python
+
+QString becomes str, QList<double> becomes list[float], QByteArray becomes bytes (the blob
+is 00 FF 0A, which would be invalid as text -- that is the difference between a QByteArray
+and a QString on the wire), QMap<QString,int> becomes dict[str, int], and the enum travels
+as its integer, which IntEnum accepts directly.
+
+The receiver stops when the stream goes quiet rather than after a fixed count, and checks
+the sequence is contiguous from wherever it attached rather than from 1. A subscriber that
+starts after the publisher legitimately misses the beginning: qnnt has no replay, and
+pretending otherwise would make the example fail for the wrong reason.
+
+
+...and the other way round: Python sending, Qt receiving
+--------------------------------------------------------
+
+examples/telemetry_sender.py publishes; examples/qt_receiver.cpp receives. Nothing about
+the wire changes -- the mapping is symmetric, so only the declarations swap sides.
+
+  Terminal 1 -- the Qt receiver, started first:
+
+    zig build qt-receiver -Dqt=/Users/you/Qt/6.10.3/macos
+
+  Terminal 2 -- the Python sender:
+
+    export QNNT_LIBRARY=$PWD/zig-out/lib/libqnnt_c.dylib      # .so on Linux
+    python3 -u examples/telemetry_sender.py
+
+This pair deliberately disagrees about the struct, to show what that costs:
+
+    Python sends            C++ declares
+    ------------            ------------
+    seq, name, mode,        seq, name, mode,
+    samples, blob, tags     samples, blob, tags
+    note                    --                    ignored by the reader
+    --                      threshold = 42.0      keeps its initialiser
+
+Neither is an error, and the run reports both:
+
+    first frame: seq=1 name=python-node mode=1
+      samples=3 blob=00ff0a tags=2 threshold=42 (never sent)
+    received 10 frame(s), seq 1..10, dropped 0
+    all checks passed: the Python struct arrived intact in Qt
+
+That is the whole argument for TLD_DEFINE_MAP over TLD_DEFINE: the two programs were
+compiled from different source trees, by different toolchains, with different ideas of the
+struct, and they still interoperate -- because the field names are on the wire. With the
+positional form, `note` would have shifted every field after it and `threshold` would have
+consumed whatever came next, silently.
+
+Frames reach the Qt receiver as a signal on its own thread, drained from the poll queue by
+the worker inside QnntNode, with a QByteArray the receiving object owns. Both examples check
+that the sequence is contiguous from wherever they attached rather than from 1, since a
+subscriber that resolves the topic after the publisher started legitimately misses the
+beginning: qnnt has no replay.
+
+
+The interop mesh
+----------------
+
+examples/mesh/ is five nodes, one per language, all publishing the same struct on their own
+topic and receiving it from the other four. Twenty directed links, checked by the nodes
+themselves. examples/mesh/SCHEMA.txt is the shared schema and the reasoning behind its
+shape.
+
+    node.zig      publishes mesh/zig       node.py       publishes mesh/python
+    node.c        publishes mesh/c         node_qt.cpp   publishes mesh/qt
+    node.cpp      publishes mesh/cpp
+
+    zig build mesh                                  # zig, c, cpp (python needs no build)
+    zig build mesh -Dqt=/Users/you/Qt/6.10.3/macos  # and the Qt node
+
+    QT_PATH=/Users/you/Qt/6.10.3/macos bash examples/mesh/run.sh
+
+Every field of the struct is derived from its sequence number, so a receiver checks exactly
+what it should have got rather than merely that something arrived -- and each node exits
+non-zero unless it saw a contiguous, correct run from every peer. run.sh collects the exit
+codes; a node that was not built is skipped:
+
+    mesh: registry port 22470, 9s, at least 5 samples per peer
+    mesh: started 5 node(s): zig c cpp python qt
+
+    === zig: ok ===
+    zig: from c        35 samples, seq 10..44, 0 problem(s) ok
+    zig: from cpp      35 samples, seq  9..43, 0 problem(s) ok
+    zig: from python   40 samples, seq  3..42, 0 problem(s) ok
+    zig: from qt       35 samples, seq  4..38, 0 problem(s) ok
+    ...
+    mesh: every node verified every peer
+
+The sequence ranges start at different points because a subscriber cannot resolve a topic
+until the publisher has registered and its own next registry probe comes round. qnnt has no
+replay, so those early samples are simply gone; each node therefore requires contiguity from
+wherever it attached, not from 1. A gap *inside* a run is a failure.
+
+The five declarations of the struct are independent -- a Zig struct, a C descriptor table,
+two C++ classes with TLD_DEFINE_MAP (one using std::string and std::vector, one using
+QString and QList), and a Python dataclass. Nothing is generated from anything else; they
+meet on the wire. The schema avoids optionals, maps and dynamic strings precisely because C
+cannot express them, and a schema only four of the five could carry would not be a common
+one.

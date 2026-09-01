@@ -92,6 +92,14 @@ class Message:
         """The payload decoded as a TLD frame, for topics carrying frames."""
         return tld.loads(self.data)
 
+    def unpacked(self, target: type) -> Any:
+        """The payload decoded into `target` -- a dataclass, usually.
+
+        The counterpart of QnntNode::unpacked<T>() in the Qt header and of
+        tld.unpackFrom(T, ...) in Zig, so the same struct crosses all three.
+        """
+        return tld.unpack(target, self.data)
+
 
 class Node:
     """A running qnnt node. Use as a context manager so it is always shut down."""

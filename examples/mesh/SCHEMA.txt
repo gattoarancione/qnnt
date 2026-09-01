@@ -1,0 +1,68 @@
+The mesh schema
+===============
+
+One struct, declared independently in five languages, published by five nodes on five
+topics, and received and verified by all the others. examples/mesh/ holds one node per
+language plus run.sh to start them all.
+
+    node.zig      publishes mesh/zig      subscribes to the other four
+    node.c        publishes mesh/c        "
+    node.cpp      publishes mesh/cpp      "
+    node.py       publishes mesh/python   "
+    node_qt.cpp   publishes mesh/qt       "
+
+shape
+
+    Reading         channel   u8
+                    value     f64
+                    valid     bool
+
+    Origin          x         f64
+                    y         f64
+
+    Sample          seq       u64        1, 2, 3, ... per sender
+                    source    string     the sender's language: "zig", "c", ...
+                    mode      enum i32   0 idle, 1 running, 2 faulted
+                    count     i32        negative, to exercise signed integers
+                    temp      f32        32-bit, where every other float is 64-bit
+                    blob      bytes      00 FF 0A -- not valid text, on purpose
+                    origin    Origin     a nested struct
+                    readings  [3]Reading an array of nested structs
+
+Every field is derivable from `seq`, so a receiver can verify exactly what it should have
+got rather than merely that something arrived:
+
+    source        the sender's own name
+    mode          seq % 3          (0 idle, 1 running, 2 faulted)
+    count         -(i32)seq
+    temp          36.5             constant
+    blob          00 FF 0A         constant
+    origin        x 1.5, y -2.5    constant
+    readings[i]   channel = i + 1
+                  value   = seq * 10 + i     exact in f64, so compared exactly
+                  valid   = (i != 1)         a false in the middle of two trues
+
+what the shape avoids, and why
+
+C has no dynamic container, no optional and no map, so the schema has none either. A schema
+only some of the five could express would not be a common schema. That means:
+
+  * strings are bounded -- 16 bytes here -- because C carries them in char[N];
+  * `readings` is exactly 3 elements, because C carries it in Reading[3];
+  * `blob` is bounded (8 bytes here) and travels with an explicit length, because C needs
+    somewhere to put that length;
+  * no optional fields, no maps.
+
+Everything else about the mapping is uniform: field names are on the wire (TLD_DEFINE_MAP
+and its equivalents), enums travel as integers, non-negative integers take the unsigned
+encoding, and a string is a STRING frame while bytes are a BUFFER frame.
+
+running it
+
+    zig build mesh                                  # the four toolchain-free nodes
+    zig build mesh -Dqt=/path/to/Qt/6.10.3/macos    # and the Qt one
+
+    bash examples/mesh/run.sh                       # starts them, waits, reports
+
+Each node exits 0 only if it received a contiguous, correct run of at least 5 samples from
+every peer it expected. run.sh reports each node's verdict and fails if any node did.
