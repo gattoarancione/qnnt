@@ -76,6 +76,25 @@ pub fn build(b: *Build) void {
         if (linkage == .static) qnnt_c_static = lib else qnnt_c_dynamic = lib;
     }
 
+    // ---------------------------------------------------------------- the lidar example
+    //
+    // A fake RS-LiDAR-16 in Zig publishing at the rate the real one transmits, and a
+    // Qt/QML viewer that renders the point cloud. `zig build lidar` builds the sensor; add
+    // -Dqt=... and it builds the viewer too, which needs Qt Quick rather than only Core.
+    const lidar_step = b.step("lidar", "Build the fake LiDAR sensor, and the viewer with -Dqt=...");
+
+    const lidar_mod = b.createModule(.{
+        .root_source_file = b.path("examples/lidar/sensor.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    lidar_mod.addImport("qnnt", qnnt_lib_mod);
+    const lidar_sensor = b.addExecutable(.{ .name = "lidar-sensor", .root_module = lidar_mod });
+    lidar_sensor.root_module.linkLibrary(qnnt_lib);
+    b.installArtifact(lidar_sensor);
+    lidar_step.dependOn(&b.addInstallArtifact(lidar_sensor, .{}).step);
+
     const mesh_step = b.step("mesh", "Build the interop mesh nodes (examples/mesh/)");
 
     // The Qt interface proposal, built only when told where Qt is. Qt is not a dependency
@@ -147,12 +166,21 @@ pub fn build(b: *Build) void {
             src: []const u8,
             step: []const u8,
             help: []const u8,
+            quick: bool, // needs Qt Quick, not only Qt Core
         }{
             .{
                 .name = "mesh-qt",
                 .src = "examples/mesh/node_qt.cpp",
                 .step = "mesh-qt",
                 .help = "Build the Qt node of the interop mesh (needs -Dqt=...)",
+                .quick = false,
+            },
+            .{
+                .name = "lidar-viewer",
+                .src = "examples/lidar/viewer.cpp",
+                .step = "lidar-viewer",
+                .help = "Build the Qt/QML LiDAR viewer (needs -Dqt=...)",
+                .quick = true,
             },
         };
 
@@ -178,13 +206,24 @@ pub fn build(b: *Build) void {
             ex_mod.addIncludePath(ex_moc_out.dirname());
             ex_mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "include" }) });
             ex_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "lib" }) });
+            // Qt Quick pulls in Gui, Qml and Quick on top of Core, and each needs its
+            // headers on the path -- Qt's own includes are not self-locating.
+            const modules: []const []const u8 = if (ex.quick)
+                &.{ "QtCore", "QtGui", "QtQml", "QtQuick" }
+            else
+                &.{"QtCore"};
+
             if (target.result.os.tag == .macos) {
-                ex_mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "lib", "QtCore.framework", "Headers" }) });
                 ex_mod.addFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "lib" }) });
-                ex_mod.linkFramework("QtCore", .{});
+                for (modules) |m| {
+                    ex_mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "lib", b.fmt("{s}.framework", .{m}), "Headers" }) });
+                    ex_mod.linkFramework(m, .{});
+                }
             } else {
-                ex_mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "include", "QtCore" }) });
-                ex_mod.linkSystemLibrary("Qt6Core", .{});
+                for (modules) |m| {
+                    ex_mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ qt_path, "include", m }) });
+                    ex_mod.linkSystemLibrary(b.fmt("Qt6{s}", .{m["Qt".len..]}), .{});
+                }
             }
             ex_mod.linkLibrary(qnnt_c_static);
 
@@ -197,6 +236,9 @@ pub fn build(b: *Build) void {
             // So that `zig build mesh -Dqt=...` builds all five rather than four.
             if (std.mem.eql(u8, ex.name, "mesh-qt")) {
                 mesh_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+            }
+            if (std.mem.eql(u8, ex.name, "lidar-viewer")) {
+                lidar_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
             }
         }
     }

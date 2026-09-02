@@ -192,10 +192,18 @@ Then type:
     help                    the command list
     list                    every topic: publisher, subscriber count, age,
                             origin, state
-    subs test/topic-a       one line per subscriber: peer, connected, messages
-    peers                   federation peers: state, last sync, entries learned
+    subs test/topic-a       who is subscribed to a topic: address, connected,
+                            messages
+    peers                   other REGISTRIES federated with this one -- not the
+                            subscribers of a topic, which is 'subs'
     status                  uptime, topic count, node id, addressing, timings
     quit
+
+Three commands answer three different questions, and the middle two get mixed up:
+
+    list          which topics exist, and how many subscribers each has (a count)
+    subs <topic>  WHO those subscribers are, by address
+    peers         which other registries this one federates with
 
 For example:
 
@@ -203,6 +211,12 @@ For example:
       test/topic-a  tcp://127.0.0.1:60373  1     1.5s       6.0s  local   live
       test/topic-c  tcp://127.0.0.1:60377  0     0.5s       5.0s  82ff671c  live
     # 2 topic(s)
+    # end
+
+    # subscribers of test/topic-a, reported 0.4s ago
+    # subscriber       connected  msgs
+      127.0.0.1:58146  1.7s       179
+    # 1 subscriber(s)
     # end
 
 Reading the columns:
@@ -742,3 +756,43 @@ One wrinkle worth knowing if you use the scheduler: runPublisher starts its thre
 immediately, so waiting in main gates nothing. The gate belongs in the source callback,
 which returns null to skip a tick -- and skipping does not consume a sequence number, which
 is what keeps seq 1 the first sample anybody sees.
+
+
+A fake LiDAR, and a QML view of it
+----------------------------------
+
+examples/lidar/ is a fake RS-LiDAR-16 publishing at the rate a real one transmits, and a
+Qt/QML viewer that renders the point cloud. A Zig sensor feeding a QML display, neither
+knowing the other's language -- only the topic and the schema. examples/lidar/SCHEMA.txt has
+the packet layout and the reasoning behind it.
+
+    zig build lidar                                  # the sensor
+    zig build lidar -Dqt=/Users/you/Qt/6.10.3/macos   # and the viewer
+
+    ./zig-out/bin/lidar-sensor                       # terminal 1
+    ./zig-out/bin/lidar-viewer                       # terminal 2, from the project root
+
+The rate is the datasheet's, not a convenient fraction of it: 600 rpm, 12 blocks per packet,
+32 samples per block, so 750 packets/s and 288,000 points/s. Both ends report it:
+
+    lidar-sensor: RS-LiDAR-16 on lidar/rs16
+      600 rpm, 750 packets/s, 288000 points/s
+      1552 byte frames vs 1248 on the wire (304 bytes of self-description)
+
+    lidar-viewer: 750 frames/s, 288000 points/s, 30 revolutions, 28661 displayed
+
+28,661 rather than 28,800 because beams that find only sky return a distance of 0, which a
+consumer must skip rather than plot at the sensor.
+
+Two decisions in it are worth more than the rendering.
+
+Where the structure stops. A block keeps its azimuth as a named field, because a consumer
+wants it without parsing; its 32 samples travel as one BUFFER in MSOP's own layout. Naming
+every channel instead would have put ten times more key bytes on the wire than sample bytes.
+Self-description is worth 24% here and would not be worth 900%.
+
+Where the work happens. Frames arrive as signals on the GUI thread and are decoded there --
+288,000 points/s is a few milliseconds of CPU per second in C++ -- but painting is decoupled:
+points accumulate into the revolution being swept, and the item repaints at 30 Hz from the
+last completed one. Repainting per packet would be 750 paints/s of a 28,800-point cloud.
+QML does layout, chrome and controls; the cloud is a QQuickPaintedItem in C++.

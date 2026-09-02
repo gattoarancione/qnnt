@@ -1,0 +1,89 @@
+Fake RoboSense LiDAR over TLD
+=============================
+
+examples/lidar/sensor.zig fakes an RS-LiDAR-16 and publishes it as TLD; viewer.cpp plus
+main.qml subscribe and render the point cloud. A Zig sensor feeding a Qt/QML display is the
+split this is meant to show: the data path in the systems language, the presentation in QML.
+
+what is being imitated
+----------------------
+
+RS-LiDAR-16 output, from its MSOP (Main data Stream Output Protocol) shape:
+
+    1248-byte UDP packets   42-byte header, 12 blocks x 100 bytes, 6-byte tail
+    12 blocks per packet    each block = one azimuth, two firings of 16 channels
+    0.2 deg azimuth step    1800 azimuth positions per revolution
+    600 RPM                 10 revolutions per second
+    -> 900 blocks/rev, 75 packets/rev, 750 packets/s, 28,800 points/rev
+    -> 288,000 points/s, about 0.94 MB/s on the wire
+
+The sensor here publishes at that rate: one TLD frame per MSOP packet, 750 frames/s, paced
+by the library's scheduler at a 1333 us period.
+
+Deliberate simplifications, since this is a fake and says so: one return per beam (no dual
+return), no per-packet GPS timestamp block, and the two firings in a block share their
+channel order rather than following the real interleave. Ranges come from a synthetic room
+rather than from anything physical.
+
+the frame, and why it is shaped this way
+----------------------------------------
+
+    Block   azimuth_cdeg  u16     hundredths of a degree, 0..35999, as MSOP carries it
+            samples       bytes   32 x (u16 distance_mm, u8 intensity) = 96 bytes
+
+    Packet  seq           u64     packet counter
+            t_us          u64     the sensor's clock when the packet was assembled
+            model         string  "RS-LiDAR-16"
+            rpm           u16     600
+            blocks        [12]Block
+
+The judgment worth noticing is where the structure stops. Mapping every channel to a TLD
+object -- 384 objects per packet, each with named fields -- would put roughly ten times more
+key bytes on the wire than sample bytes. Instead the block keeps its azimuth as a named
+field, because a consumer wants it without parsing anything, and the 32 samples travel as
+one BUFFER in exactly MSOP's layout.
+
+That is TLD used where self-description pays and got out of the way where it does not. The
+sensor prints the comparison at startup; measured:
+
+    raw MSOP              1248 bytes    no self-description at all
+    per-block buffers     1552 bytes    what this uses: +304 bytes, or 24%
+    per-channel objects   ~12 KB        every channel named, ten times the payload
+
+304 bytes buys a frame that names its model, its rpm, its sequence, its timestamp and every
+azimuth -- where the MSOP packet needs a datasheet to interpret at all.
+
+geometry the viewer needs
+-------------------------
+
+The 16 channels are fixed vertical angles, -15 deg to +15 deg in 2 deg steps:
+
+    channel 0..15  ->  -15, -13, -11, -9, -7, -5, -3, -1, +1, +3, +5, +7, +9, +11, +13, +15
+
+A block's 32 samples are firing 0 (channels 0..15) at `azimuth_cdeg`, then firing 1
+(channels 0..15) at `azimuth_cdeg + 20`, which is the 0.2 deg step. A point is then:
+
+    r = distance_mm / 1000
+    x = r * cos(elev) * sin(azim)
+    y = r * cos(elev) * cos(azim)
+    z = r * sin(elev)
+
+distance_mm of 0 means no return -- absorbed, out of range, or sky -- and must be skipped
+rather than plotted at the origin.
+
+the scene
+---------
+
+A 20 m x 14 m room with the sensor at 1 m above the floor, two pillars, and one box that
+moves, so a viewer shows something recognisable rather than noise: four walls, two circles,
+and a rectangle that drifts across the floor. Intensity distinguishes wall from pillar from
+floor, so a renderer colouring by intensity separates them.
+
+running it
+----------
+
+    zig build lidar                                  # the sensor
+    zig build lidar -Dqt=/path/to/Qt/6.10.3/macos    # and the viewer
+
+    ./zig-out/bin/lidar-sensor                       # terminal 1
+    ./zig-out/bin/lidar-viewer                       # terminal 2

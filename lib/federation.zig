@@ -101,7 +101,10 @@ var fed_change_seq: std.atomic.Value(u32) = .init(0);
 var inbound_applied: std.atomic.Value(u64) = .init(0);
 
 pub fn notifyChange() void {
-    if (federation_port == 0) return;
+    // `enabled()`, not the port: with a port but no key nothing is waiting on this word,
+    // so the bump and the futexWake syscall were spent on nobody -- and federation off is
+    // the common case, with every publisher refresh landing here.
+    if (!enabled()) return;
     _ = fed_change_seq.fetchAdd(1, .monotonic);
     qnnt.io.futexWake(u32, &fed_change_seq.raw, std.math.maxInt(u32));
 }
@@ -749,10 +752,26 @@ fn sweepRun() void {
 // Federation state, on the loopback interface only. Whether a peer is reachable, and how
 // much it has taught us, is the first thing to look at when a topic fails to appear.
 pub fn writePeerList(buffer: *std.ArrayList(u8)) !void {
-    if (federation_port == 0) {
-        try buffer.print(allocator, "# federation disabled (no port set)\n", .{});
+    // Gated on `enabled()`, not on the port. The cluster key became the switch and the
+    // port gained a default, which left this testing a condition that can no longer be
+    // false: a node with no key reported "listening on 2223" while nothing was listening.
+    // `status` was already right, which is why only `peers` lied.
+    if (!enabled()) {
+        if (cluster_key_len == 0) {
+            try buffer.print(allocator,
+                "# federation disabled: no cluster key (set QNNT_CLUSTER_KEY to enable it)\n",
+                .{});
+        } else {
+            try buffer.print(allocator, "# federation disabled: port set to 0\n", .{});
+        }
+        // Still worth showing: a peer list configured before the key was forgotten is
+        // exactly the mistake this command should make visible.
+        if (peer_count != 0) {
+            try buffer.print(allocator, "# {d} peer(s) configured but not dialled\n", .{peer_count});
+        }
         return;
     }
+
     if (peer_count == 0) {
         try buffer.print(allocator, "# listening on {d}, no peers configured to dial\n", .{federation_port});
         try buffer.print(allocator, "# {d} entr(ies) applied from peers that dialed us\n", .{
@@ -900,4 +919,36 @@ fn heldPort(topic: []const u8) u16 {
     qnnt.directory_mutex.lockUncancelable(qnnt.io);
     defer qnnt.directory_mutex.unlock(qnnt.io);
     return qnnt.directory.getPtr(topic).?.endpoint.getPort();
+}
+
+test "peers reports why federation is off, rather than a port it is not listening on" {
+    // The bug this pins: the cluster key became the switch and the port gained a default,
+    // which left `writePeerList` testing `federation_port == 0` -- a condition that can no
+    // longer be true. A node with no key reported "listening on 2223" while nothing was.
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
+
+    // No key: disabled, and it must say so.
+    try testing.expect(!enabled());
+    try writePeerList(&buffer);
+    try testing.expect(std.mem.indexOf(u8, buffer.items, "no cluster key") != null);
+    try testing.expect(std.mem.indexOf(u8, buffer.items, "listening on") == null);
+
+    // Peers configured without a key is the mistake worth surfacing, so it is named.
+    buffer.clearRetainingCapacity();
+    try testing.expect(addPeer("10.0.0.9", 0));
+    try writePeerList(&buffer);
+    try testing.expect(std.mem.indexOf(u8, buffer.items, "1 peer(s) configured") != null);
+
+    // With a key it is enabled, and the listing describes the peer rather than the reason.
+    buffer.clearRetainingCapacity();
+    try testing.expect(setClusterKey("a-key"));
+    try testing.expect(enabled());
+    try writePeerList(&buffer);
+    try testing.expect(std.mem.indexOf(u8, buffer.items, "10.0.0.9") != null);
+    try testing.expect(std.mem.indexOf(u8, buffer.items, "disabled") == null);
+
+    // Leave the module as it was found: these are globals shared with the other tests.
+    cluster_key_len = 0;
+    peer_count = 0;
 }

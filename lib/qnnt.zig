@@ -1056,11 +1056,11 @@ fn writeHelp(buffer: *std.ArrayList(u8)) !void {
     try buffer.print(allocator,
         \\# commands (case-insensitive):
         \\#   list                 registered topics: publisher, subscribers, age, state
-        \\#   subs <topic>         one line per subscriber: peer, connected, messages
+        \\#   subs <topic>         who is subscribed to a topic: address, connected, messages
         \\#   sub <topic>          resolve a topic to its publisher URI
         \\#   pub <topic> <uri>    register or refresh a topic's publisher endpoint
         \\#   unpub <topic>        drop a registration
-        \\#   peers                federation peers: state, last sync, entries learned
+        \\#   peers                other REGISTRIES federated with this one, not subscribers
         \\#   status               registry uptime, topic count, timings
         \\#   ping                 liveness check
         \\#   help                 this text
@@ -1262,7 +1262,12 @@ fn writeSubscriberList(buffer: *std.ArrayList(u8), topic: []const u8) !void {
         return;
     }
 
-    var peer_width: usize = "peer".len;
+    // Labelled "subscriber", not "peer". Within this one interface "peer" was being used
+    // for both a topic's subscriber and a federated registry -- and `peers` means the
+    // latter, which made `subs` output read as though it listed the wrong thing. The node
+    // protocol's `report ... peer <uri>` token keeps its name: it is a wire format, and
+    // both ends of it are in this repository, so the ambiguity there costs nobody.
+    var peer_width: usize = "subscriber".len;
     for (entry.peers.items) |peer| {
         var buf: [64]u8 = undefined;
         const text = std.fmt.bufPrint(&buf, "{f}", .{peer.address}) catch "?";
@@ -1270,7 +1275,7 @@ fn writeSubscriberList(buffer: *std.ArrayList(u8), topic: []const u8) !void {
     }
 
     try buffer.appendSlice(allocator, "# ");
-    try writePadded(buffer, "peer", peer_width);
+    try writePadded(buffer, "subscriber", peer_width);
     try buffer.appendSlice(allocator, "  ");
     try writePadded(buffer, "connected", age_column_width);
     try buffer.appendSlice(allocator, "  msgs\n");
@@ -1828,7 +1833,15 @@ pub fn publishAll(topic: []const u8, data: []const u8) !void {
                 idx -= 1;
                 var writer = list_ptr.items[idx].client.writer(io, &.{});
                 writer.interface.writeAll(data) catch |err| {
-                    std.debug.print("error writing: {}\n", .{err});
+                    // Named, and named as what it is. "error writing: error.WriteFailed"
+                    // told the reader nothing and looked like a fault; a subscriber going
+                    // away is the ordinary case, and the useful facts are which topic and
+                    // which peer. The event below carries the same news programmatically.
+                    std.debug.print("subscriber {f} left {s} ({s})\n", .{
+                        list_ptr.items[idx].address,
+                        topic,
+                        @errorName(err),
+                    });
                     if (lost_count < lost.len) {
                         const text = std.fmt.bufPrint(&lost[lost_count], "{f}", .{
                             list_ptr.items[idx].address,
