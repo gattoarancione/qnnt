@@ -31,12 +31,13 @@ and constructing a second one while the first is open raises.
 from __future__ import annotations
 
 import ctypes as C
+import enum as _enum
 import os
 from dataclasses import dataclass
 from typing import Any, Iterator, Sequence
 
 from . import tld
-from ._lib import Error, Message as _CMessage, declare, load
+from ._lib import Error, EventRecord as _CEvent, Message as _CMessage, declare, load
 
 __all__ = ["Node", "Message", "Error", "tld", "version"]
 
@@ -74,6 +75,39 @@ def _split_host_port(spec):
     # No port, or something that is not a number where one would go: the whole spec is the
     # host, and an unusable one fails later by name rather than being silently truncated.
     return spec, 0
+
+
+class EventKind(_enum.IntEnum):
+    """What a connection event reports. Mirrors qnnt_event in qnnt.h."""
+
+    subscriber_connected = 0
+    subscriber_disconnected = 1
+    publisher_connected = 2
+    publisher_disconnected = 3
+    publisher_stale = 4
+    publisher_resumed = 5
+
+
+@dataclass(frozen=True)
+class Event:
+    """One connection event, copied out of library storage.
+
+    `subscribers` is the topic's subscriber count at the time, which is what lets a
+    publisher wait for a known number of peers:
+
+        for event in node.poll_events():
+            if (event.kind is EventKind.subscriber_connected
+                    and event.subscribers == expected):
+                start_publishing()
+
+    It is 0 for the publisher_* kinds, which concern the other direction.
+    """
+
+    kind: EventKind
+    topic: str
+    peer: str
+    subscribers: int
+    at_us: int
 
 
 @dataclass(frozen=True)
@@ -289,6 +323,81 @@ class Node:
         while not self.stop_requested:
             for message in self.poll(timeout=timeout):
                 yield message
+
+    def poll_events(self, max_events: int = 64) -> list["Event"]:
+        """Drain buffered connection events.
+
+        Python has no event callback on purpose: the library would call it on one of its own
+        threads, so ctypes would acquire the GIL there -- on this node's accept thread or a
+        subscriber's read thread -- and a Python handler would hold up the library while it
+        ran. Events are buffered instead and handed over here, the same trade `poll` makes
+        for messages.
+
+        Nothing is lost before the first call: buffering starts with the node, not with the
+        first poll. Past 64 undrained events the newest are dropped and counted in
+        `events_dropped`.
+        """
+        if max_events <= 0:
+            return []
+
+        buffer = (_CEvent * max_events)()
+        written = C.c_size_t(0)
+        _check(self._lib,
+               self._lib.qnnt_poll_events(buffer, max_events, C.byref(written)),
+               "poll_events")
+
+        out: list[Event] = []
+        for i in range(written.value):
+            record = buffer[i]
+            # Copied now: the pointers are only valid until the next call.
+            out.append(Event(
+                kind=EventKind(record.event),
+                topic=C.string_at(record.topic, record.topic_len).decode("utf-8", "replace"),
+                peer=C.string_at(record.peer, record.peer_len).decode("utf-8", "replace"),
+                subscribers=int(record.subscribers),
+                at_us=int(record.at_us),
+            ))
+        return out
+
+    @property
+    def events_dropped(self) -> int:
+        """Events discarded because nothing drained the queue."""
+        return int(self._lib.qnnt_events_dropped())
+
+    def subscriber_count(self, topic: str) -> int:
+        """Subscribers connected to this node's publisher for `topic`."""
+        raw = self._topic_bytes(topic)
+        return int(self._lib.qnnt_subscriber_count(raw, len(raw)))
+
+    def wait_for_subscriber(self, topic: str, *, timeout: float = 5.0) -> bool:
+        """Block until `topic` has a subscriber, or the timeout expires.
+
+        What a publisher should call before its first message: a subscriber cannot attach
+        until this publisher has registered AND the subscriber's next registry probe comes
+        round, so the delay is neither zero nor predictable. Sleeping a guess loses the
+        opening messages, because qnnt has no replay.
+        """
+        raw = self._topic_bytes(topic)
+        return bool(self._lib.qnnt_wait_for_subscriber(raw, len(raw), int(timeout * 1000)))
+
+    def wait_for_subscribers(self, topic: str, count: int, *, timeout: float = 5.0) -> bool:
+        """Block until `topic` has `count` subscribers, or the timeout expires.
+
+        For a node that knows how many peers to expect: waiting for one stops a publisher
+        shouting into an empty room, while waiting for all of them means every peer sees
+        the stream from its first message.
+        """
+        raw = self._topic_bytes(topic)
+        return bool(self._lib.qnnt_wait_for_subscribers(raw, len(raw), int(count),
+                                                        int(timeout * 1000)))
+
+    def set_stale_timeout(self, ms: int) -> None:
+        """Silence after which a connected subscription counts as stale. 0 disables it.
+
+        Once set, a quiet subscription produces EventKind.publisher_stale, which
+        `poll_events` will hand over, followed by publisher_resumed when data returns.
+        """
+        self._lib.qnnt_set_stale_timeout(int(ms))
 
     @property
     def dropped(self) -> int:

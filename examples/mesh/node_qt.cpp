@@ -24,7 +24,6 @@ namespace {
 constexpr const char* kMe = "qt";
 constexpr auto kMyTopic = "mesh/qt";
 constexpr int kIntervalMs = 200;
-constexpr int kStartupDelayMs = 600;
 } // namespace
 
 enum class Mode : qint32 { idle = 0, running = 1, faulted = 2 };
@@ -206,9 +205,27 @@ int main(int argc, char** argv) {
         node->publishPacked(QString::fromLatin1(kMyTopic),
                             expected(*seq, QString::fromLatin1(kMe)));
     });
-    // A peer cannot resolve this topic until it is registered and their next probe comes
-    // round, and qnnt has no replay, so the first frames would otherwise go nowhere.
-    QTimer::singleShot(kStartupDelayMs, [timer] { timer->start(kIntervalMs); });
+    // Start on the event, not on a timer. A peer cannot resolve this topic until it is
+    // registered and their next probe comes round, and qnnt has no replay -- so the old
+    // fixed delay here was a guess that sometimes lost the opening samples.
+    const int expecting = static_cast<int>(mesh.peers().size());
+    QObject::connect(node, &qnnt::QnntNode::subscriberConnected,
+                     [timer, expecting](const QString& topic, const QString& peer, int count) {
+                         if (topic != QString::fromLatin1(kMyTopic)) return;
+                         // Wait for the whole roster, not just the first peer, so every
+                         // one of them sees seq 1.
+                         if (count >= expecting && !timer->isActive()) {
+                             std::printf("%s: all %d subscribers on %s (last %s), publishing\n",
+                                         kMe, expecting, kMyTopic, qPrintable(peer));
+                             std::fflush(stdout);
+                             timer->start(kIntervalMs);
+                         }
+                     });
+
+    // A floor, in case this node is started alone: publish anyway rather than never.
+    QTimer::singleShot(5000, [timer] {
+        if (!timer->isActive()) timer->start(kIntervalMs);
+    });
 
     QTimer::singleShot(static_cast<int>(run_ms), &app, &QCoreApplication::quit);
     app.exec();

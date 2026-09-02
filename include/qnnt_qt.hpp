@@ -271,6 +271,24 @@ public:
 
     /* --- subscribing ---------------------------------------------------------- */
 
+    /* --- connection state ----------------------------------------------------- */
+
+    /// Subscribers connected to this node's publisher for `topic`.
+    int subscriberCount(const QString& topic) const;
+
+    /// Block until `topic` has a subscriber, or the timeout expires. Returns whether it
+    /// has one.
+    ///
+    /// Prefer connecting to subscriberConnected() in a Qt program -- this blocks the
+    /// calling thread, and blocking the GUI thread is rarely what you want. It is here for
+    /// startup code that legitimately wants to wait before publishing anything.
+    bool waitForSubscriber(const QString& topic, int timeoutMs = 5000);
+
+    /// Silence after which a connected subscription emits publisherStale(). 0 disables it,
+    /// which is the default: a quiet topic is not in itself an error.
+    void setStaleTimeout(int ms);
+    int staleTimeout() const;
+
     /// Subscribe through the poll queue. Messages arrive as messageAvailable() (Text) or
     /// frameAvailable() (Frames), on this object's thread.
     bool addSubscriber(const QString& topic, Delivery delivery = Delivery::Text);
@@ -295,6 +313,10 @@ public:
     quint64 droppedCount() const;
 
 Q_SIGNALS:
+    /// Internal: carries a library event across the thread boundary. Connect to the named
+    /// signals above instead.
+    void eventRelay(int event, const QString& topic, const QString& peer, int count);
+
     void started();
     void stopped();
 
@@ -311,11 +333,37 @@ Q_SIGNALS:
     /// A signal handler asked the process to stop, if installSignalHandlers() was called.
     void stopRequested();
 
+    /// A subscriber connected to one of this node's publishers. `count` is how many that
+    /// topic now has, so `count == 1` is the moment publishing becomes worthwhile.
+    void subscriberConnected(const QString& topic, const QString& peer, int count);
+
+    /// A subscriber's connection was found broken while publishing to it.
+    void subscriberDisconnected(const QString& topic, const QString& peer, int count);
+
+    /// One of this node's subscriptions attached to a publisher.
+    void publisherConnected(const QString& topic, const QString& peer);
+
+    /// A publisher this node was subscribed to closed the stream. The subscription retries
+    /// on its own; this is notification, not a call to action.
+    void publisherDisconnected(const QString& topic, const QString& peer);
+
+    /// Nothing has arrived on a connected subscription for the stale timeout. Only emitted
+    /// when setStaleTimeout() has been called with a non-zero value.
+    void publisherStale(const QString& topic);
+
+    /// Data arrived on a subscription that had gone stale.
+    void publisherResumed(const QString& topic);
+
     /// A library call failed. `context` names the call, `status` is the qnnt_status value
     /// and `statusName` its spelling from qnnt_status_name().
     void errorOccurred(const QString& context, int status, const QString& statusName);
 
 private Q_SLOTS:
+    /// Where a library event lands, on this object's thread. The trampoline below emits
+    /// eventRelay() from a library thread; the queued connection to this slot is what
+    /// moves it, so every signal above is emitted where the receiver expects.
+    void eventDelivered(int event, const QString& topic, const QString& peer, int count);
+
     /// Where the poller's queued signal lands, on this object's thread. Chooses which
     /// public signal to emit, since the queue carries bytes without recording the framing
     /// that produced them.
@@ -478,10 +526,73 @@ inline bool QnntNode::reserveQueue(int capacity) {
 
 inline void QnntNode::configureFromEnvironment() { qnnt_configure_from_environment(); }
 
+/// Called by the library on one of its own threads. It does the least possible: convert to
+/// Qt types and emit the relay, whose queued connection carries it to the Qt thread. Doing
+/// anything else here would be doing it on a library thread.
+inline void qnntEventTrampoline(qnnt_event event, const char* topic, std::size_t topic_len,
+                                const char* peer, std::size_t peer_len,
+                                std::size_t subscribers, void* user) {
+    auto* node = static_cast<QnntNode*>(user);
+    Q_EMIT node->eventRelay(static_cast<int>(event),
+                            QString::fromUtf8(topic, static_cast<qsizetype>(topic_len)),
+                            QString::fromUtf8(peer, static_cast<qsizetype>(peer_len)),
+                            static_cast<int>(subscribers));
+}
+
+inline void QnntNode::eventDelivered(int event, const QString& topic, const QString& peer,
+                                     int count) {
+    switch (static_cast<qnnt_event>(event)) {
+    case QNNT_EVENT_SUBSCRIBER_CONNECTED:
+        Q_EMIT subscriberConnected(topic, peer, count);
+        break;
+    case QNNT_EVENT_SUBSCRIBER_DISCONNECTED:
+        Q_EMIT subscriberDisconnected(topic, peer, count);
+        break;
+    case QNNT_EVENT_PUBLISHER_CONNECTED:
+        Q_EMIT publisherConnected(topic, peer);
+        break;
+    case QNNT_EVENT_PUBLISHER_DISCONNECTED:
+        Q_EMIT publisherDisconnected(topic, peer);
+        break;
+    case QNNT_EVENT_PUBLISHER_STALE:
+        Q_EMIT publisherStale(topic);
+        break;
+    case QNNT_EVENT_PUBLISHER_RESUMED:
+        Q_EMIT publisherResumed(topic);
+        break;
+    }
+}
+
+inline int QnntNode::subscriberCount(const QString& topic) const {
+    const QByteArray name = topic.toUtf8();
+    return static_cast<int>(
+        qnnt_subscriber_count(name.constData(), static_cast<std::size_t>(name.size())));
+}
+
+inline bool QnntNode::waitForSubscriber(const QString& topic, int timeoutMs) {
+    const QByteArray name = topic.toUtf8();
+    return qnnt_wait_for_subscriber(name.constData(),
+                                    static_cast<std::size_t>(name.size()),
+                                    static_cast<std::uint64_t>(timeoutMs));
+}
+
+inline void QnntNode::setStaleTimeout(int ms) {
+    qnnt_set_stale_timeout(static_cast<std::uint64_t>(ms));
+}
+
+inline int QnntNode::staleTimeout() const {
+    return static_cast<int>(qnnt_stale_timeout());
+}
+
 inline bool QnntNode::start() {
     if (m_running) return true;
     if (!check(qnnt_init(), QStringLiteral("start"))) return false;
     m_running = true;
+
+    // Queued, because the trampoline emits from a library thread.
+    connect(this, &QnntNode::eventRelay, this, &QnntNode::eventDelivered,
+            Qt::QueuedConnection);
+    qnnt_set_event_handler(&qnntEventTrampoline, this);
 
     m_thread = new QThread(this);
     m_poller = new QnntPoller;
@@ -506,6 +617,9 @@ inline bool QnntNode::start() {
 
 inline void QnntNode::stop() {
     if (!m_running) return;
+
+    // Before the node goes down, so no event arrives with this object half torn down.
+    qnnt_set_event_handler(nullptr, nullptr);
 
     if (m_poller != nullptr) m_poller->requestStop();
     if (m_thread != nullptr) {
@@ -641,14 +755,11 @@ inline quint64 QnntNode::droppedCount() const { return qnnt_queue_dropped(); }
  *       the wire support exists; what is missing is a way to stop the worker thread for one
  *       topic and unregister it.
  *
- *   publisherConnected / publisherDisconnected
- *   subscriberConnected / subscriberDisconnected / responderConnected
- *       No connection events exist. The registry does track subscribers per topic and its
- *       line protocol on loopback reports them (`list` shows a count, `subs <topic>` the
- *       detail), so a Qt implementation could poll that with a QTcpSocket and emit
- *       subscriberCountChanged(topic, count) honestly -- as a polled figure, not an event.
- *       Real edge-triggered signals would need the library to call back when a publisher
- *       accepts or loses a subscriber, which it currently does not.
+ *   responderConnected
+ *       Needs the request/reply role above. The other four connection signals now exist:
+ *       subscriberConnected, subscriberDisconnected, publisherConnected and
+ *       publisherDisconnected are emitted from real library events, plus publisherStale
+ *       and publisherResumed which the old class did not have.
  *
  * Also worth knowing when porting:
  *

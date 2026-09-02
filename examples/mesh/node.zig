@@ -122,7 +122,14 @@ fn onFrame(_: []const u8, frame: tld.Frame, context: ?*anyopaque) void {
 var out_frame: std.ArrayList(u8) = .empty;
 var next_seq: u64 = 0;
 
+/// The scheduler starts ticking the moment runPublisher is called, which is before the
+/// roster has connected -- so the gate lives here rather than in main. Returning null skips
+/// a tick without consuming a sequence number, which is what keeps seq 1 the first sample
+/// anybody sees.
+var gate_open = std.atomic.Value(bool).init(false);
+
 fn produce(_: []const u8, _: ?*anyopaque) ?[]const u8 {
+    if (!gate_open.load(.monotonic)) return null;
     next_seq += 1;
     tld.packTo(allocator, &out_frame, expected(next_seq, me)) catch return null;
     return out_frame.items;
@@ -145,8 +152,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer qnnt.deinit();
     qnnt.installSignalHandlers();
 
-    // Publish before subscribing, so peers can resolve this topic while this node is still
-    // attaching to theirs.
+    // Announce the topic first, so peers can resolve it while this node attaches to theirs.
+    // The scheduler starts further down, once someone is actually listening.
     if (!qnnt.runPublisher(my_topic, produce, 200_000, null)) {
         std.debug.print("{s}: failed to publish {s}\n", .{ me, my_topic });
         std.process.exit(1);
@@ -164,6 +171,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     std.debug.print("{s}: publishing {s}, subscribed to {d} peers\n", .{ me, my_topic, expecting });
+
+    // Wait for the first subscriber rather than sleeping a guess. Before this existed the
+    // examples slept a fixed 600-1500 ms and still lost the opening samples when a peer
+    // was slow to resolve the topic; now the first sample goes out when someone is there
+    // to receive it.
+    // Not just one subscriber but all of them: this node knows how many peers the roster
+    // says are coming, and waiting for the last one means every peer sees seq 1.
+    if (qnnt.waitForSubscribers(my_topic, expecting, 5000)) {
+        std.debug.print("{s}: all {d} subscribers on {s}, publishing\n", .{
+            me, expecting, my_topic,
+        });
+    } else {
+        std.debug.print("{s}: only {d} of {d} subscribers after 5s, publishing anyway\n", .{
+            me, qnnt.subscriberCount(my_topic), expecting,
+        });
+    }
+    gate_open.store(true, .monotonic);
 
     const deadline = @as(u64, @intCast(qnnt.nowMicros())) + run_ms * 1000;
     while (!qnnt.stopRequested() and @as(u64, @intCast(qnnt.nowMicros())) < deadline) {

@@ -430,3 +430,149 @@ export fn qnnt_status_name(status: Status) callconv(.c) [*:0]const u8 {
         .invalid_period => "source and period must be given together",
     };
 }
+
+// ---------------------------------------------------------------- connection events
+
+const EventFn = *const fn (
+    event: c_int,
+    topic: [*]const u8,
+    topic_len: usize,
+    peer: [*]const u8,
+    peer_len: usize,
+    subscribers: usize,
+    user: ?*anyopaque,
+) callconv(.c) void;
+
+const EventBox = struct {
+    callback: EventFn,
+    user: ?*anyopaque,
+};
+
+// One box, replaced rather than accumulated: the library holds a single handler, and this
+// mirrors it. Leaked on replacement, which is bounded by how many times a program changes
+// its handler -- in practice once.
+var event_box: ?*EventBox = null;
+
+fn eventTrampoline(
+    event: qnnt.Event,
+    topic: []const u8,
+    peer: []const u8,
+    subscribers: usize,
+    context: ?*anyopaque,
+) void {
+    const box: *EventBox = @ptrCast(@alignCast(context.?));
+    // Empty slices still need a valid pointer for C: an empty `peer` is normal.
+    const topic_ptr: [*]const u8 = if (topic.len == 0) "" else topic.ptr;
+    const peer_ptr: [*]const u8 = if (peer.len == 0) "" else peer.ptr;
+    box.callback(@intFromEnum(event), topic_ptr, topic.len, peer_ptr, peer.len, subscribers, box.user);
+}
+
+/// Register a handler for connection events, or pass NULL to clear it.
+///
+/// The handler runs on one of the library's threads, not the caller's, and two events may
+/// be delivered at once from different threads. It is called with no library lock held, so
+/// it may call back in -- qnnt_subscriber_count from inside a handler is fine.
+export fn qnnt_set_event_handler(handler: ?EventFn, user: ?*anyopaque) callconv(.c) void {
+    const callback = handler orelse {
+        qnnt.setEventHandlerFn(null, null);
+        return;
+    };
+
+    const box = allocator.create(EventBox) catch return;
+    box.* = .{ .callback = callback, .user = user };
+    event_box = box;
+    qnnt.setEventHandlerFn(eventTrampoline, box);
+}
+
+/// Subscribers currently connected to this node's publisher for `topic`.
+export fn qnnt_subscriber_count(topic: ?[*]const u8, topic_len: usize) callconv(.c) usize {
+    const name = topicSlice(topic, topic_len) orelse return 0;
+    return qnnt.subscriberCountFn(name);
+}
+
+/// Block until `topic` has a subscriber, or the timeout expires. Returns whether it has
+/// one. This is what a publisher should call instead of sleeping before its first message.
+export fn qnnt_wait_for_subscriber(
+    topic: ?[*]const u8,
+    topic_len: usize,
+    timeout_ms: u64,
+) callconv(.c) bool {
+    const name = topicSlice(topic, topic_len) orelse return false;
+    return qnnt.waitForSubscriberFn(name, timeout_ms);
+}
+
+/// As above, but for a known number of peers: waiting for one subscriber stops a publisher
+/// shouting into an empty room, while waiting for all of them means every peer sees the
+/// stream from its first message.
+export fn qnnt_wait_for_subscribers(
+    topic: ?[*]const u8,
+    topic_len: usize,
+    count: usize,
+    timeout_ms: u64,
+) callconv(.c) bool {
+    const name = topicSlice(topic, topic_len) orelse return false;
+    return qnnt.waitForSubscribersFn(name, count, timeout_ms);
+}
+
+/// Silence after which a connected subscription is reported stale. 0 disables it.
+export fn qnnt_set_stale_timeout(ms: u64) callconv(.c) void {
+    qnnt.setStaleTimeoutFn(ms);
+}
+
+export fn qnnt_stale_timeout() callconv(.c) u64 {
+    return qnnt.staleTimeoutFn();
+}
+
+const EventRecord = extern struct {
+    event: c_int,
+    topic: [*]const u8,
+    topic_len: usize,
+    peer: [*]const u8,
+    peer_len: usize,
+    subscribers: usize,
+    at_us: u64,
+};
+
+// Room for one drain's worth of records, so the Zig-side slices can be converted without
+// allocating per call.
+var event_scratch: [64]qnnt.PolledEvent = undefined;
+
+/// Drain buffered connection events into `out`, writing how many to *count.
+///
+/// The alternative to qnnt_set_event_handler, and the right one for a language that cannot
+/// be called on a foreign thread: events are buffered as they happen and handed over when
+/// asked for. Both may be used at once.
+///
+/// The `topic` and `peer` pointers are valid until the next call, as with qnnt_poll.
+export fn qnnt_poll_events(
+    out: ?[*]EventRecord,
+    max: usize,
+    count: ?*usize,
+) callconv(.c) Status {
+    const dst = out orelse return .invalid_argument;
+    const written = count orelse return .invalid_argument;
+    written.* = 0;
+    if (max == 0) return .ok;
+
+    const take = @min(max, event_scratch.len);
+    const events = qnnt.pollEventsFn(event_scratch[0..take]);
+
+    for (events, 0..) |event, i| {
+        dst[i] = .{
+            .event = @intFromEnum(event.event),
+            .topic = if (event.topic.len == 0) "" else event.topic.ptr,
+            .topic_len = event.topic.len,
+            .peer = if (event.peer.len == 0) "" else event.peer.ptr,
+            .peer_len = event.peer.len,
+            .subscribers = event.subscribers,
+            .at_us = event.at_us,
+        };
+    }
+    written.* = events.len;
+    return .ok;
+}
+
+/// Events discarded because nothing drained the queue.
+export fn qnnt_events_dropped() callconv(.c) u64 {
+    return qnnt.eventsDroppedFn();
+}

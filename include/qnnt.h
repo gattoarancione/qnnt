@@ -203,6 +203,99 @@ qnnt_status qnnt_publisher_start(const char *topic, size_t topic_len,
 qnnt_status qnnt_publish(const char *topic, size_t topic_len,
                          const void *data, size_t data_len);
 
+/* --- connection events ------------------------------------------------------- */
+/*
+ * A publisher that starts producing before anyone has connected is publishing into
+ * nothing: qnnt has no replay. These events, and qnnt_wait_for_subscriber below, are how a
+ * publisher knows when to begin.
+ */
+typedef enum {
+    /* A subscriber connected to one of this node's publishers. */
+    QNNT_EVENT_SUBSCRIBER_CONNECTED = 0,
+    /* A subscriber's connection was found broken while publishing to it. */
+    QNNT_EVENT_SUBSCRIBER_DISCONNECTED = 1,
+    /* One of this node's subscriptions attached to a publisher. */
+    QNNT_EVENT_PUBLISHER_CONNECTED = 2,
+    /* A publisher this node was subscribed to closed the stream. */
+    QNNT_EVENT_PUBLISHER_DISCONNECTED = 3,
+    /* Nothing has arrived on a connected subscription for the stale timeout. Only emitted
+     * when that timeout is set; a quiet topic is not otherwise an error. */
+    QNNT_EVENT_PUBLISHER_STALE = 4,
+    /* Data arrived on a subscription that had gone stale. */
+    QNNT_EVENT_PUBLISHER_RESUMED = 5
+} qnnt_event;
+
+/*
+ * `peer` is the address the event concerns, empty when there is none to name.
+ * `subscribers` is this node's subscriber count for `topic`, and is 0 for the
+ * QNNT_EVENT_PUBLISHER_* events, which concern the other direction.
+ *
+ * Called on one of the library's threads, not yours, and possibly from two threads at
+ * once. No library lock is held, so calling back in -- qnnt_subscriber_count, for
+ * instance -- is safe.
+ */
+typedef void (*qnnt_event_fn)(qnnt_event event, const char *topic, size_t topic_len,
+                              const char *peer, size_t peer_len, size_t subscribers,
+                              void *user);
+
+void qnnt_set_event_handler(qnnt_event_fn handler, void *user);
+
+/*
+ * One buffered event, as handed out by qnnt_poll_events. `topic` and `peer` point into
+ * library storage and are valid until the next qnnt_poll_events call, as with qnnt_poll.
+ */
+typedef struct {
+    qnnt_event event;
+    const char *topic;
+    size_t topic_len;
+    const char *peer;
+    size_t peer_len;
+    size_t subscribers;
+    uint64_t at_us;
+} qnnt_event_record;
+
+/*
+ * Drain buffered connection events; *count receives how many were written.
+ *
+ * The alternative to a handler, and the right one for a language that cannot be called on
+ * a foreign thread -- a ctypes callback would acquire the GIL on this node's accept thread
+ * and hold up the library while it ran. Events are buffered as they happen, so nothing is
+ * lost before the first poll, which is exactly when the interesting ones occur. Both
+ * mechanisms may be used at once.
+ *
+ * The buffer holds 64 events; past that the newest are dropped and counted, so a consumer
+ * that stops draining loses new events rather than the history it has not read.
+ */
+qnnt_status qnnt_poll_events(qnnt_event_record *out, size_t max, size_t *count);
+
+/* Events discarded because nothing drained the queue. */
+uint64_t qnnt_events_dropped(void);
+
+/* Subscribers connected to this node's publisher for `topic`. */
+size_t qnnt_subscriber_count(const char *topic, size_t topic_len);
+
+/*
+ * Block until `topic` has at least one subscriber, or the timeout expires; returns whether
+ * it has one. A timeout of 0 polls once.
+ *
+ * This is the call to make before a publisher's first message. A subscriber cannot attach
+ * until the publisher has registered AND the subscriber's next registry probe comes round,
+ * so the delay is neither zero nor predictable -- waiting for the fact beats sleeping for
+ * a guess.
+ */
+bool qnnt_wait_for_subscriber(const char *topic, size_t topic_len, uint64_t timeout_ms);
+
+/* As above, for a known number of peers. Waiting for one subscriber stops a publisher
+ * shouting into an empty room; waiting for all of them means every peer sees the stream
+ * from its first message. */
+bool qnnt_wait_for_subscribers(const char *topic, size_t topic_len, size_t count,
+                               uint64_t timeout_ms);
+
+/* Silence after which a connected subscription is reported stale, via
+ * QNNT_EVENT_PUBLISHER_STALE. 0 (the default) disables it. */
+void qnnt_set_stale_timeout(uint64_t ms);
+uint64_t qnnt_stale_timeout(void);
+
 /* --- subscriptions: callback ------------------------------------------------- */
 
 /* Invoked on the subscriber's own thread. `data` is valid only for this call. */

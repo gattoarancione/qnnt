@@ -125,18 +125,58 @@ def main() -> int:
 
     with qnnt.Node() as node:
         node.publisher(MY_TOPIC)
+        # Long enough not to fire during normal 200 ms traffic, short enough to notice a
+        # peer that stops. Without this, publisher_stale is never emitted at all.
+        node.set_stale_timeout(1500)
         for topic in PEERS.values():
             node.subscribe(topic, frames=True)
         print(f"{ME}: publishing {MY_TOPIC}, subscribed to {len(PEERS)} peers", flush=True)
+
+        # Wait for the first subscriber rather than sleeping a guess: a peer cannot attach
+        # until this publisher is registered and its own next registry probe comes round.
 
         by_topic = {topic: states[name] for name, topic in PEERS.items()}
         seq = 0
         deadline = time.monotonic() + RUN_S
         next_send = time.monotonic()
 
+        # Publishing is gated on the roster being complete, and the gate opens on an event
+        # rather than after a sleep: subscriber_connected carries the topic's subscriber
+        # count, so this node knows when the last peer has attached. Until then nothing is
+        # published, which is what makes seq 1 the first sample every peer sees -- qnnt has
+        # no replay, so anything sent earlier would simply be gone.
+        publishing = False
+        # A floor, in case this node is started alone: publish anyway rather than never.
+        gate_deadline = time.monotonic() + 5.0
+
         while time.monotonic() < deadline:
             now = time.monotonic()
-            if now >= next_send:
+
+            for event in node.poll_events():
+                if event.kind is qnnt.EventKind.subscriber_connected:
+                    if event.topic == MY_TOPIC and not publishing:
+                        if event.subscribers >= len(PEERS):
+                            publishing = True
+                            print(f"{ME}: all {event.subscribers} subscribers on "
+                                  f"{MY_TOPIC}, publishing", flush=True)
+                elif event.kind is qnnt.EventKind.subscriber_disconnected:
+                    print(f"{ME}: subscriber left {event.topic} ({event.peer}), "
+                          f"{event.subscribers} left", flush=True)
+                elif event.kind is qnnt.EventKind.publisher_disconnected:
+                    # The subscription reconnects on its own; this is notification only.
+                    print(f"{ME}: {event.topic} publisher went away ({event.peer})",
+                          flush=True)
+                elif event.kind is qnnt.EventKind.publisher_stale:
+                    print(f"{ME}: {event.topic} has gone quiet", flush=True)
+                elif event.kind is qnnt.EventKind.publisher_resumed:
+                    print(f"{ME}: {event.topic} is producing again", flush=True)
+
+            if not publishing and now >= gate_deadline:
+                publishing = True
+                print(f"{ME}: only {node.subscriber_count(MY_TOPIC)} of {len(PEERS)} "
+                      f"subscribers after 5s, publishing anyway", flush=True)
+
+            if publishing and now >= next_send:
                 seq += 1
                 node.publish_object(MY_TOPIC, expected(seq, ME))
                 next_send = now + INTERVAL_S
@@ -157,6 +197,7 @@ def main() -> int:
                               flush=True)
 
         dropped = node.dropped
+        events_dropped = node.events_dropped
 
     failed = False
     for state in states.values():
@@ -168,6 +209,9 @@ def main() -> int:
 
     if dropped:
         print(f"{ME}: {dropped} message(s) dropped by the queue", flush=True)
+    if events_dropped:
+        print(f"{ME}: {events_dropped} event(s) dropped -- poll_events was not drained "
+              f"often enough", flush=True)
 
     print(f"{ME}: {'FAILED' if failed else 'all peers verified'}", flush=True)
     return 1 if failed else 0

@@ -152,7 +152,17 @@ void onFrame(const char*, std::size_t, const qnnt_tld_frame* raw, void* user) {
 std::vector<std::uint8_t> g_out;
 std::uint64_t g_seq = 0;
 
+/// The scheduler starts ticking when qnnt_publisher_start is called, which is before the
+/// roster has connected -- so the gate lives here rather than in main. Returning nullptr
+/// skips a tick without consuming a sequence number, which is what keeps seq 1 the first
+/// sample anybody sees.
+std::atomic<bool> g_gate_open{false};
+
 const std::uint8_t* sourceFn(const char*, std::size_t, std::size_t* out_len, void*) {
+    if (!g_gate_open.load()) {
+        *out_len = 0;
+        return nullptr;
+    }
     ++g_seq;
     g_out = qnnt::tld::pack(expected(g_seq, kMe));
     *out_len = g_out.size();
@@ -192,6 +202,17 @@ int main(int argc, char** argv) {
     }
 
     std::printf("%s: publishing %s, subscribed to %zu peers\n", kMe, kMyTopic, expecting);
+    std::fflush(stdout);
+
+    // All of them, not just the first: this node knows how many peers the roster says are
+    // coming, and waiting for the last one means every peer sees seq 1.
+    if (qnnt_wait_for_subscribers(kMyTopic, std::strlen(kMyTopic), expecting, 5000)) {
+        std::printf("%s: all %zu subscribers on %s, publishing\n", kMe, expecting, kMyTopic);
+    } else {
+        std::printf("%s: only %zu of %zu subscribers after 5s, publishing anyway\n", kMe,
+                    qnnt_subscriber_count(kMyTopic, std::strlen(kMyTopic)), expecting);
+    }
+    g_gate_open.store(true);
     std::fflush(stdout);
 
     const std::int64_t deadline = qnnt_now_micros() + run_ms * 1000;

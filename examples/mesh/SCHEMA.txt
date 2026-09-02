@@ -66,3 +66,20 @@ running it
 
 Each node exits 0 only if it received a contiguous, correct run of at least 5 samples from
 every peer it expected. run.sh reports each node's verdict and fails if any node did.
+
+when publishing starts
+
+No node publishes until every peer on the roster has connected to its topic. It knows when
+because the subscriber_connected event carries the topic's subscriber count, so a node can
+wait for all four rather than for the first -- qnnt.waitForSubscribers in Zig,
+qnnt_wait_for_subscribers in C and C++, a lambda on subscriberConnected in the Qt node, and
+node.poll_events() in the Python one, which drains the same events in its main loop and so
+also reports peers leaving and topics going quiet.
+
+That is why every one of the twenty links reports seq 1..N. Before the events existed each
+node slept a fixed 600-1500 ms and most links began at seq 2-10: the samples published
+before a peer attached were simply gone, since qnnt has no replay.
+
+For the three nodes that use the scheduler (zig, c, cpp) the gate is inside the source
+callback, not in main: runPublisher starts its thread ticking as soon as it is called, and
+returning null from the source skips a tick without consuming a sequence number.

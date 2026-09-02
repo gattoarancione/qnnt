@@ -604,114 +604,6 @@ removeSubscriber) and connection-lifecycle signals (publisherConnected and frien
 is listed at the bottom of the header with what implementing it would take.
 
 
-A Qt node sending a struct to a Python node
--------------------------------------------
-
-examples/qt_telemetry.cpp publishes a struct; examples/telemetry_receiver.py receives it as
-a dataclass. Two terminals:
-
-  Terminal 1 -- the receiver, started first so it sees every message:
-
-    export QNNT_LIBRARY=$PWD/zig-out/lib/libqnnt_c.dylib      # .so on Linux
-    python3 -u examples/telemetry_receiver.py
-
-  Terminal 2 -- the Qt publisher:
-
-    zig build qt-telemetry -Dqt=/Users/you/Qt/6.10.3/macos
-
-The C++ side declares:
-
-    enum class Mode : int { idle = 0, running = 1, faulted = 2 };
-
-    struct Telemetry {
-        quint64 seq;
-        QString name;
-        Mode mode;
-        QList<double> samples;
-        QByteArray blob;
-        QMap<QString, int> tags;
-        TLD_DEFINE_MAP(seq, name, mode, samples, blob, tags)
-    };
-
-and the Python side, independently:
-
-    @dataclass
-    class Telemetry:
-        seq: int
-        name: str
-        mode: Mode              # an IntEnum
-        samples: list[float]
-        blob: bytes
-        tags: dict[str, int]
-
-Nothing generates one from the other. The whole contract is the topic name, a registry port
-both agree on, and matching field names -- which is why TLD_DEFINE_MAP rather than
-TLD_DEFINE: with names on the wire, either side can add a field without breaking the other,
-and a reordering cannot silently swap two values.
-
-What actually arrives:
-
-    got seq=7 name='qt-node' mode=running samples=[0.141, -0.99, 9.0] blob=00ff0a
-        tags={'rev': 6, 'site': 4}
-
-    received 10 of 10, dropped 0
-    all checks passed: the Qt struct arrived intact in Python
-
-QString becomes str, QList<double> becomes list[float], QByteArray becomes bytes (the blob
-is 00 FF 0A, which would be invalid as text -- that is the difference between a QByteArray
-and a QString on the wire), QMap<QString,int> becomes dict[str, int], and the enum travels
-as its integer, which IntEnum accepts directly.
-
-The receiver stops when the stream goes quiet rather than after a fixed count, and checks
-the sequence is contiguous from wherever it attached rather than from 1. A subscriber that
-starts after the publisher legitimately misses the beginning: qnnt has no replay, and
-pretending otherwise would make the example fail for the wrong reason.
-
-
-...and the other way round: Python sending, Qt receiving
---------------------------------------------------------
-
-examples/telemetry_sender.py publishes; examples/qt_receiver.cpp receives. Nothing about
-the wire changes -- the mapping is symmetric, so only the declarations swap sides.
-
-  Terminal 1 -- the Qt receiver, started first:
-
-    zig build qt-receiver -Dqt=/Users/you/Qt/6.10.3/macos
-
-  Terminal 2 -- the Python sender:
-
-    export QNNT_LIBRARY=$PWD/zig-out/lib/libqnnt_c.dylib      # .so on Linux
-    python3 -u examples/telemetry_sender.py
-
-This pair deliberately disagrees about the struct, to show what that costs:
-
-    Python sends            C++ declares
-    ------------            ------------
-    seq, name, mode,        seq, name, mode,
-    samples, blob, tags     samples, blob, tags
-    note                    --                    ignored by the reader
-    --                      threshold = 42.0      keeps its initialiser
-
-Neither is an error, and the run reports both:
-
-    first frame: seq=1 name=python-node mode=1
-      samples=3 blob=00ff0a tags=2 threshold=42 (never sent)
-    received 10 frame(s), seq 1..10, dropped 0
-    all checks passed: the Python struct arrived intact in Qt
-
-That is the whole argument for TLD_DEFINE_MAP over TLD_DEFINE: the two programs were
-compiled from different source trees, by different toolchains, with different ideas of the
-struct, and they still interoperate -- because the field names are on the wire. With the
-positional form, `note` would have shifted every field after it and `threshold` would have
-consumed whatever came next, silently.
-
-Frames reach the Qt receiver as a signal on its own thread, drained from the poll queue by
-the worker inside QnntNode, with a QByteArray the receiving object owns. Both examples check
-that the sequence is contiguous from wherever they attached rather than from 1, since a
-subscriber that resolves the topic after the publisher started legitimately misses the
-beginning: qnnt has no replay.
-
-
 The interop mesh
 ----------------
 
@@ -756,3 +648,97 @@ QString and QList), and a Python dataclass. Nothing is generated from anything e
 meet on the wire. The schema avoids optionals, maps and dynamic strings precisely because C
 cannot express them, and a schema only four of the five could carry would not be a common
 one.
+
+
+Connection events
+-----------------
+
+A publisher that starts producing before anyone has connected is publishing into nothing:
+qnnt has no replay. The library reports connection state so a node can wait for the fact
+instead of sleeping for a guess.
+
+six events
+
+    subscriber_connected      a subscriber attached to one of this node's publishers
+    subscriber_disconnected   its connection was found broken while publishing to it
+    publisher_connected       one of this node's subscriptions attached
+    publisher_disconnected    the publisher closed the stream (the subscription retries)
+    publisher_stale           nothing has arrived for the stale timeout, if one is set
+    publisher_resumed         data arrived on a subscription that had gone stale
+
+Every subscriber_* event carries the topic's current subscriber count, which is what lets a
+node wait for a known number of peers rather than merely the first:
+
+    Zig    qnnt.setEventHandler(handler, ctx)      handler(event, topic, peer, subscribers, ctx)
+           qnnt.waitForSubscribers(topic, n, timeout_ms)
+           qnnt.subscriberCount(topic)
+           qnnt.setStaleTimeout(ms)                0 disables it, the default
+
+    C      qnnt_set_event_handler(fn, user)        fn(event, topic, len, peer, len, subscribers, user)
+           qnnt_wait_for_subscribers(topic, len, n, timeout_ms)
+           qnnt_subscriber_count(topic, len)
+           qnnt_set_stale_timeout(ms)
+
+    Qt     subscriberConnected(topic, peer, count) publisherConnected(topic, peer)
+           subscriberDisconnected(...)             publisherDisconnected(topic, peer)
+           publisherStale(topic)                   publisherResumed(topic)
+           waitForSubscriber(topic, ms)            subscriberCount(topic)
+
+    Python node.poll_events(max_events=64)      -> list[Event]
+           node.wait_for_subscribers(topic, n, timeout=5.0)
+           node.subscriber_count(topic)
+           node.set_stale_timeout(ms)
+
+threading, which is the part to get right
+
+Handlers run on the library's own threads -- the publisher's accept thread, a subscriber's
+read thread, or whichever thread called publish when a write revealed a dead subscriber --
+and two may run at once. They are called with no library lock held, so a handler may call
+back in; qnnt_subscriber_count from inside a handler is fine.
+
+The Qt wrapper turns them into signals delivered on the receiving object's thread, through
+a queued connection, so a slot sees a QString and a QByteArray it owns and needs no locking.
+
+Python has no callback, deliberately -- a ctypes callback would acquire the GIL on this
+node's accept thread, and a Python handler would then hold up the library while it ran. It
+drains a queue instead, the same trade `poll` makes for messages:
+
+    for event in node.poll_events():
+        if (event.kind is qnnt.EventKind.subscriber_connected
+                and event.subscribers >= expected):
+            start_publishing()
+        elif event.kind is qnnt.EventKind.subscriber_disconnected:
+            print(f"{event.peer} left {event.topic}, {event.subscribers} remain")
+
+The queue is filled from the moment the node starts, not from the first poll, so nothing is
+lost before a consumer gets around to asking -- which is exactly when the interesting events
+happen. It holds 64; past that the newest are dropped and counted in `events_dropped`, so a
+consumer that stops draining loses new events rather than the history it has not read.
+
+qnnt_poll_events is in the C ABI too, and either mechanism may be used: a handler for
+immediacy, the queue for a language or thread that would rather ask.
+
+what the mesh does with it
+
+Before these existed, every mesh node slept 600-1500 ms before its first message and still
+lost the opening samples when a peer was slow to resolve the topic. Now each node knows how
+many peers its roster names and waits for exactly that many:
+
+    zig: all 4 subscribers on mesh/zig, publishing
+    zig: from c        33 samples, seq 1..33, 0 problem(s) ok
+    zig: from cpp      32 samples, seq 1..32, 0 problem(s) ok
+    zig: from python   33 samples, seq 1..33, 0 problem(s) ok
+    zig: from qt       31 samples, seq 1..31, 0 problem(s) ok
+
+Every one of the twenty links now starts at seq 1, where before most began somewhere between
+2 and 10.
+
+Each language uses the mechanism that suits it. The Qt node acts on the signal
+(`count >= expecting` in a lambda on subscriberConnected). The Python node drains
+poll_events in its main loop, so it also reports peers leaving and topics going quiet. Zig,
+C and C++ block on waitForSubscribers, since their startup code can afford to.
+
+One wrinkle worth knowing if you use the scheduler: runPublisher starts its thread ticking
+immediately, so waiting in main gates nothing. The gate belongs in the source callback,
+which returns null to skip a tick -- and skipping does not consume a sequence number, which
+is what keeps seq 1 the first sample anybody sees.

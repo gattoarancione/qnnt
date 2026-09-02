@@ -175,11 +175,22 @@ static void on_frame(const char *topic, size_t topic_len, const qnnt_tld_frame *
 static qnnt_tld_encoder *encoder = NULL;
 static uint64_t out_seq = 0;
 
+/* The scheduler starts ticking when qnnt_publisher_start is called, which is before the
+ * roster has connected -- so the gate lives in the source callback rather than in main.
+ * Returning NULL skips a tick without consuming a sequence number, which is what keeps
+ * seq 1 the first sample anybody sees. */
+static volatile bool gate_open = false;
+
 static const uint8_t *source_fn(const char *topic, size_t topic_len, size_t *out_len,
                                 void *user) {
     (void)topic;
     (void)topic_len;
     (void)user;
+
+    if (!gate_open) {
+        *out_len = 0;
+        return NULL;
+    }
 
     out_seq += 1;
     qnnt_tld_encoder_reset(encoder);
@@ -225,6 +236,17 @@ int main(int argc, char **argv) {
     }
 
     printf("%s: publishing %s, subscribed to %zu peers\n", ME, MY_TOPIC, expecting);
+    fflush(stdout);
+
+    /* All of them, not just the first: this node knows how many peers the roster says are
+     * coming, and waiting for the last one means every peer sees seq 1. */
+    if (qnnt_wait_for_subscribers(MY_TOPIC, strlen(MY_TOPIC), expecting, 5000)) {
+        printf("%s: all %zu subscribers on %s, publishing\n", ME, expecting, MY_TOPIC);
+    } else {
+        printf("%s: only %zu of %zu subscribers after 5s, publishing anyway\n", ME,
+               qnnt_subscriber_count(MY_TOPIC, strlen(MY_TOPIC)), expecting);
+    }
+    gate_open = true;
     fflush(stdout);
 
     const int64_t deadline = qnnt_now_micros() + (int64_t)run_ms * 1000;

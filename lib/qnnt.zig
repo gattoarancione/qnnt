@@ -492,6 +492,319 @@ pub fn sleepMsInterruptible(ms: u64) bool {
 var subscribers: std.StringHashMap(std.ArrayList(QnntNode)) = .init(allocator);
 var subscribers_mutex: Io.Mutex = .init;
 
+// ---------------------------------------------------------------- connection events
+//
+// A publisher that starts producing before anyone has connected is publishing into
+// nothing: qnnt has no replay, so those messages are gone. The mesh examples worked around
+// it with a fixed startup delay, which is a guess. These events, and `waitForSubscriber`
+// below, replace the guess with the fact.
+//
+// Threading: handlers run on the library's own threads -- the publisher's accept thread,
+// the subscriber's read thread, or whichever thread called `publish` when a write to a
+// dead subscriber revealed it. Not on the caller's thread, and not serialised with each
+// other. Keep them short, and marshal to your own thread if you need more (the Qt wrapper
+// does exactly that with a queued connection).
+//
+// A handler is called with NO library lock held. That is deliberate: an earlier draft
+// emitted from inside the subscribers critical section, where a handler calling
+// `subscriberCount` would have deadlocked against the lock it was already under.
+
+pub const Event = enum(c_int) {
+    /// A subscriber connected to one of this node's publishers.
+    subscriber_connected = 0,
+    /// A subscriber's connection was found broken while publishing to it.
+    subscriber_disconnected = 1,
+    /// This node's subscription attached to a publisher.
+    publisher_connected = 2,
+    /// A publisher this node was subscribed to closed the stream.
+    publisher_disconnected = 3,
+    /// Nothing has arrived on a connected subscription for `stale_timeout_ms`. Only
+    /// emitted when that timeout is set; a quiet topic is not otherwise an error.
+    publisher_stale = 4,
+    /// Data arrived on a subscription that had gone stale.
+    publisher_resumed = 5,
+};
+
+/// `peer` is the address the event concerns, as text, or empty when there is none to name.
+/// `subscribers` is this node's current subscriber count for `topic` -- 0 for the
+/// publisher_* events, which concern the other direction.
+pub const EventHandler = *const fn (
+    event: Event,
+    topic: []const u8,
+    peer: []const u8,
+    subscribers: usize,
+    context: ?*anyopaque,
+) void;
+
+var event_handler: ?EventHandler = null;
+var event_context: ?*anyopaque = null;
+var event_mutex: Io.Mutex = .init;
+
+/// Register the handler for connection events, or clear it with null. May be called before
+/// or after `run()`.
+pub fn setEventHandlerFn(handler: ?EventHandler, context: ?*anyopaque) void {
+    event_mutex.lockUncancelable(io);
+    defer event_mutex.unlock(io);
+    event_handler = handler;
+    event_context = context;
+}
+
+fn emitEvent(event: Event, topic: []const u8, peer: []const u8, subscriber_count: usize) void {
+    // Buffered first, so a slow handler cannot delay what a poller would have seen.
+    eventQueuePush(event, topic, peer, subscriber_count);
+
+    // Copy the handler out under the lock and call it outside, so a handler that
+    // re-registers or clears itself cannot deadlock, and a long handler cannot block
+    // another thread's emit.
+    var handler: ?EventHandler = null;
+    var context: ?*anyopaque = null;
+    {
+        event_mutex.lockUncancelable(io);
+        defer event_mutex.unlock(io);
+        handler = event_handler;
+        context = event_context;
+    }
+    if (handler) |h| h(event, topic, peer, subscriber_count, context);
+}
+
+// -- event queue --------------------------------------------------------------------
+//
+// The same trade as the message queue, for the same reason. A callback is delivered on a
+// library thread, which is wrong for a language that has to take a lock to run any code at
+// all: a ctypes callback would acquire the GIL on this node's accept thread, and then a
+// Python handler would be holding up the library while it ran. Buffering here and letting
+// the consumer drain at its own pace removes both problems.
+//
+// Buffered unconditionally rather than on request, so no event is lost before a consumer
+// gets around to its first poll -- which is exactly when the interesting ones happen. The
+// cost is a mutex and a ~120 byte copy per *connection*, not per message.
+
+const event_queue_capacity = 64;
+
+const EventSlot = struct {
+    event: Event = .subscriber_connected,
+    topic: [64]u8 = undefined,
+    topic_len: usize = 0,
+    peer: [48]u8 = undefined,
+    peer_len: usize = 0,
+    subscribers: usize = 0,
+    at_us: u64 = 0,
+};
+
+var event_ring: [event_queue_capacity]EventSlot = undefined;
+var event_ring_head: usize = 0;
+var event_ring_count: usize = 0;
+var event_ring_mutex: Io.Mutex = .init;
+var event_dropped = std.atomic.Value(u64).init(0);
+
+// Where a drain copies to, so the slices handed out stay valid until the next drain -- the
+// same contract as `poll` for messages.
+var event_staging: [event_queue_capacity]EventSlot = undefined;
+
+/// One buffered event. `topic` and `peer` are valid until the next `pollEvents`.
+pub const PolledEvent = struct {
+    event: Event,
+    topic: []const u8,
+    peer: []const u8,
+    subscribers: usize,
+    at_us: u64,
+};
+
+fn eventQueuePush(event: Event, topic: []const u8, peer: []const u8, subscriber_count: usize) void {
+    event_ring_mutex.lockUncancelable(io);
+    defer event_ring_mutex.unlock(io);
+
+    if (event_ring_count == event_queue_capacity) {
+        // The newest is dropped, as in the message queue: a consumer that has stopped
+        // draining should not be able to push out the history it has not read yet.
+        _ = event_dropped.fetchAdd(1, .monotonic);
+        return;
+    }
+
+    const slot = &event_ring[(event_ring_head + event_ring_count) % event_queue_capacity];
+    slot.event = event;
+    slot.topic_len = @min(topic.len, slot.topic.len);
+    @memcpy(slot.topic[0..slot.topic_len], topic[0..slot.topic_len]);
+    slot.peer_len = @min(peer.len, slot.peer.len);
+    @memcpy(slot.peer[0..slot.peer_len], peer[0..slot.peer_len]);
+    slot.subscribers = subscriber_count;
+    slot.at_us = @intCast(nowMicrosFn());
+    event_ring_count += 1;
+}
+
+/// Drain up to `out.len` buffered events. Returns the slice actually filled; the strings it
+/// points at stay valid until the next call.
+pub fn pollEventsFn(out: []PolledEvent) []PolledEvent {
+    if (out.len == 0) return out[0..0];
+
+    event_ring_mutex.lockUncancelable(io);
+    defer event_ring_mutex.unlock(io);
+
+    const take = @min(out.len, @min(event_ring_count, event_queue_capacity));
+    for (0..take) |i| {
+        event_staging[i] = event_ring[(event_ring_head + i) % event_queue_capacity];
+        const slot = &event_staging[i];
+        out[i] = .{
+            .event = slot.event,
+            .topic = slot.topic[0..slot.topic_len],
+            .peer = slot.peer[0..slot.peer_len],
+            .subscribers = slot.subscribers,
+            .at_us = slot.at_us,
+        };
+    }
+    event_ring_head = (event_ring_head + take) % event_queue_capacity;
+    event_ring_count -= take;
+    return out[0..take];
+}
+
+/// Events discarded because nothing drained the queue.
+pub fn eventsDroppedFn() u64 {
+    return event_dropped.load(.monotonic);
+}
+
+/// How many subscribers are connected to this node's publisher for `topic`. 0 if this node
+/// does not publish it.
+pub fn subscriberCountFn(topic: []const u8) usize {
+    subscribers_mutex.lockUncancelable(io);
+    defer subscribers_mutex.unlock(io);
+    if (subscribers.getPtr(topic)) |list| return list.items.len;
+    return 0;
+}
+
+/// Block until `topic` has at least one connected subscriber, or the timeout expires.
+/// Returns whether there is one. A timeout of 0 polls once and returns immediately.
+///
+/// This is the answer to "when may I start publishing": a subscriber cannot attach until
+/// this publisher has registered AND the subscriber's next registry probe comes round, so
+/// the delay is neither zero nor predictable. Waiting for the event beats sleeping for a
+/// guess.
+pub fn waitForSubscriberFn(topic: []const u8, timeout_ms: u64) bool {
+    return waitForSubscribersFn(topic, 1, timeout_ms);
+}
+
+/// Block until `topic` has at least `count` connected subscribers, or the timeout expires.
+///
+/// The plural form matters when a node knows how many peers to expect: waiting for one
+/// subscriber stops a publisher shouting into an empty room, but the second and third peers
+/// still miss the opening messages. Waiting for all of them means every peer sees the
+/// stream from its first message.
+pub fn waitForSubscribersFn(topic: []const u8, count: usize, timeout_ms: u64) bool {
+    if (subscriberCountFn(topic) >= count) return true;
+    if (timeout_ms == 0) return false;
+
+    const deadline = @as(u64, @intCast(nowMicrosFn())) + timeout_ms * 1000;
+    while (@as(u64, @intCast(nowMicrosFn())) < deadline) {
+        // Polled rather than signalled: the wait happens once at startup, so 5 ms of
+        // latency costs nothing and a condition variable would be state to get wrong.
+        if (!sleepMsInterruptible(5)) return false;
+        if (subscriberCountFn(topic) >= count) return true;
+    }
+    return subscriberCountFn(topic) >= count;
+}
+
+// -- subscription liveness ----------------------------------------------------------
+//
+// Tracked here rather than in the subscribe loops because the loops block in `read`, and a
+// thread blocked in a read cannot notice that nothing has arrived. One sweeper watches the
+// timestamps instead.
+
+const SubState = struct {
+    connected: bool = false,
+    stale: bool = false,
+    last_us: u64 = 0,
+};
+
+var sub_states: std.StringHashMap(SubState) = .init(allocator);
+var sub_states_mutex: Io.Mutex = .init;
+
+/// Silence after which a connected subscription is reported stale. 0 disables it, which is
+/// the default: a topic may legitimately be quiet, and calling that an error by default
+/// would make the feature a nuisance.
+var stale_timeout_ms: u64 = 0;
+
+pub fn setStaleTimeoutFn(ms: u64) void {
+    stale_timeout_ms = ms;
+}
+
+pub fn staleTimeoutFn() u64 {
+    return stale_timeout_ms;
+}
+
+fn subMark(topic: []const u8, connected: bool) void {
+    sub_states_mutex.lockUncancelable(io);
+    defer sub_states_mutex.unlock(io);
+
+    const gop = sub_states.getOrPut(topic) catch return;
+    if (!gop.found_existing) {
+        // The key must outlive the caller's slice: subscribe topics are already copied at
+        // the ABI boundary, but a Zig caller may pass a temporary.
+        gop.key_ptr.* = allocator.dupe(u8, topic) catch {
+            _ = sub_states.remove(topic);
+            return;
+        };
+        gop.value_ptr.* = .{};
+    }
+    gop.value_ptr.connected = connected;
+    gop.value_ptr.stale = false;
+    gop.value_ptr.last_us = @intCast(nowMicrosFn());
+}
+
+/// Called from the delivery path on every message, so staleness is measured from real
+/// traffic rather than from the connection's age.
+fn subTouch(topic: []const u8) void {
+    if (stale_timeout_ms == 0) return;
+
+    var resumed = false;
+    {
+        sub_states_mutex.lockUncancelable(io);
+        defer sub_states_mutex.unlock(io);
+        if (sub_states.getPtr(topic)) |state| {
+            state.last_us = @intCast(nowMicrosFn());
+            if (state.stale) {
+                state.stale = false;
+                resumed = true;
+            }
+        }
+    }
+    if (resumed) emitEvent(.publisher_resumed, topic, "", 0);
+}
+
+// One sweeper for every subscription, started with the node.
+fn staleSweepRun() void {
+    while (!isShuttingDown()) {
+        if (!sleepMsInterruptible(200)) return;
+        const timeout = stale_timeout_ms;
+        if (timeout == 0) continue;
+
+        const now: u64 = @intCast(nowMicrosFn());
+
+        // Collected under the lock and emitted after it, for the reason given above.
+        var stale_topics: [16][]const u8 = undefined;
+        var count: usize = 0;
+        {
+            sub_states_mutex.lockUncancelable(io);
+            defer sub_states_mutex.unlock(io);
+
+            var it = sub_states.iterator();
+            while (it.next()) |entry| {
+                const state = entry.value_ptr;
+                if (!state.connected or state.stale) continue;
+                if (now -| state.last_us < timeout * 1000) continue;
+                state.stale = true;
+                if (count < stale_topics.len) {
+                    stale_topics[count] = entry.key_ptr.*;
+                    count += 1;
+                }
+            }
+        }
+
+        for (stale_topics[0..count]) |topic| {
+            emitEvent(.publisher_stale, topic, "", 0);
+        }
+    }
+}
+
+
 pub const Qnnt = struct {
     // Every callback takes the `context` pointer given at registration and hands it
     // back untouched. Without it a callback can only reach module-level state, which
@@ -537,6 +850,18 @@ pub const Qnnt = struct {
     /// Registry port control. Set before `run()`; see `setRegistryPort`.
     pub const setRegistryPort = &setRegistryPortFn;
     pub const registryPort = &currentRegistryPort;
+    pub const Event = @import("qnnt.zig").Event;
+    pub const EventHandler = @import("qnnt.zig").EventHandler;
+    pub const setEventHandler = &setEventHandlerFn;
+    pub const subscriberCount = &subscriberCountFn;
+    pub const waitForSubscriber = &waitForSubscriberFn;
+    pub const waitForSubscribers = &waitForSubscribersFn;
+    pub const PolledEvent = @import("qnnt.zig").PolledEvent;
+    pub const pollEvents = &pollEventsFn;
+    pub const eventsDropped = &eventsDroppedFn;
+    pub const setStaleTimeout = &setStaleTimeoutFn;
+    pub const staleTimeout = &staleTimeoutFn;
+
     pub const setRealtimePriority = &setRealtimePriorityFn;
     pub const realtimePriority = &realtimePriorityFn;
     pub const setLockMemory = &setLockMemoryFn;
@@ -1481,29 +1806,51 @@ fn registryRun() void {
 }
 
 pub fn publishAll(topic: []const u8, data: []const u8) !void {
-    // Held across the socket writes: on localhost this is cheap, and it keeps
-    // the subscriber list stable while the accept loop may be appending to it.
-    subscribers_mutex.lockUncancelable(io);
-    defer subscribers_mutex.unlock(io);
+    // Peers whose write failed, reported after the lock is released.
+    var lost: [8][64]u8 = undefined;
+    var lost_len: [8]usize = @splat(0);
+    var lost_count: usize = 0;
+    var remaining: usize = 0;
 
-    if (subscribers.getPtr(topic)) |list_ptr| {
-        // Iterate backward so a failed-write swapRemove only ever touches
-        // indices we've already visited.
-        var idx = list_ptr.items.len;
-        while (idx > 0) {
-            idx -= 1;
-            var writer = list_ptr.items[idx].client.writer(io, &.{});
-            writer.interface.writeAll(data) catch |err| {
-                std.debug.print("error writing: {}\n", .{err});
-                // Close before dropping it: swapRemove alone leaked the descriptor.
-                list_ptr.items[idx].client.close(io);
-                _ = list_ptr.swapRemove(idx);
-                continue;
-            };
-            list_ptr.items[idx].messages += 1;
+    {
+        // Held across the socket writes: on localhost this is cheap, and it keeps
+        // the subscriber list stable while the accept loop may be appending to it.
+        // Scoped to this block rather than the function, so the events below are emitted
+        // with no lock held -- a handler may call back into the library.
+        subscribers_mutex.lockUncancelable(io);
+        defer subscribers_mutex.unlock(io);
+
+        if (subscribers.getPtr(topic)) |list_ptr| {
+            // Iterate backward so a failed-write swapRemove only ever touches
+            // indices we've already visited.
+            var idx = list_ptr.items.len;
+            while (idx > 0) {
+                idx -= 1;
+                var writer = list_ptr.items[idx].client.writer(io, &.{});
+                writer.interface.writeAll(data) catch |err| {
+                    std.debug.print("error writing: {}\n", .{err});
+                    if (lost_count < lost.len) {
+                        const text = std.fmt.bufPrint(&lost[lost_count], "{f}", .{
+                            list_ptr.items[idx].address,
+                        }) catch "?";
+                        lost_len[lost_count] = text.len;
+                        lost_count += 1;
+                    }
+                    // Close before dropping it: swapRemove alone leaked the descriptor.
+                    list_ptr.items[idx].client.close(io);
+                    _ = list_ptr.swapRemove(idx);
+                    continue;
+                };
+                list_ptr.items[idx].messages += 1;
+            }
+            remaining = list_ptr.items.len;
+        } else {
+            std.debug.print("topic {s} not found\n", .{topic});
         }
-    } else {
-        std.debug.print("topic {s} not found\n", .{topic});
+    }
+
+    for (lost[0..lost_count], lost_len[0..lost_count]) |*buf, len| {
+        emitEvent(.subscriber_disconnected, topic, buf[0..len], remaining);
     }
 }
 
@@ -1587,16 +1934,26 @@ fn nodePublish(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: u64, c
             return err;
         };
 
-        subscribers_mutex.lockUncancelable(io);
-        defer subscribers_mutex.unlock(io);
-        if (subscribers.getPtr(topic)) |list_ptr| {
-            try list_ptr.append(allocator, .{
-                .client = client,
-                .address = client.socket.address, // peer address, resolved by accept
-                .since_us = @intCast(nowMicrosFn()),
-                .messages = 0,
-            });
+        var now_count: usize = 0;
+        {
+            subscribers_mutex.lockUncancelable(io);
+            defer subscribers_mutex.unlock(io);
+            if (subscribers.getPtr(topic)) |list_ptr| {
+                try list_ptr.append(allocator, .{
+                    .client = client,
+                    .address = client.socket.address, // peer address, resolved by accept
+                    .since_us = @intCast(nowMicrosFn()),
+                    .messages = 0,
+                });
+                now_count = list_ptr.items.len;
+            }
         }
+
+        // Emitted after the lock is released: a handler is free to call back into the
+        // library, and `subscriberCount` would deadlock against this very mutex.
+        var peer_buf: [64]u8 = undefined;
+        const peer = std.fmt.bufPrint(&peer_buf, "{f}", .{client.socket.address}) catch "?";
+        emitEvent(.subscriber_connected, topic, peer, now_count);
     }
 }
 
@@ -1731,12 +2088,21 @@ fn subscribeLoop(topic: []const u8, handler: Qnnt.MessageHandler, context: ?*any
 
         std.debug.print("subscribed to {s} @ tcp://{f}\n", .{ topic, endpoint });
 
+        var peer_buf: [64]u8 = undefined;
+        const peer = std.fmt.bufPrint(&peer_buf, "{f}", .{endpoint}) catch "?";
+        subMark(topic, true);
+        emitEvent(.publisher_connected, topic, peer, 0);
+
         var rbuf: [1024]u8 = undefined;
         var reader = stream.reader(io, &rbuf);
         while (true) {
             const msg = reader.interface.takeDelimiterInclusive('\n') catch break;
+            subTouch(topic);
             handler(topic, msg, context); // delivered on this thread; msg valid only for the call
         }
+
+        subMark(topic, false);
+        emitEvent(.publisher_disconnected, topic, peer, 0);
 
         // Publisher closed (or we are shutting down); re-resolve and reconnect.
         if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
@@ -1785,6 +2151,11 @@ fn subscribeFramesLoop(topic: []const u8, handler: Qnnt.FrameHandler, context: ?
 
         std.debug.print("subscribed to {s} @ tcp://{f} (tld)\n", .{ topic, endpoint });
 
+        var peer_buf: [64]u8 = undefined;
+        const peer = std.fmt.bufPrint(&peer_buf, "{f}", .{endpoint}) catch "?";
+        subMark(topic, true);
+        emitEvent(.publisher_connected, topic, peer, 0);
+
         var rbuf: [4096]u8 = undefined;
         var reader = stream.reader(io, &rbuf);
         while (true) {
@@ -1797,8 +2168,12 @@ fn subscribeFramesLoop(topic: []const u8, handler: Qnnt.FrameHandler, context: ?
                 }
                 break;
             };
+            subTouch(topic);
             handler(topic, frame, context);
         }
+
+        subMark(topic, false);
+        emitEvent(.publisher_disconnected, topic, peer, 0);
 
         if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
     }
@@ -2093,6 +2468,12 @@ pub fn nodeRun() bool {
     ensureNodeId(); // needs `io` for randomness, so it cannot happen any earlier
 
     // Signal handlers are deliberately NOT installed here; see installShutdownHandlers.
+
+    // One sweeper for subscription liveness. Cheap when the timeout is 0 (the default):
+    // it wakes every 200 ms, sees no timeout set, and goes back to sleep.
+    if (!spawnWorker(staleSweepRun, .{})) {
+        std.debug.print("error spawning stale sweeper\n", .{});
+    }
 
     if (!spawnWorker(registryRun, .{})) {
         std.debug.print("error spawning registry thread\n", .{});

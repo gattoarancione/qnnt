@@ -326,3 +326,139 @@ test "memory locking is accepted only where it is implemented" {
     try testing.expect(qnnt.setLockMemory(false));
     try testing.expect(!qnnt.lockMemory());
 }
+
+// -- connection events ------------------------------------------------------------------
+
+const EventLog = struct {
+    // Handlers fire on several library threads at once, so the slot is claimed atomically
+    // and each writer then owns its own entry.
+    var kinds: [64]qnnt.Event = undefined;
+    var topics: [64][48]u8 = undefined;
+    var topic_lens: [64]usize = @splat(0);
+    var count = std.atomic.Value(usize).init(0);
+
+    fn record(event: qnnt.Event, topic: []const u8, _: []const u8, _: usize, _: ?*anyopaque) void {
+        const slot = count.fetchAdd(1, .monotonic);
+        if (slot >= kinds.len) return;
+        kinds[slot] = event;
+        const n = @min(topic.len, topics[slot].len);
+        @memcpy(topics[slot][0..n], topic[0..n]);
+        topic_lens[slot] = n;
+    }
+
+    fn reset() void {
+        count.store(0, .monotonic);
+    }
+
+    fn seen(event: qnnt.Event, topic: []const u8) bool {
+        const n = @min(count.load(.monotonic), kinds.len);
+        for (kinds[0..n], topics[0..n], topic_lens[0..n]) |k, *t, len| {
+            if (k == event and std.mem.eql(u8, t[0..len], topic)) return true;
+        }
+        return false;
+    }
+};
+
+fn eventSource(_: []const u8, _: ?*anyopaque) ?[]const u8 {
+    return "tick\n";
+}
+
+fn eventSink(_: []const u8, _: []const u8, _: ?*anyopaque) void {}
+
+test "a publisher learns when a subscriber connects, and can wait for one" {
+    EventLog.reset();
+    try startNode();
+    defer qnnt.deinit();
+
+    qnnt.setEventHandler(EventLog.record, null);
+    defer qnnt.setEventHandler(null, null);
+
+    try testing.expect(qnnt.runPublisher("test/events", eventSource, 20_000, null));
+
+    // Nobody is connected yet, so a zero-timeout wait must say so rather than block.
+    try testing.expectEqual(@as(usize, 0), qnnt.subscriberCount("test/events"));
+    try testing.expect(!qnnt.waitForSubscriber("test/events", 0));
+
+    try testing.expect(qnnt.subscribe("test/events", eventSink, null));
+
+    // This is the call the mesh examples wanted instead of a fixed sleep.
+    try testing.expect(qnnt.waitForSubscriber("test/events", 5000));
+    try testing.expect(qnnt.subscriberCount("test/events") >= 1);
+
+    try testing.expect(EventLog.seen(.subscriber_connected, "test/events"));
+    // The subscriber side of the same connection.
+    try testing.expect(EventLog.seen(.publisher_connected, "test/events"));
+}
+
+test "a quiet subscription is reported stale only when a timeout is set" {
+    EventLog.reset();
+    try startNode();
+    defer qnnt.deinit();
+
+    qnnt.setEventHandler(EventLog.record, null);
+    defer qnnt.setEventHandler(null, null);
+    // Off by default: a topic may legitimately be quiet.
+    try testing.expectEqual(@as(u64, 0), qnnt.staleTimeout());
+    qnnt.setStaleTimeout(300);
+    defer qnnt.setStaleTimeout(0);
+
+    // A publisher that never publishes: the subscription connects and then hears nothing.
+    try testing.expect(qnnt.runPublisher("test/quiet", null, null, null));
+    try testing.expect(qnnt.subscribe("test/quiet", eventSink, null));
+    try testing.expect(qnnt.waitForSubscriber("test/quiet", 5000));
+
+    // The sweeper wakes every 200 ms, so allow it a few passes past the timeout.
+    var waited: usize = 0;
+    while (waited < 3000 and !EventLog.seen(.publisher_stale, "test/quiet")) : (waited += 100) {
+        qnnt.sleepMs(100);
+    }
+    try testing.expect(EventLog.seen(.publisher_stale, "test/quiet"));
+}
+
+test "events are buffered for a poller, not only pushed to a handler" {
+    try startNode();
+    defer qnnt.deinit();
+
+    // No handler registered at all: the queue is filled regardless, which is what stops a
+    // consumer losing the connections that happen before its first poll.
+    try testing.expect(qnnt.runPublisher("test/polled", eventSource, 20_000, null));
+    try testing.expect(qnnt.subscribe("test/polled", eventSink, null));
+    try testing.expect(qnnt.waitForSubscriber("test/polled", 5000));
+
+    var buffer: [16]qnnt.PolledEvent = undefined;
+    var saw_subscriber = false;
+    var saw_publisher = false;
+    var count: usize = 0;
+
+    // Drain a few times: the two sides of the connection are established by different
+    // threads, so they need not both be queued by the time the wait returns.
+    var attempts: usize = 0;
+    while (attempts < 50 and !(saw_subscriber and saw_publisher)) : (attempts += 1) {
+        for (qnnt.pollEvents(&buffer)) |event| {
+            count += 1;
+            if (event.event == .subscriber_connected and
+                std.mem.eql(u8, event.topic, "test/polled"))
+            {
+                saw_subscriber = true;
+                // The count is the point: it is what lets a publisher wait for a known
+                // number of peers rather than merely the first.
+                try testing.expect(event.subscribers >= 1);
+                try testing.expect(event.peer.len > 0);
+            }
+            if (event.event == .publisher_connected and
+                std.mem.eql(u8, event.topic, "test/polled"))
+            {
+                saw_publisher = true;
+            }
+        }
+        if (!(saw_subscriber and saw_publisher)) qnnt.sleepMs(20);
+    }
+
+    try testing.expect(saw_subscriber);
+    try testing.expect(saw_publisher);
+
+    // Draining is destructive: what has been handed over is gone.
+    var again: [16]qnnt.PolledEvent = undefined;
+    try testing.expectEqual(@as(usize, 0), qnnt.pollEvents(&again).len);
+    try testing.expectEqual(@as(u64, 0), qnnt.eventsDropped());
+}
