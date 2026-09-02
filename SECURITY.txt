@@ -1,0 +1,211 @@
+qnnt security: threat model and where the boundaries are
+========================================================
+
+What this document is for: to say plainly what qnnt protects, what it does not, and which
+of those gaps are decisions rather than omissions. A library that is vague about this gets
+deployed as though it were secure, which is worse than being clear that it is not.
+
+Read the summary, then the plane it applies to. Section 6 is the deployment requirement; if
+you read nothing else, read that.
+
+
+1. the three planes, and how differently they are protected
+-----------------------------------------------------------
+
+qnnt has three kinds of socket, and their exposure is not what you would guess from the
+port numbers.
+
+  plane        binds                          authenticated   encrypted   carries
+  ---------    ---------------------------    -------------   ---------   -----------------
+  registry     127.0.0.1 only, always         no (see 2)      no          directory metadata
+  federation   0.0.0.0 when a key is set      YES (see 3)     no          directory metadata
+  data         0.0.0.0 when federation is on  NO (see 4)      no          every message
+
+The asymmetry is the headline: the directory is authenticated on the network, and the
+messages are not. Federation guards the address book; nothing guards the mail.
+
+
+2. the registry plane: local, and deliberately trusted
+------------------------------------------------------
+
+The registry listens on 127.0.0.1 and nowhere else. This is not configurable, only the port
+is. Any process on the host may connect and issue:
+
+    list  sub  subs  peers  status  ping  help  quit      read-only
+    pub  report                                            a node announcing itself
+    unpub                                                  removes a topic from the directory
+
+So a local process can enumerate every topic and endpoint, and can `unpub` a topic to
+deny it to subscribers until the publisher's next refresh.
+
+This is accepted, because the trust boundary is the host: any process that could connect
+here could also read the publisher sockets directly, ptrace the node, or read its memory.
+Defending the registry from a hostile local process would be theatre while the data plane
+is open to it.
+
+What follows from it: do not port-forward 2222, and do not run untrusted code on a host
+running a qnnt node. The loopback bind is what makes the first mistake hard to make by
+accident.
+
+
+3. the federation plane: authenticated, not confidential
+--------------------------------------------------------
+
+Federation is the only plane with a real handshake.
+
+  * It refuses to start without a pre-shared key (QNNT_CLUSTER_KEY). There is no
+    "insecure by default" mode -- a node with no key does not open the port and says so.
+  * Each connection gets a fresh 16-byte random nonce. The peer must return
+    HMAC-SHA256(nonce, key) before anything else is served.
+  * The comparison is constant-time (std.crypto.timing_safe.eql), so a wrong key cannot be
+    recovered a byte at a time by timing the reply.
+  * Before authentication succeeds the verb set is `fed-auth` and nothing else -- no
+    `list`, no `unpub`, none of the human commands.
+  * The key is never echoed in diagnostics; the environment reader prints
+    "<value withheld>" when reporting it.
+
+What it does NOT do:
+
+  * No confidentiality. Topic names, node ids, publisher addresses and subscriber counts
+    cross the network in the clear, and an observer learns your entire topology.
+  * No replay protection across connections. The nonce is per connection, so a captured
+    exchange cannot be replayed into a *different* connection, but nothing binds a session
+    to anything beyond it.
+  * No peer identity. Every peer holds the same key, so the key answers "is this one of
+    ours" and not "which one". See 5.
+
+
+4. the data plane: unauthenticated, and this is the real gap
+------------------------------------------------------------
+
+A publisher binds a socket, registers the endpoint, and accepts whatever connects:
+
+    const client = server.accept(io) ...     // straight into the subscriber list
+
+There is no handshake. Any host that can reach the port and learn the endpoint receives
+every message published on that topic, forever, silently. The endpoint is not a secret: it
+is in the registry, and federation hands it to every peer.
+
+When federation is enabled, these sockets bind 0.0.0.0. That is required for a remote
+subscriber to reach them and is not a bug, but it does mean enabling federation moves every
+topic's payload from loopback to every interface.
+
+Subscribers are equally unprotected in the other direction: a subscription connects to
+whatever address the registry returned and reads it as authoritative. A peer that can write
+to the directory can therefore redirect a topic's subscribers to a host of its choosing --
+which is precisely why the registry is loopback-only and federation requires a key.
+
+This is the gap that most deserves closing in the library, and the one a tunnel closes
+least well: a tunnel grants *host*-level access, so any host inside it can subscribe to any
+topic. It cannot express "this node may read sensors/* but not control/*".
+
+
+5. node identity is asserted, not proven
+----------------------------------------
+
+A NodeId is 128 random bits, generated at startup. Federation attributes every directory
+entry to an origin NodeId, and conflicts are resolved first-wins with the clash reported.
+
+An authenticated peer may claim any origin it likes. With the shared key -- which every
+peer has -- a peer can assert another node's NodeId and take over a topic under the
+first-wins rule, or hold it with a stale entry. Nothing in the protocol can tell the
+difference between a node and an impostor holding the same key.
+
+So federation's trust model is: every peer with the cluster key is fully trusted. It is a
+perimeter, not a set of identities. Sharing the key with a peer you would not let publish
+on any topic is not a supported configuration.
+
+
+6. the deployment requirement
+-----------------------------
+
+Given 1 through 5:
+
+    Run qnnt on a trusted network segment, or inside a tunnel. Treat a WAN deployment as
+    requiring WireGuard, IPsec or an equivalent, and treat that as a requirement rather
+    than a recommendation.
+
+Why the tunnel and not encryption in the library:
+
+  * It uses the same primitives an in-library design would reach for (X25519,
+    ChaCha20-Poly1305), audited and maintained by people who do only that.
+  * The crypto runs in the kernel, so its cost lands in softirq rather than in the
+    SCHED_FIFO worker threads whose latency budget qnnt spends effort protecting.
+  * It covers all three planes at once, including the registry port if someone exposes it,
+    and any plane added later.
+  * A handshake designed here is a handshake maintained here, and its failures are silent.
+
+What a tunnel does not fix, and no tunnel can:
+
+  * topic-level authorisation (4) -- host-level access is all a tunnel has to give;
+  * node identity (5) -- the impostor is inside the tunnel by definition.
+
+
+7. what the library does defend against
+---------------------------------------
+
+Not everything is deferred. The parts that process untrusted bytes are written as though
+they are untrusted:
+
+  * TLD decoding is bounded. A frame's declared length is 8 attacker-controlled bytes, so
+    readFrame caps what one frame may ask the process to buffer (FrameTooLarge) rather than
+    trusting the number. Container nesting is depth-limited in `validate`. A child frame
+    overrunning its parent is an error, not a read past the end.
+  * STRING frames are UTF-8 validated on the way in and on the way out, so a decoder that
+    hands text to something expecting text cannot be used to smuggle invalid sequences.
+  * Hosts arriving over the wire are parsed with resolve.parseLiteral, which accepts
+    addresses only and never performs DNS. A peer cannot make this host resolve a name it
+    chose, nor stall a handler thread while a resolver times out.
+  * The subscription queue drops the newest message when full and counts it, so a consumer
+    that stops draining costs bounded memory rather than unbounded growth.
+  * Federation entries expire. A stale entry stops being served after 30 s and is forgotten
+    after 300 s, and is no longer re-gossiped once unservable, so a departed node's
+    addresses do not circulate indefinitely.
+  * Shutdown is deterministic: workers are tracked and joined, and blocking sockets are
+    broken rather than left to be closed underneath a thread.
+
+
+8. local denial of service you can do to yourself
+-------------------------------------------------
+
+Not attacks so much as configurations that behave like them:
+
+  * An unpaced publisher (period 0) at a real-time priority is a busy loop the scheduler
+    cannot preempt. Linux's RT throttle keeps the machine reachable, and the measured cost
+    is a ~40 ms stall every second. The library warns when asked for both; do not.
+  * mlockall pins memory that cannot be reclaimed. With ONFAULT that is the process's real
+    footprint (~10 MB here); without it, on a kernel that lacks the flag, it is every
+    mapping the allocator reserved (~184 MB measured). On a small board that is memory the
+    rest of the system loses.
+  * A subscriber that stops draining its queue loses messages, and the drop count is the
+    only place that shows. Watch `queueDropped`, and `eventsDropped` for connection events.
+
+
+9. if you need more than a tunnel
+---------------------------------
+
+In the order they would be worth doing, and why that order:
+
+  1. Data-plane authentication. Extend federation's existing PSK/nonce/HMAC challenge to
+     publisher accepts. Authentication only -- no key agreement, no cipher, no new
+     protocol -- reusing code that already works, and it closes 4.
+  2. Verifiable identity. Make a NodeId an Ed25519 public key and sign federation entries,
+     so origin attribution becomes checkable and 5 stops being an open door for any peer
+     holding the key.
+  3. Payload confidentiality, only if a deployment genuinely cannot have a tunnel. Two
+     constraints from measurement: encrypt per *stream* rather than per message, since each
+     subscriber already has its own TCP stream and a per-message AEAD would add 28 bytes to
+     an 88-byte frame while the small-frame path is already syscall-bound; and implement a
+     published handshake (a Noise pattern) rather than inventing one.
+
+std.crypto has X25519, Ed25519, ChaCha20-Poly1305, AES-GCM and HKDF, so none of this is
+blocked on dependencies. It is blocked on being worth the maintenance, which 1 and 2 are
+and 3 usually is not.
+
+
+10. reporting something
+-----------------------
+
+This is a project in development, not a product with a disclosure process. If you find
+something, say so wherever the project is tracked. Nothing here has been through an external
+review, and this document is the author's own assessment rather than an audit.
