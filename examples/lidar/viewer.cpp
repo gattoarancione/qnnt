@@ -312,6 +312,13 @@ private:
                         m_elevations[static_cast<std::size_t>(i++)] =
                             static_cast<float>(angle.asFloat());
                     }
+                } else if (field.key == "azimuth_offsets_deg") {
+                    int i = 0;
+                    for (const qnnt::tld::Frame& angle : field.value.array()) {
+                        if (i >= kMaxChannels) break;
+                        m_azimuth_offsets[static_cast<std::size_t>(i++)] =
+                            static_cast<float>(angle.asFloat());
+                    }
                 }
             }
 
@@ -367,12 +374,18 @@ private:
             // With two firings per block the second half of the samples belongs to the
             // NEXT azimuth, not this one. With one firing they all share it. Getting this
             // wrong smears the cloud by a fifth of a degree and looks almost right.
-            const double azim =
-                (azimuth_cdeg + firing * m_azimuth_step_cdeg) * M_PI / 18000.0;
-            const double sin_a = std::sin(azim);
-            const double cos_a = std::cos(azim);
+            // Was hoisted out of the channel loop, which is only valid when every channel
+            // in a firing shares an azimuth. A two-column sensor breaks that: each channel
+            // carries its own horizontal correction, so the sin/cos move inside.
+            const double firing_deg =
+                (azimuth_cdeg + firing * m_azimuth_step_cdeg) / 100.0;
 
             for (int ch = 0; ch < m_channels; ++ch) {
+                const double azim =
+                    (firing_deg + m_azimuth_offsets[static_cast<std::size_t>(ch)]) *
+                    M_PI / 180.0;
+                const double sin_a = std::sin(azim);
+                const double cos_a = std::cos(azim);
                 // The distance was 2 bytes until ranges past 65.535 m had to survive the
                 // trip; see kSampleStride above.
                 const std::size_t at =
@@ -415,6 +428,9 @@ private:
     int m_firings_per_block = 0;
     int m_azimuth_step_cdeg = 20;
     std::array<float, kMaxChannels> m_elevations{};
+    /// Per-channel horizontal correction, degrees. Zero-initialised, so a publisher that
+    /// does not send them behaves as before rather than skewing the cloud.
+    std::array<float, kMaxChannels> m_azimuth_offsets{};
     bool m_have_calibration = false;
     bool m_angles_from_device = false;
     int m_last_azimuth_cdeg = 0;

@@ -153,6 +153,8 @@ guessed was wrong. What a live unit at 192.168.3.221 actually sends:
     DIFOP magic            A5FF005A11115555 the same     -- the other
     angle table            offset 32, 2B    offset 468, THREE bytes: sign + magnitude
     angle values           invented         +14.94 down to -54.60, non-uniform
+    horizontal table       not known to     offset 564, same encoding: rs_driver's DIFOP
+                           exist            is vert_angle_cali[32] then horiz_angle_cali[32]
 
 The DIFOP also carries the ethernet block, which is how the layout was established at all:
 sensor IP at 10, destination IP at 14, MAC at 18, MSOP port at 24, DIFOP port at 28. Reading
@@ -163,6 +165,43 @@ The angle table is still a fallback rather than a default to rely on: it is ONE 
 calibration, and the family covers several distributions. `anglesArePlaceholder()` reports
 when it is in use, and the driver prefers the device's own table -- which arrives within a
 second, as `angles device` in the bridge's output.
+
+the horizontal table, and the wall that rendered twice
+------------------------------------------------------
+
+A Helios-32's lasers sit in TWO columns, and the DIFOP says so in a second table that this
+driver ignored at first. The measured unit alternates by channel:
+
+    even channels   -3.97 .. -5.32 deg
+    odd channels    +3.57 .. +4.80 deg
+
+An 8 degree spread between neighbours. Dropping it does not blur a cloud, it splits one: a
+vertical wall renders as two walls swung apart, which is how the omission surfaced -- as
+"scattered lines, some way too left and some others way too right" in the viewer.
+
+Worth being precise about why a top-down view is a good test for this. A bird's-eye
+projection collapses elevation, and for a VERTICAL surface every channel's projection lands
+on the same line no matter its elevation angle, because the horizontal reach r*cos(elev)
+grows exactly as the beam's travel along the wall does. So one wall must draw one line. Two
+lines means the per-channel azimuth is wrong, and it cannot be an artifact of the projection.
+
+Fitting a line to the even channels and to the odd channels of one 10 degree sector
+measures the error directly. On the real unit, over the same points:
+
+    corrections applied   even -36.86 deg, odd -36.93 deg   ->  0.06 deg apart
+    corrections zeroed    even -32.23 deg, odd -36.03 deg   ->  3.80 deg apart
+
+The correction is applied in `scan.resolve`, which is why the sin/cos had to move inside the
+channel loop in viewer.cpp: hoisting them out is only valid when a firing's channels share
+an azimuth, which is exactly what a two-column sensor breaks. The offsets ride in the
+calibration frame as `azimuth_offsets_deg`, and a consumer that ignores them gets the split
+cloud back.
+
+One residual is known and NOT corrected here: within a block the 32 channels fire
+sequentially over 53.63 of the block's 55.56 us, so each channel's true azimuth leads the
+block's by up to 0.193 deg at 600 rpm -- rs_driver interpolates this with a per-channel time
+fraction. It is a tenth the size of the two-column error and shows as slight smearing rather
+than a split; correcting it needs the firing-time table on the wire as well.
 
 Two things the measurements changed beyond constants:
 
@@ -208,8 +247,27 @@ Two things about that window are worth knowing:
     0, no return, rather than wrapping -- a sensor that cannot count that high could not have
     reported that range either, and saturating would invent a 163.8 m return. `scan.zig` has
     both halves, `sampleDistanceMm` and `sampleDistanceCounts`, next to each other.
-  * neither fake can exercise any of this. The nearest return either scene can produce is
-    the floor under the steepest downward beam, 1.0 m / sin(49.59 deg) = 1.31 m, which is
+
+Both were then measured against the unit at 192.168.3.221, reading raw MSOP and histogramming
+counts so that a return the driver dropped stays distinguishable from a zero the sensor sent
+(downstream they are the same value). Over 1,152,000 samples:
+
+    sensor's own zero   31,862   2.77%
+    counts 1..39            67   0.0058%   <- removed by the rated window
+    counts >= 40     1,120,071
+    max count           10,865             27.16 m
+
+So the window is real but small, and what it removes looks exactly like what it is for: the
+sub-minimum counts cluster at 4, 8 and 32..38 -- 10 mm, 20 mm and 80..95 mm -- which is
+near-field noise that would otherwise have drawn false points on top of the sensor.
+
+The u32, by contrast, is NOT exercised here. This is an indoor scene: the furthest return in
+4.6 million samples was 27.18 m, and nothing came within a factor of two of the 65.535 m
+where a u16 used to clamp. The widening is right and the boundary cases are pinned by unit
+tests over raw counts, but no run of this example demonstrates it -- it would take a scene
+with something 70 m away. Worth knowing before treating a green pipeline as proof.
+  * neither fake can exercise the distance window. The nearest return either scene can
+    produce is the floor under the steepest downward beam, 1.0 m / sin(49.59 deg) = 1.31 m,
     comfortably inside both windows. So the window is covered by unit tests over raw counts
     and not by running the example -- the same shape of blind spot as the mid-packet azimuth
     wrap the fakes hid, and worth remembering before trusting a green pipeline here.

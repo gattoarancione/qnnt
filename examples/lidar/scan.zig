@@ -91,6 +91,16 @@ pub const Calibration = struct {
     /// Vertical angle per channel, in degrees, in channel order. Only the first `channels`
     /// entries are meaningful.
     elevations_deg: [max_channels]f32,
+    /// Horizontal angle correction per channel, in degrees, in channel order. Added to the
+    /// block azimuth before projection.
+    ///
+    /// Zero for a sensor whose lasers share a single column, which is why this defaults to
+    /// zero and why the RS16 never fills it in -- rs_driver hard-zeros that model's table.
+    /// A Helios-32 has two columns: the unit measured here alternates about -4 and +4
+    /// degrees by channel, an 8 degree spread between neighbours. Ignoring it does not blur
+    /// the cloud, it splits it -- a vertical wall renders as two walls, one swung left and
+    /// one right, which is the visible symptom that led here.
+    azimuth_offsets_deg: [max_channels]f32 = @splat(0),
     /// Whether the angles above came from the device or from a table compiled in. False is
     /// a warning sign for any sensor whose spacing is not uniform.
     from_device: bool = false,
@@ -119,7 +129,12 @@ pub fn resolve(
     const azimuth_cdeg = (@as(u32, block.azimuth_cdeg) +
         @as(u32, @intCast(firing)) * cal.azimuth_step_cdeg) % 36000;
 
-    const azim = @as(f32, @floatFromInt(azimuth_cdeg)) * std.math.pi / 18000.0;
+    // Degrees rather than hundredths from here, because the per-channel correction is a
+    // signed fraction of a degree and pushing it back into the unsigned cdeg would need a
+    // wrap that sin and cos do not care about.
+    const azim_deg = @as(f32, @floatFromInt(azimuth_cdeg)) / 100.0 +
+        cal.azimuth_offsets_deg[channel];
+    const azim = azim_deg * std.math.pi / 180.0;
     const elev = cal.elevations_deg[channel] * std.math.pi / 180.0;
     const r = @as(f32, @floatFromInt(sample.distance_mm)) / 1000.0;
     const horizontal = r * @cos(elev);

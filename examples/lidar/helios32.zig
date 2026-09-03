@@ -246,20 +246,33 @@ pub const difop_difop_port_offset = 28;
 pub const difop_angles_offset = 468;
 pub const difop_angle_stride = 3;
 
+/// The horizontal correction table, immediately after the vertical one: rs_driver's DIFOP
+/// struct is `RSCalibrationAngle vert_angle_cali[32]` then `horiz_angle_cali[32]`, and each
+/// entry is 3 bytes, so 468 + 32 * 3. Read separately from the vertical table because for a
+/// long time only the vertical one was read, and a wall rendered as two.
+pub const difop_horiz_angles_offset = difop_angles_offset + channels * difop_angle_stride;
+
 pub fn writeDifop(out: *[difop_packet_len]u8, cal: *const scan.Calibration) void {
     @memset(out, 0);
     @memcpy(out[0..difop_magic.len], &difop_magic);
     std.mem.writeInt(u16, out[difop_rpm_offset..][0..2], cal.rpm, .big);
 
     for (0..channels) |i| {
-        const deg = cal.elevations_deg[i];
-        const at = difop_angles_offset + i * difop_angle_stride;
         // Sign byte then magnitude, which is how the device does it -- not a signed
         // integer. A negative angle written as two's complement would read as +600 degrees.
-        out[at] = if (deg < 0) 1 else 0;
-        const mag: u16 = @intFromFloat(@abs(deg) * 100.0);
-        std.mem.writeInt(u16, out[at + 1 ..][0..2], mag, .big);
+        writeAngle(out, difop_angles_offset + i * difop_angle_stride, cal.elevations_deg[i]);
+        writeAngle(
+            out,
+            difop_horiz_angles_offset + i * difop_angle_stride,
+            cal.azimuth_offsets_deg[i],
+        );
     }
+}
+
+fn writeAngle(out: *[difop_packet_len]u8, at: usize, deg: f32) void {
+    out[at] = if (deg < 0) 1 else 0;
+    const mag: u16 = @intFromFloat(@abs(deg) * 100.0);
+    std.mem.writeInt(u16, out[at + 1 ..][0..2], mag, .big);
 }
 
 pub fn parseDifop(bytes: []const u8, cal: *scan.Calibration) bool {
@@ -277,6 +290,16 @@ pub fn parseDifop(bytes: []const u8, cal: *scan.Calibration) bool {
         if (mag != 0) any = true;
         const deg = @as(f32, @floatFromInt(mag)) / 100.0;
         cal.elevations_deg[i] = if (negative) -deg else deg;
+
+        // The horizontal correction is not gated on `any`: a sensor could legitimately
+        // report every horizontal offset as zero -- a single-column model does -- and that
+        // is data, not an absent table. The vertical table decides whether the device
+        // answered at all.
+        const h_at = difop_horiz_angles_offset + i * difop_angle_stride;
+        const h_negative = bytes[h_at] != 0;
+        const h_mag = std.mem.readInt(u16, bytes[h_at + 1 ..][0..2], .big);
+        const h_deg = @as(f32, @floatFromInt(h_mag)) / 100.0;
+        cal.azimuth_offsets_deg[i] = if (h_negative) -h_deg else h_deg;
     }
     if (any) cal.from_device = true;
     return any;
@@ -473,4 +496,63 @@ test "a distance no count can carry is written as no-return, not wrapped" {
 
     try testing.expectEqual(@as(u32, 0), parsed.blocks[0].samples[0].distance_mm);
     try testing.expectEqual(@as(u32, 100_000), parsed.blocks[0].samples[1].distance_mm);
+}
+
+test "DIFOP carries a horizontal correction table after the vertical one" {
+    // Both tables, written the way the unit at 192.168.3.221 writes them: sign byte then
+    // big-endian hundredths of a degree, vertical at 468 and horizontal at 564. The real
+    // sensor alternates roughly -4 and +4 degrees by channel -- two laser columns -- and
+    // reading only the vertical table renders a wall as two walls 8 degrees apart.
+    var difop: [difop_packet_len]u8 = std.mem.zeroes([difop_packet_len]u8);
+    @memcpy(difop[0..difop_magic.len], &difop_magic);
+    std.mem.writeInt(u16, difop[difop_rpm_offset..][0..2], 600, .big);
+
+    for (0..channels) |i| {
+        const v_at = difop_angles_offset + i * difop_angle_stride;
+        difop[v_at] = if (i >= 16) 1 else 0;
+        std.mem.writeInt(u16, difop[v_at + 1 ..][0..2], @intCast(100 + i * 10), .big);
+
+        // Even channels swing left, odd right, as the measured unit does.
+        const h_at = difop_horiz_angles_offset + i * difop_angle_stride;
+        difop[h_at] = if (i % 2 == 0) 1 else 0;
+        std.mem.writeInt(u16, difop[h_at + 1 ..][0..2], if (i % 2 == 0) 407 else 363, .big);
+    }
+
+    var cal = defaultCalibration();
+    try testing.expect(parseDifop(&difop, &cal));
+    try testing.expect(cal.from_device);
+
+    try testing.expectApproxEqAbs(@as(f32, 1.0), cal.elevations_deg[0], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, -2.6), cal.elevations_deg[16], 0.001);
+
+    try testing.expectApproxEqAbs(@as(f32, -4.07), cal.azimuth_offsets_deg[0], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 3.63), cal.azimuth_offsets_deg[1], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, -4.07), cal.azimuth_offsets_deg[30], 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 3.63), cal.azimuth_offsets_deg[31], 0.001);
+}
+
+test "writeDifop round-trips both angle tables, not just the vertical one" {
+    // Regression guard: writeDifop wrote only the vertical table for a long time, so a
+    // fake built on it declared a single-column sensor and the example could not show the
+    // horizontal correction going missing.
+    var cal = defaultCalibration();
+    cal.rpm = 600;
+    for (0..channels) |i| {
+        cal.elevations_deg[i] = -20.0 + @as(f32, @floatFromInt(i));
+        cal.azimuth_offsets_deg[i] = if (i % 2 == 0) -4.07 else 3.63;
+    }
+
+    var difop: [difop_packet_len]u8 = undefined;
+    writeDifop(&difop, &cal);
+
+    var back = defaultCalibration();
+    try testing.expect(parseDifop(&difop, &back));
+    for (0..channels) |i| {
+        try testing.expectApproxEqAbs(cal.elevations_deg[i], back.elevations_deg[i], 0.011);
+        try testing.expectApproxEqAbs(
+            cal.azimuth_offsets_deg[i],
+            back.azimuth_offsets_deg[i],
+            0.011,
+        );
+    }
 }

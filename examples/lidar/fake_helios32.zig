@@ -89,6 +89,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const u = 2.0 * t - 1.0; // -1 at the bottom beam, +1 at the top
         const shaped = std.math.pow(f32, @abs(u), 1.6);
         calibration.elevations_deg[i] = if (u < 0) -50.0 * shaped else 15.0 * shaped;
+        // Two columns, alternating by channel, at roughly the spread the measured unit
+        // reports. Without this the fake is a single-column sensor and the example never
+        // exercises the horizontal correction -- which is how reading only the vertical
+        // table went unnoticed until a real wall rendered twice.
+        calibration.azimuth_offsets_deg[i] = if (i % 2 == 0) -4.07 else 3.63;
     }
 
     std.debug.print(
@@ -129,7 +134,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
             block.azimuth_cdeg = @intCast(azimuth_cdeg);
             // One firing: every sample slot is its own channel, no interleave.
             for (0..helios.channels) |ch| {
-                const hit = scene.beam(azimuth_cdeg, calibration.elevations_deg[ch], phase);
+                // The real unit's lasers sit in two columns, so each channel's ray leaves
+                // at its own azimuth. Cast through the same correction the DIFOP declares,
+                // or the driver would apply an offset this scene never used and the fake
+                // would disagree with itself.
+                const offset_cdeg: i32 =
+                    @intFromFloat(calibration.azimuth_offsets_deg[ch] * 100.0);
+                const ray_cdeg: u32 =
+                    @intCast(@mod(@as(i32, @intCast(azimuth_cdeg)) + offset_cdeg, 36000));
+                const hit = scene.beam(ray_cdeg, calibration.elevations_deg[ch], phase);
                 block.samples[ch] = .{ .distance_mm = hit.distance_mm, .intensity = hit.intensity };
             }
             azimuth_cdeg = (azimuth_cdeg + helios.azimuth_step_cdeg) % 36000;
