@@ -152,6 +152,52 @@ spacing IS its published table, so its default is trustworthy. The Helios has no
 table -- the family covers several distributions -- so any default here would be wrong for
 most units.
 
+when nothing is transmitting
+----------------------------
+
+A driver whose sensor is absent used to park the thread in recvfrom, where it could not be
+interrupted: the last line in the log was "awaiting DIFOP", SIGINT was ignored, and the
+process had to be killed. Both drivers now bound both waits.
+
+  receive_timeout_ms       500    one `next` call waits this long, then reports .timeout
+  calibration_timeout_ms  3000    how long to wait for the device's angle table
+
+`next` therefore has three outcomes rather than two, and they mean different things:
+
+    .scan       a packet
+    .timeout    nothing arrived -- check that the sensor is transmitting, and where to
+    .malformed  a datagram arrived and was not ours -- almost always the wrong model,
+                since both generations use port 6699 and 1248-byte packets
+
+What that looks like with no sensor running:
+
+    lidar-sensor: no DIFOP within the wait; using the driver's table (32 channels,
+      -55.00..19.00 deg) -- these are a placeholder, not this unit's geometry
+    lidar-sensor: no packets on 0.0.0.0:6699 for 3s -- is the sensor transmitting, and
+      to this host and port?
+    ^C
+    lidar-sensor: stopping (0 published, 0 malformed, 12 idle waits)
+
+With the wrong driver for the device:
+
+    lidar-sensor: a datagram on 6699 was not helios32 MSOP -- wrong model? the other
+      generation uses the same port and size
+    lidar-sensor: stopping (0 published, 2994 malformed, 0 idle waits)
+
+And a sensor that appears late is picked up without a restart, including its calibration:
+
+    lidar-sensor: no packets on 0.0.0.0:6699 for 3s -- is the sensor transmitting...
+    lidar-sensor: packets are arriving again
+    lidar-sensor: 902 packets/s in, ... angles driver
+    lidar-sensor: calibration from the device: 600 rpm, channel 0 at -50.00 deg, ...
+    lidar-sensor: 1500 packets/s in, ... angles device
+
+The receiver itself is scan.zig's, parameterised by the driver module, because both drivers
+had a byte-identical copy of it and this change would have had to be made twice -- which is
+how two copies stop being identical. Two tests pin it: a receiver with nobody sending
+returns .timeout within its window rather than blocking, and the calibration wait expires
+instead of staying open forever without fabricating a device table.
+
 running it
 ----------
 

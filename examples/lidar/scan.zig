@@ -155,3 +155,244 @@ test "no return resolves to nothing, not to the origin" {
     const block: Block = .{ .azimuth_cdeg = 0, .samples = @splat(.{ .distance_mm = 0, .intensity = 0 }) };
     try std.testing.expect(resolve(&cal, block, 0) == null);
 }
+
+// -- the receiver, generic over a driver --------------------------------------------
+//
+// Both drivers had a byte-identical Receiver, differing only in which parse function and
+// packet lengths they used. That duplication was about to be edited in two places at once,
+// which is how two copies stop being identical, so it lives here parameterised instead.
+//
+// `Driver` is a driver module: rs16.zig or helios32.zig, passed as @This().
+
+/// What one call to `next` produced. Three outcomes, named, because a caller must be able
+/// to tell "nothing is arriving" from "something arrived and was wrong" -- the first means
+/// check the cable, the second means check the model.
+pub fn Next(comptime _: type) type {
+    return union(enum) {
+        scan: Scan,
+        /// Nothing arrived within the receive timeout. Not an error: a sensor that is off,
+        /// unplugged, or on another port looks exactly like this, and the caller decides
+        /// what to say about it.
+        timeout,
+        /// A datagram arrived and was not a packet this driver understands -- wrong model,
+        /// truncated, or not a LiDAR at all.
+        malformed,
+    };
+}
+
+pub fn Receiver(comptime Driver: type) type {
+    return struct {
+        const Self = @This();
+
+        io: std.Io,
+        msop: std.Io.net.Socket,
+        difop: ?std.Io.net.Socket,
+        calibration: Calibration,
+
+        /// How long one `next` call waits before reporting a timeout.
+        ///
+        /// It exists because the alternative is a blocking receive, and a blocking receive
+        /// with no sensor on the other end parks the thread in recvfrom where a signal
+        /// cannot reach it: the process ignored SIGINT entirely and had to be killed. Any
+        /// bounded wait fixes that; half a second keeps the loop responsive without
+        /// spinning.
+        receive_timeout_ms: u32 = 500,
+
+        /// How long to wait for the device's own calibration before settling for the
+        /// driver's table. Announced once, either way, so "awaiting DIFOP" always resolves
+        /// into a decision instead of being the last thing a log ever says.
+        calibration_timeout_ms: u32 = 3000,
+
+        seq: u64 = 0,
+        malformed: u64 = 0,
+        timeouts: u64 = 0,
+        revolutions: u64 = 0,
+        last_azimuth_cdeg: u16 = 0,
+
+        started_us: u64 = 0,
+        calibration_settled: bool = false,
+
+        buffer: [Driver.msop_packet_len * 2]u8 = undefined,
+        difop_buffer: [Driver.difop_packet_len * 2]u8 = undefined,
+
+        pub fn init(io: std.Io, bind_addr: []const u8, msop: u16, difop: ?u16) !Self {
+            var msop_address: std.Io.net.IpAddress = try .parse(bind_addr, msop);
+            const msop_socket = try msop_address.bind(io, .{ .mode = .dgram });
+
+            var difop_socket: ?std.Io.net.Socket = null;
+            if (difop) |port| {
+                var difop_address: std.Io.net.IpAddress = try .parse(bind_addr, port);
+                difop_socket = difop_address.bind(io, .{ .mode = .dgram }) catch null;
+            }
+
+            return .{
+                .io = io,
+                .msop = msop_socket,
+                .difop = difop_socket,
+                .calibration = Driver.defaultCalibration(),
+                .started_us = @intCast(std.Io.Timestamp.now(io, .real).toMicroseconds()),
+            };
+        }
+
+        pub fn deinit(r: *Self) void {
+            r.msop.close(r.io);
+            if (r.difop) |*d| d.close(r.io);
+        }
+
+        /// Wait up to `receive_timeout_ms` for one packet.
+        pub fn next(r: *Self) !Next(Driver) {
+            const message = r.msop.receiveTimeout(r.io, &r.buffer, .{
+                .duration = .{
+                    .raw = std.Io.Duration.fromMilliseconds(r.receive_timeout_ms),
+                    // The monotonic clock: a wall-clock adjustment must not extend or
+                    // collapse the wait.
+                    .clock = .awake,
+                },
+            }) catch |err| switch (err) {
+                error.Timeout => {
+                    r.timeouts += 1;
+                    return .timeout;
+                },
+                else => return err,
+            };
+
+            r.seq += 1;
+            const now_us: u64 = @intCast(std.Io.Timestamp.now(r.io, .real).toMicroseconds());
+            const parsed = Driver.parseMsop(message.data, r.seq, now_us) catch {
+                r.malformed += 1;
+                return .malformed;
+            };
+
+            if (parsed.blocks[0].azimuth_cdeg < r.last_azimuth_cdeg) r.revolutions += 1;
+            r.last_azimuth_cdeg = parsed.blocks[blocks_per_packet - 1].azimuth_cdeg;
+            return .{ .scan = parsed };
+        }
+
+        /// Take any pending DIFOP packet, without blocking. Returns true when it changed
+        /// the calibration.
+        pub fn pollCalibration(r: *Self) bool {
+            const socket = if (r.difop) |*d| d else {
+                r.calibration_settled = true; // no DIFOP socket: nothing to wait for
+                return false;
+            };
+
+            const message = socket.receiveTimeout(r.io, &r.difop_buffer, .{
+                .duration = .{ .raw = std.Io.Duration.fromMilliseconds(0), .clock = .awake },
+            }) catch {
+                // Nothing waiting. Give up on the device's table once the window has
+                // passed, so a caller can stop saying "awaiting" and say what it settled on.
+                if (!r.calibration_settled) {
+                    const now_us: u64 = @intCast(std.Io.Timestamp.now(r.io, .real).toMicroseconds());
+                    if (now_us -| r.started_us >= @as(u64, r.calibration_timeout_ms) * 1000) {
+                        r.calibration_settled = true;
+                    }
+                }
+                return false;
+            };
+
+            const changed = Driver.parseDifop(message.data, &r.calibration);
+            if (changed) r.calibration_settled = true;
+            return changed;
+        }
+
+        /// True once the calibration question is answered: either the device supplied a
+        /// table, or the wait for one expired.
+        pub fn calibrationSettled(r: *const Self) bool {
+            return r.calibration_settled;
+        }
+    };
+}
+
+test "a receiver with nobody sending times out rather than blocking forever" {
+    // The bug this pins: a blocking receive parked the thread in recvfrom, where the
+    // process could not even be interrupted -- SIGINT was ignored and it had to be killed.
+    const Fake = struct {
+        pub const msop_packet_len = 64;
+        pub const difop_packet_len = 64;
+        pub fn defaultCalibration() Calibration {
+            return .{
+                .model = "fake",
+                .rpm = 600,
+                .channels = 16,
+                .firings_per_block = 2,
+                .azimuth_step_cdeg = 20,
+                .elevations_deg = @splat(0),
+            };
+        }
+        pub fn parseMsop(_: []const u8, _: u64, _: u64) !Scan {
+            return error.BadMagic;
+        }
+        pub fn parseDifop(_: []const u8, _: *Calibration) bool {
+            return false;
+        }
+    };
+
+    var io_impl: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    // Port 0 lets the OS pick, so this test cannot collide with a real driver or another
+    // test run.
+    var receiver = try Receiver(Fake).init(io, "127.0.0.1", 0, null);
+    defer receiver.deinit();
+    receiver.receive_timeout_ms = 50;
+    receiver.calibration_timeout_ms = 10;
+
+    const before = std.Io.Timestamp.now(io, .awake).toNanoseconds();
+    const result = try receiver.next();
+    const elapsed_ms = @divTrunc(std.Io.Timestamp.now(io, .awake).toNanoseconds() - before, 1_000_000);
+
+    try std.testing.expect(result == .timeout);
+    try std.testing.expectEqual(@as(u64, 1), receiver.timeouts);
+    // Bounded, and actually waited: neither a hang nor a busy spin.
+    try std.testing.expect(elapsed_ms >= 40);
+    try std.testing.expect(elapsed_ms < 2000);
+
+    // With no DIFOP socket at all there is nothing to await, so the question is settled
+    // immediately rather than left open.
+    _ = receiver.pollCalibration();
+    try std.testing.expect(receiver.calibrationSettled());
+}
+
+test "the calibration wait expires instead of staying open forever" {
+    const Fake = struct {
+        pub const msop_packet_len = 64;
+        pub const difop_packet_len = 64;
+        pub fn defaultCalibration() Calibration {
+            return .{
+                .model = "fake",
+                .rpm = 600,
+                .channels = 32,
+                .firings_per_block = 1,
+                .azimuth_step_cdeg = 20,
+                .elevations_deg = @splat(0),
+            };
+        }
+        pub fn parseMsop(_: []const u8, _: u64, _: u64) !Scan {
+            return error.BadMagic;
+        }
+        pub fn parseDifop(_: []const u8, _: *Calibration) bool {
+            return false;
+        }
+    };
+
+    var io_impl: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    // A DIFOP socket that exists and never receives anything: the case a real driver hits
+    // when the sensor is off.
+    var receiver = try Receiver(Fake).init(io, "127.0.0.1", 0, 0);
+    defer receiver.deinit();
+    receiver.calibration_timeout_ms = 60;
+
+    try std.testing.expect(!receiver.calibrationSettled());
+    _ = receiver.pollCalibration();
+    try std.testing.expect(!receiver.calibrationSettled()); // too early to give up
+
+    try io.sleep(.fromMilliseconds(100), .awake);
+    _ = receiver.pollCalibration();
+    try std.testing.expect(receiver.calibrationSettled()); // and now it has
+    // Settling does not fabricate a device table.
+    try std.testing.expect(!receiver.calibration.from_device);
+}

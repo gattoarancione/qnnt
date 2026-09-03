@@ -35,9 +35,30 @@ const Driver = union(enum) {
     rs16: rs16.Receiver,
     helios32: helios32.Receiver,
 
-    fn next(d: *Driver) !?scan.Scan {
+    /// Three outcomes, not two: a packet, silence, or a datagram this driver does not
+    /// understand. The caller must tell them apart -- silence means check the sensor,
+    /// malformed means check the model.
+    const Result = union(enum) { scan: scan.Scan, timeout, malformed };
+
+    fn next(d: *Driver) !Result {
         return switch (d.*) {
-            inline else => |*r| r.next(),
+            inline else => |*r| switch (try r.next()) {
+                .scan => |s| Result{ .scan = s },
+                .timeout => Result.timeout,
+                .malformed => Result.malformed,
+            },
+        };
+    }
+
+    fn calibrationSettled(d: *const Driver) bool {
+        return switch (d.*) {
+            inline else => |*r| r.calibrationSettled(),
+        };
+    }
+
+    fn timeouts(d: *const Driver) u64 {
+        return switch (d.*) {
+            inline else => |r| r.timeouts,
         };
     }
     fn pollCalibration(d: *Driver) bool {
@@ -235,10 +256,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var last_published: u64 = 0;
     var last_report_us: u64 = @intCast(qnnt.nowMicros());
 
+    var announced_calibration = false;
+    var last_frame_len: usize = 0;
+    var silent_since_us: u64 = @intCast(qnnt.nowMicros());
+    var announced_silence = false;
+
     while (!qnnt.stopRequested()) {
         if (driver.pollCalibration()) {
             const fresh = driver.calibration();
-            // Only worth announcing when it actually changed something.
             if (fresh.from_device != cal.from_device or fresh.rpm != cal.rpm) {
                 std.debug.print(
                     "lidar-sensor: calibration from the device: {d} rpm, channel 0 at {d:.2} deg, channel {d} at {d:.2} deg\n",
@@ -246,29 +271,86 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 );
             }
             cal = fresh;
+            announced_calibration = true;
             publishCalibration(cal, cal_topic) catch {};
         }
 
-        const s = driver.next() catch |err| {
+        // "awaiting DIFOP" has to resolve into a statement one way or the other. Without
+        // this the startup line was the last thing the log ever said, which read as a hang
+        // -- and was one, before the driver grew a receive timeout.
+        if (!announced_calibration and driver.calibrationSettled() and !cal.from_device) {
+            announced_calibration = true;
+            std.debug.print(
+                "lidar-sensor: no DIFOP within the wait; using the driver's table" ++
+                    " ({d} channels, {d:.2}..{d:.2} deg){s}\n",
+                .{
+                    cal.channels,
+                    cal.elevations_deg[0],
+                    cal.elevations_deg[cal.channels - 1],
+                    if (std.mem.eql(u8, model, "helios32"))
+                        " -- these are a placeholder, not this unit's geometry"
+                    else
+                        "",
+                },
+            );
+        }
+
+        const now_us: u64 = @intCast(qnnt.nowMicros());
+
+        switch (driver.next() catch |err| {
             if (qnnt.stopRequested()) break;
             std.debug.print("lidar-sensor: receive failed: {}\n", .{err});
             continue;
-        } orelse continue; // malformed datagram, already counted
+        }) {
+            .timeout => {
+                // Nothing arrived. Say so once, with the two things worth checking, and
+                // keep looping so the process stays interruptible.
+                if (!announced_silence and now_us -| silent_since_us >= 3_000_000) {
+                    announced_silence = true;
+                    std.debug.print(
+                        "lidar-sensor: no packets on {s}:{d} for 3s -- is the sensor" ++
+                            " transmitting, and to this host and port?\n",
+                        .{ bind_addr, if (is_helios) helios32.msop_port else rs16.msop_port },
+                    );
+                }
+                continue;
+            },
+            .malformed => {
+                // A datagram arrived and was not ours. Almost always the wrong model,
+                // since both generations use the same port and packet size.
+                if (driver.malformed() == 1) {
+                    std.debug.print(
+                        "lidar-sensor: a datagram on {d} was not {s} MSOP -- wrong model?" ++
+                            " the other generation uses the same port and size\n",
+                        .{ if (is_helios) helios32.msop_port else rs16.msop_port, model },
+                    );
+                }
+                continue;
+            },
+            .scan => |s| {
+                if (announced_silence) {
+                    std.debug.print("lidar-sensor: packets are arriving again\n", .{});
+                    announced_silence = false;
+                }
+                silent_since_us = now_us;
 
-        const frame = pack(s, cal) catch continue;
-        qnnt.publish(topic, frame) catch continue;
-        published += 1;
+                const frame = pack(s, cal) catch continue;
+                qnnt.publish(topic, frame) catch continue;
+                published += 1;
+                last_frame_len = frame.len;
+            },
+        }
 
-        const now_us: u64 = @intCast(qnnt.nowMicros());
         if (now_us -| last_report_us >= 1_000_000) {
             std.debug.print(
-                "lidar-sensor: {d} packets/s in, {d} published, {d} malformed, {d} revs, {d} byte frames, angles {s}\n",
+                "lidar-sensor: {d} packets/s in, {d} published, {d} malformed, {d} idle waits, {d} revs, {d} byte frames, angles {s}\n",
                 .{
                     published - last_published,
                     published,
                     driver.malformed(),
+                    driver.timeouts(),
                     driver.revolutions(),
-                    frame.len,
+                    last_frame_len,
                     if (cal.from_device) "device" else "driver",
                 },
             );
@@ -276,4 +358,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
             last_report_us = now_us;
         }
     }
+
+    std.debug.print("lidar-sensor: stopping ({d} published, {d} malformed, {d} idle waits)\n", .{
+        published,
+        driver.malformed(),
+        driver.timeouts(),
+    });
 }

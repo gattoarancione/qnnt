@@ -228,67 +228,16 @@ pub fn parseDifop(bytes: []const u8, cal: *scan.Calibration) bool {
 }
 
 // -- the receiver -------------------------------------------------------------------
+//
+// scan.zig's, parameterised by this module. Both drivers had an identical copy of it; the
+// timeouts that stop a missing sensor from parking the thread in recvfrom now exist once.
+//
+// One datagram per scan, which is how the sensor transmits: no reassembly, no framing, and
+// a dropped packet costs exactly one packet's worth of points. That is why a LiDAR speaks
+// UDP, and why a driver counts losses rather than trying to recover them.
 
-pub const Receiver = struct {
-    io: std.Io,
-    msop: std.Io.net.Socket,
-    difop: ?std.Io.net.Socket,
-    calibration: scan.Calibration = undefined,
-
-    seq: u64 = 0,
-    malformed: u64 = 0,
-    revolutions: u64 = 0,
-    last_azimuth_cdeg: u16 = 0,
-
-    buffer: [msop_packet_len * 2]u8 = undefined,
-    difop_buffer: [difop_packet_len * 2]u8 = undefined,
-
-    pub fn init(io: std.Io, bind_addr: []const u8, msop: u16, difop: ?u16) !Receiver {
-        var msop_address: std.Io.net.IpAddress = try .parse(bind_addr, msop);
-        const msop_socket = try msop_address.bind(io, .{ .mode = .dgram });
-
-        var difop_socket: ?std.Io.net.Socket = null;
-        if (difop) |port| {
-            var difop_address: std.Io.net.IpAddress = try .parse(bind_addr, port);
-            difop_socket = difop_address.bind(io, .{ .mode = .dgram }) catch null;
-        }
-
-        return .{
-            .io = io,
-            .msop = msop_socket,
-            .difop = difop_socket,
-            .calibration = defaultCalibration(),
-        };
-    }
-
-    pub fn deinit(r: *Receiver) void {
-        r.msop.close(r.io);
-        if (r.difop) |*d| d.close(r.io);
-    }
-
-    pub fn next(r: *Receiver) !?scan.Scan {
-        const message = try r.msop.receive(r.io, &r.buffer);
-        r.seq += 1;
-
-        const now_us: u64 = @intCast(std.Io.Timestamp.now(r.io, .real).toMicroseconds());
-        const parsed = parseMsop(message.data, r.seq, now_us) catch {
-            r.malformed += 1;
-            return null;
-        };
-
-        if (parsed.blocks[0].azimuth_cdeg < r.last_azimuth_cdeg) r.revolutions += 1;
-        r.last_azimuth_cdeg = parsed.blocks[blocks_per_packet - 1].azimuth_cdeg;
-        return parsed;
-    }
-
-    pub fn pollCalibration(r: *Receiver) bool {
-        const socket = if (r.difop) |*d| d else return false;
-        const message = socket.receiveTimeout(r.io, &r.difop_buffer, .{
-            .duration = .{ .raw = std.Io.Duration.fromMilliseconds(0), .clock = .awake },
-        }) catch return false;
-        return parseDifop(message.data, &r.calibration);
-    }
-};
+pub const Next = scan.Next(@This());
+pub const Receiver = scan.Receiver(@This());
 
 // -- tests --------------------------------------------------------------------------
 
