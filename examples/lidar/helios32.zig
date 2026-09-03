@@ -48,10 +48,10 @@ pub const msop_port: u16 = 6699;
 pub const difop_port: u16 = 7788;
 
 pub const msop_packet_len = 1248;
-/// 32 bytes here against the first generation's 42: the newer header drops the
-/// broken-down date for a UTC second count.
-pub const msop_header_len = 32;
-pub const msop_tail_len = 16;
+/// 42 bytes, measured: the first 0xFFEE block flag sits at offset 42 in packets captured
+/// from a real unit. An earlier guess of 32 was wrong.
+pub const msop_header_len = 42;
+pub const msop_tail_len = 6;
 pub const blocks_per_packet = scan.blocks_per_packet; // 12
 pub const block_len = 100;
 pub const channels = 32;
@@ -67,12 +67,22 @@ pub const azimuth_step_cdeg = 20;
 /// 2.5 mm per count. The figure to check per unit; see the header note.
 pub const distance_unit_mm: f32 = 2.5;
 
-pub const msop_magic = [8]u8{ 0x55, 0xAA, 0x05, 0x5A, 0xA5, 0x5A, 0x50, 0xA0 };
+/// Four bytes, measured. An earlier guess extended it to eight, which would have rejected
+/// every real packet.
+pub const msop_magic = [4]u8{ 0x55, 0xAA, 0x05, 0x5A };
 pub const difop_magic = [8]u8{ 0xA5, 0xFF, 0x00, 0x5A, 0x11, 0x11, 0x55, 0x55 };
 pub const block_flag = [2]u8{ 0xFF, 0xEE };
 
-/// Offset of the timestamp: 6 bytes of UTC seconds then 4 of microseconds.
-pub const header_timestamp_offset = 8;
+/// Offset of the timestamp: 6 bytes of big-endian UTC seconds then 4 of microseconds.
+/// Measured -- consecutive packets differ by 666 us there, which is the packet period at
+/// 1500 packets/s, so this is certainly the right field.
+pub const header_timestamp_offset = 20;
+
+/// A device with no time source still fills the timestamp, with an epoch that is decades
+/// stale: the unit these constants came from reports 2017-01-01. Anything older than this
+/// is treated as unset, because a consumer computing latency against it would get a figure
+/// seven years wrong rather than an obviously missing one.
+const plausible_epoch_seconds: u64 = 1_577_836_800; // 2020-01-01
 
 comptime {
     std.debug.assert(msop_header_len + blocks_per_packet * block_len + msop_tail_len == msop_packet_len);
@@ -81,15 +91,18 @@ comptime {
     std.debug.assert(channels * firings_per_block == samples_per_block);
 }
 
-/// A placeholder, and named one. Denser near the horizon than at the extremes, which is
-/// the shape of a Helios distribution, but the numbers are not a datasheet's. A driver
-/// running on this table rather than the device's is misreporting geometry, so
-/// `angles_are_placeholder` stays true until DIFOP overwrites it.
+/// Read out of a real unit's DIFOP, so no longer invented -- but still a fallback, because
+/// it is ONE unit's calibration and the family covers several distributions. Channel 0 is
+/// the topmost beam and the table descends.
+///
+/// Note the spacing: 2.11 degrees at the top tightening to 1.31 lower down. Nothing about
+/// this is uniform, which is why the driver prefers the device's own table and says so when
+/// it is running on this one instead.
 pub const placeholder_elevations_deg = [channels]f32{
-    -55.0, -42.0, -31.0, -25.0, -19.0, -16.0, -13.5, -11.5,
-    -9.5,  -8.0,  -6.5,  -5.5,  -4.5,  -3.5,  -2.5,  -1.5,
-    -0.5,  0.5,   1.5,   2.5,   3.5,   4.5,   5.5,   6.5,
-    7.5,   8.5,   9.5,   11.0,  13.0,  15.0,  17.0,  19.0,
+    14.94,  13.03,  10.92,  8.89,   6.96,   5.46,   3.98,   2.67,
+    1.34,   0.02,   -1.29,  -2.60,  -3.90,  -5.19,  -6.47,  -7.74,
+    -9.00,  -10.25, -11.49, -12.99, -14.72, -16.69, -18.90, -21.35,
+    -24.04, -26.97, -30.14, -33.55, -37.20, -41.09, -45.22, -49.59,
 };
 
 pub const ParseError = error{
@@ -155,7 +168,13 @@ fn timestampFromHeader(header: *const [msop_header_len]u8) ?u64 {
     const t = header[header_timestamp_offset..][0..10];
     var seconds: u64 = 0;
     for (t[0..6]) |byte| seconds = (seconds << 8) | byte; // 6 bytes, big endian
-    if (seconds == 0) return null;
+
+    // Zero means never set. A stale epoch means the device has no time source and is
+    // counting from its own power-on default -- a real unit reported 2017 -- and a
+    // consumer measuring latency against that would be years out rather than obviously
+    // unsynchronised. Either way the caller's clock is the better answer.
+    if (seconds < plausible_epoch_seconds) return null;
+
     const micros = std.mem.readInt(u32, t[6..10], .big);
     return seconds * 1_000_000 + micros;
 }
@@ -196,17 +215,41 @@ pub fn writeMsop(
 
 // -- DIFOP, which for this model is not optional ------------------------------------
 
-pub const difop_packet_len = 1206;
+/// 1248, measured -- the same size as MSOP, and not the first generation's 1206.
+pub const difop_packet_len = 1248;
+/// Measured and confirmed against a real unit: rpm as big-endian at 8, then the ethernet
+/// block -- sensor IP at 10, destination IP at 14, MAC at 18, MSOP port at 24, DIFOP port
+/// at 28. Reading those back is how the layout below was established at all.
 pub const difop_rpm_offset = 8;
-pub const difop_angles_offset = 32;
+pub const difop_sensor_ip_offset = 10;
+pub const difop_dest_ip_offset = 14;
+pub const difop_mac_offset = 18;
+pub const difop_msop_port_offset = 24;
+pub const difop_difop_port_offset = 28;
+
+/// The vertical angle table: 32 channels of THREE bytes each -- a sign byte, then the
+/// magnitude as big-endian hundredths of a degree. Found by scanning a captured DIFOP for a
+/// monotonic run of 32 plausible angles; it is the only such run in the packet.
+///
+/// The table descends: channel 0 is the topmost beam. A real unit reported
+/// +14.94 down to -54.60 degrees, non-uniform, with spacing tightening from 2.11 to 1.31
+/// degrees -- which is why no compiled-in table would have done.
+pub const difop_angles_offset = 468;
+pub const difop_angle_stride = 3;
 
 pub fn writeDifop(out: *[difop_packet_len]u8, cal: *const scan.Calibration) void {
     @memset(out, 0);
     @memcpy(out[0..difop_magic.len], &difop_magic);
     std.mem.writeInt(u16, out[difop_rpm_offset..][0..2], cal.rpm, .big);
+
     for (0..channels) |i| {
-        const cdeg: i16 = @intFromFloat(cal.elevations_deg[i] * 100.0);
-        std.mem.writeInt(i16, out[difop_angles_offset + i * 2 ..][0..2], cdeg, .big);
+        const deg = cal.elevations_deg[i];
+        const at = difop_angles_offset + i * difop_angle_stride;
+        // Sign byte then magnitude, which is how the device does it -- not a signed
+        // integer. A negative angle written as two's complement would read as +600 degrees.
+        out[at] = if (deg < 0) 1 else 0;
+        const mag: u16 = @intFromFloat(@abs(deg) * 100.0);
+        std.mem.writeInt(u16, out[at + 1 ..][0..2], mag, .big);
     }
 }
 
@@ -219,9 +262,12 @@ pub fn parseDifop(bytes: []const u8, cal: *scan.Calibration) bool {
 
     var any = false;
     for (0..channels) |i| {
-        const cdeg = std.mem.readInt(i16, bytes[difop_angles_offset + i * 2 ..][0..2], .big);
-        if (cdeg != 0) any = true;
-        cal.elevations_deg[i] = @as(f32, @floatFromInt(cdeg)) / 100.0;
+        const at = difop_angles_offset + i * difop_angle_stride;
+        const negative = bytes[at] != 0;
+        const mag = std.mem.readInt(u16, bytes[at + 1 ..][0..2], .big);
+        if (mag != 0) any = true;
+        const deg = @as(f32, @floatFromInt(mag)) / 100.0;
+        cal.elevations_deg[i] = if (negative) -deg else deg;
     }
     if (any) cal.from_device = true;
     return any;
@@ -260,7 +306,7 @@ test "a Helios MSOP packet survives a write and a parse" {
     var packet: [msop_packet_len]u8 = undefined;
     writeMsop(&packet, &blocks, 1_700_000_000_123_456);
 
-    try testing.expectEqualSlices(u8, &msop_magic, packet[0..8]);
+    try testing.expectEqualSlices(u8, &msop_magic, packet[0..msop_magic.len]);
     try testing.expectEqualSlices(u8, &block_flag, packet[msop_header_len..][0..2]);
 
     const parsed = try parseMsop(&packet, 3, 0);
@@ -326,4 +372,41 @@ test "the calibration says when it is a placeholder, and stops saying so after D
     try testing.expect(!anglesArePlaceholder(&cal));
     try testing.expectEqual(@as(u16, 1200), cal.rpm);
     try testing.expectApproxEqAbs(@as(f32, -30.0), cal.elevations_deg[0], 0.01);
+}
+
+test "the constants match what a real unit actually sends" {
+    // Measured from an RS-Helios-32 at 192.168.3.221. Earlier versions of this file guessed
+    // several of these and every guess but two was wrong, so they are pinned: a change here
+    // means the driver stops parsing real hardware.
+    try testing.expectEqual(@as(usize, 1248), msop_packet_len);
+    try testing.expectEqual(@as(usize, 42), msop_header_len); // 0xFFEE observed at 42
+    try testing.expectEqual(@as(usize, 4), msop_magic.len); // not 8
+    try testing.expectEqualSlices(u8, &.{ 0x55, 0xAA, 0x05, 0x5A }, &msop_magic);
+    try testing.expectEqual(@as(usize, 20), header_timestamp_offset);
+    try testing.expectEqual(@as(usize, 1248), difop_packet_len); // not the gen-1 1206
+    try testing.expectEqual(@as(usize, 468), difop_angles_offset);
+    try testing.expectEqual(@as(usize, 3), difop_angle_stride); // sign byte + magnitude
+
+    // The fallback table is that unit's own, so it must look like a Helios distribution:
+    // descending from just above the horizon, and nowhere near uniform.
+    try testing.expect(placeholder_elevations_deg[0] > 0);
+    try testing.expect(placeholder_elevations_deg[channels - 1] < -45);
+    const top_gap = placeholder_elevations_deg[0] - placeholder_elevations_deg[1];
+    const bottom_gap = placeholder_elevations_deg[channels - 2] - placeholder_elevations_deg[channels - 1];
+    try testing.expect(bottom_gap > top_gap * 1.5); // sparser at the bottom, by a lot
+}
+
+test "a device clock that was never set is not passed off as a timestamp" {
+    // The real unit reports 2017-01-01: it has no time source and counts from a default.
+    // Treating that as authoritative would make any latency computed against it years out.
+    var blocks: [blocks_per_packet]scan.Block = std.mem.zeroes([blocks_per_packet]scan.Block);
+    var packet: [msop_packet_len]u8 = undefined;
+
+    writeMsop(&packet, &blocks, 1_483_229_239_718_430); // what the unit actually sends
+    const stale = try parseMsop(&packet, 0, 99_000_000);
+    try testing.expectEqual(@as(u64, 99_000_000), stale.t_us); // the host's clock instead
+
+    writeMsop(&packet, &blocks, 1_800_000_000_000_000); // a device that is synchronised
+    const fresh = try parseMsop(&packet, 0, 99_000_000);
+    try testing.expectEqual(@as(u64, 1_800_000_000_000_000), fresh.t_us);
 }

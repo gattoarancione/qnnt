@@ -4,7 +4,16 @@
 //!   ./zig-out/bin/lidar-sensor rs16 [bind_addr]
 //!
 //!   ./zig-out/bin/fake-helios32
-//!   ./zig-out/bin/lidar-sensor helios32 [bind_addr]
+//!   ./zig-out/bin/lidar-sensor helios32
+//!
+//! With real hardware, the direction of the connection is the thing to get straight: the
+//! sensor PUSHES MSOP to a destination configured on the device, and nothing here dials
+//! it. Set the sensor's destination IP to this host, then:
+//!
+//!   ./zig-out/bin/lidar-sensor helios32 --from 192.168.3.100
+//!
+//! where 192.168.3.100 is the SENSOR's address, used only to discard packets from anything
+//! else on the port -- not to connect anywhere.
 //!
 //! Two models, one bridge. Everything that differs between an RS-LiDAR-16 and a Helios-32
 //! -- endianness is the same, but the header, the distance unit, the channel count and how
@@ -38,7 +47,7 @@ const Driver = union(enum) {
     /// Three outcomes, not two: a packet, silence, or a datagram this driver does not
     /// understand. The caller must tell them apart -- silence means check the sensor,
     /// malformed means check the model.
-    const Result = union(enum) { scan: scan.Scan, timeout, malformed };
+    const Result = union(enum) { scan: scan.Scan, timeout, malformed, foreign };
 
     fn next(d: *Driver) !Result {
         return switch (d.*) {
@@ -46,7 +55,20 @@ const Driver = union(enum) {
                 .scan => |s| Result{ .scan = s },
                 .timeout => Result.timeout,
                 .malformed => Result.malformed,
+                .foreign => Result.foreign,
             },
+        };
+    }
+
+    fn setSource(d: *Driver, address: ?std.Io.net.IpAddress) void {
+        switch (d.*) {
+            inline else => |*r| r.expected_source = address,
+        }
+    }
+
+    fn foreign(d: *const Driver) u64 {
+        return switch (d.*) {
+            inline else => |r| r.foreign,
         };
     }
 
@@ -181,6 +203,45 @@ fn pack(s: scan.Scan, cal: scan.Calibration) ![]const u8 {
     return frame_buf.items;
 }
 
+/// The two bind failures mean opposite things and have opposite fixes, so they are worth
+/// separating: one is "this host is not the destination", the other is "something here
+/// already has the port".
+fn reportBindFailure(bind_addr: []const u8, port: u16, err: anyerror) void {
+    switch (err) {
+        error.AddressUnavailable, error.AddressNotAvailable => std.debug.print(
+            "lidar-sensor: this host has no address {s}, so nothing sent there can arrive." ++
+                " Bind an address this host actually has -- or 0.0.0.0 for all of them --" ++
+                " and make sure the sensor's configured destination is one of them ({})\n",
+            .{ bind_addr, err },
+        ),
+        error.AddressInUse => std.debug.print(
+            "lidar-sensor: {s}:{d} is already taken -- another driver, or a fake sensor," ++
+                " is holding it ({})\n",
+            .{ bind_addr, port, err },
+        ),
+        else => std.debug.print(
+            "lidar-sensor: cannot bind {s}:{d} ({})\n",
+            .{ bind_addr, port, err },
+        ),
+    }
+}
+
+fn usage(what: []const u8) void {
+    std.debug.print(
+        \\lidar-sensor: unexpected argument '{s}'
+        \\
+        \\usage: lidar-sensor [rs16|helios32] [options]
+        \\  --bind  <addr>   local interface to receive on (default 0.0.0.0, every one)
+        \\  --msop  <port>   MSOP port the sensor sends to (default 6699)
+        \\  --difop <port>   DIFOP port (default 7788)
+        \\  --from  <addr>   accept packets only from this sensor's address
+        \\
+        \\A sensor PUSHES to a destination configured on the device; nothing here dials it.
+        \\Set the sensor's destination to this host's address, then run this.
+        \\
+    , .{what});
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next();
@@ -190,13 +251,46 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // deployment knows what it bought.
     var model: []const u8 = "rs16";
     var bind_addr: []const u8 = "0.0.0.0";
-    if (args.next()) |a| model = a;
-    if (args.next()) |a| bind_addr = a;
+    var msop_port: ?u16 = null;
+    var difop_port: ?u16 = null;
+    var from_addr: ?[]const u8 = null;
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--bind")) {
+            bind_addr = args.next() orelse return usage("--bind needs an address");
+        } else if (std.mem.eql(u8, arg, "--msop")) {
+            const text = args.next() orelse return usage("--msop needs a port");
+            msop_port = std.fmt.parseInt(u16, text, 10) catch return usage("--msop is not a port");
+        } else if (std.mem.eql(u8, arg, "--difop")) {
+            const text = args.next() orelse return usage("--difop needs a port");
+            difop_port = std.fmt.parseInt(u16, text, 10) catch return usage("--difop is not a port");
+        } else if (std.mem.eql(u8, arg, "--from")) {
+            from_addr = args.next() orelse return usage("--from needs an address");
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return usage(arg);
+        } else {
+            // The one positional: the model, so the short form stays `lidar-sensor rs16`.
+            model = arg;
+        }
+    }
 
     const is_helios = std.mem.eql(u8, model, "helios32");
     if (!is_helios and !std.mem.eql(u8, model, "rs16")) {
         std.debug.print("lidar-sensor: unknown model '{s}' (expected rs16 or helios32)\n", .{model});
         return;
+    }
+
+    const msop = msop_port orelse if (is_helios) helios32.msop_port else rs16.msop_port;
+    const difop = difop_port orelse if (is_helios) helios32.difop_port else rs16.difop_port;
+
+    // Parsed before binding anything, so a typo fails immediately rather than after the
+    // node is up and the port is taken.
+    var source: ?std.Io.net.IpAddress = null;
+    if (from_addr) |text| {
+        source = std.Io.net.IpAddress.parse(text, 0) catch {
+            std.debug.print("lidar-sensor: --from '{s}' is not an IP address\n", .{text});
+            return;
+        };
     }
 
     const topic = if (is_helios) "lidar/helios32" else "lidar/rs16";
@@ -222,17 +316,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
     }
 
     var driver: Driver = if (is_helios) .{
-        .helios32 = helios32.Receiver.init(qnnt_mod.io, bind_addr, helios32.msop_port, helios32.difop_port) catch |err| {
-            std.debug.print("lidar-sensor: cannot bind {s}:{d} ({})\n", .{ bind_addr, helios32.msop_port, err });
+        .helios32 = helios32.Receiver.init(qnnt_mod.io, bind_addr, msop, difop) catch |err| {
+            reportBindFailure(bind_addr, msop, err);
             return;
         },
     } else .{
-        .rs16 = rs16.Receiver.init(qnnt_mod.io, bind_addr, rs16.msop_port, rs16.difop_port) catch |err| {
-            std.debug.print("lidar-sensor: cannot bind {s}:{d} ({})\n", .{ bind_addr, rs16.msop_port, err });
+        .rs16 = rs16.Receiver.init(qnnt_mod.io, bind_addr, msop, difop) catch |err| {
+            reportBindFailure(bind_addr, msop, err);
             return;
         },
     };
     defer driver.deinit();
+    driver.setSource(source);
 
     var cal = driver.calibration();
     std.debug.print(
@@ -240,7 +335,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{
             cal.model,
             bind_addr,
-            if (is_helios) helios32.msop_port else rs16.msop_port,
+            msop,
             topic,
             cal.channels,
             cal.firings_per_block,
@@ -310,7 +405,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     std.debug.print(
                         "lidar-sensor: no packets on {s}:{d} for 3s -- is the sensor" ++
                             " transmitting, and to this host and port?\n",
-                        .{ bind_addr, if (is_helios) helios32.msop_port else rs16.msop_port },
+                        .{ bind_addr, msop },
+                    );
+                }
+                continue;
+            },
+            .foreign => {
+                // Something else is sending to this port. Named once, because with a
+                // filter set it is the difference between "no data" and "data from the
+                // wrong device", and those have different fixes.
+                if (driver.foreign() == 1) {
+                    std.debug.print(
+                        "lidar-sensor: discarding packets from another sender on {d}" ++
+                            " (--from is set); is more than one sensor aimed here?\n",
+                        .{msop},
                     );
                 }
                 continue;
@@ -322,7 +430,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                     std.debug.print(
                         "lidar-sensor: a datagram on {d} was not {s} MSOP -- wrong model?" ++
                             " the other generation uses the same port and size\n",
-                        .{ if (is_helios) helios32.msop_port else rs16.msop_port, model },
+                        .{ msop, model },
                     );
                 }
                 continue;
@@ -343,11 +451,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
         if (now_us -| last_report_us >= 1_000_000) {
             std.debug.print(
-                "lidar-sensor: {d} packets/s in, {d} published, {d} malformed, {d} idle waits, {d} revs, {d} byte frames, angles {s}\n",
+                "lidar-sensor: {d} packets/s in, {d} published, {d} malformed, {d} foreign, {d} idle waits, {d} revs, {d} byte frames, angles {s}\n",
                 .{
                     published - last_published,
                     published,
                     driver.malformed(),
+                    driver.foreign(),
                     driver.timeouts(),
                     driver.revolutions(),
                     last_frame_len,

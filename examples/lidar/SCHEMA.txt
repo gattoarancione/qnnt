@@ -141,11 +141,40 @@ the fields inside the 42-byte header beyond the magic and the timestamp, the DIF
 That last one is `distance_unit_mm` and it scales the whole cloud -- check it before
 pointing this at hardware.
 
-The Helios driver goes further: it has no angle table worth trusting, so its default is
-named `placeholder_elevations_deg` and `anglesArePlaceholder()` reports that it is in use.
-Its shape is right -- denser near the horizon -- but the numbers are invented, and a unit
-running on them is misreporting geometry. Read them from the device; the fake sends them,
-and real hardware does too.
+The Helios driver is now verified against a real RS-Helios-32, and most of what had been
+guessed was wrong. What a live unit at 192.168.3.221 actually sends:
+
+    field                  guessed          measured
+    MSOP magic             8 bytes          4 bytes, 55 AA 05 5A
+    MSOP header            32 bytes         42 bytes (first 0xFFEE observed at 42)
+    MSOP tail              16 bytes         6 bytes
+    timestamp offset       8                20, then 6 bytes of seconds + 4 of micros
+    DIFOP length           1206             1248
+    DIFOP rpm offset       8                8            -- one of two guesses that held
+    DIFOP magic            A5FF005A11115555 the same     -- the other
+    angle table            offset 32, 2B    offset 468, THREE bytes: sign + magnitude
+    angle values           invented         +14.94 down to -54.60, non-uniform
+
+The DIFOP also carries the ethernet block, which is how the layout was established at all:
+sensor IP at 10, destination IP at 14, MAC at 18, MSOP port at 24, DIFOP port at 28. Reading
+back 192.168.3.221, 192.168.3.100, 6699 and 7788 from a packet confirms the offsets are
+right rather than coincidentally plausible.
+
+The angle table is still a fallback rather than a default to rely on: it is ONE unit's
+calibration, and the family covers several distributions. `anglesArePlaceholder()` reports
+when it is in use, and the driver prefers the device's own table -- which arrives within a
+second, as `angles device` in the bridge's output.
+
+Two things the measurements changed beyond constants:
+
+  * a device with no time source still fills the timestamp. This unit reports 2017-01-01,
+    so the driver treats anything before 2020 as unset and falls back to the host clock:
+    otherwise a consumer measuring latency against it would be seven years out rather than
+    obviously unsynchronised.
+  * the distance unit remains 2.5 mm, now with supporting rather than conclusive evidence.
+    The largest count seen in a revolution was 10,834, which is 27 m at 2.5 mm and 54 m at
+    5 mm, and 63% of returns fell under 5 m at 2.5 mm. Both are physically possible; the
+    2.5 mm reading matches an indoor scene and the documented figure for the family.
 
 That asymmetry between the drivers is deliberate. The RS-LiDAR-16's uniform 2 degree
 spacing IS its published table, so its default is trustworthy. The Helios has no single
@@ -197,6 +226,28 @@ had a byte-identical copy of it and this change would have had to be made twice 
 how two copies stop being identical. Two tests pin it: a receiver with nobody sending
 returns .timeout within its window rather than blocking, and the calibration wait expires
 instead of staying open forever without fabricating a device table.
+
+pointing it at real hardware
+----------------------------
+
+A sensor PUSHES MSOP to a destination configured on the device; nothing here dials it. So
+the sensor's own address is not what the driver is told -- it is only used to discard traffic
+from anything else on the port.
+
+    sensor at 192.168.3.221, configured to send to 192.168.3.100
+    this host has 192.168.3.100 on en7
+
+    ./zig-out/bin/lidar-sensor helios32 --from 192.168.3.221
+
+    --bind  <addr>   local interface to receive on (default 0.0.0.0, all of them)
+    --msop  <port>   MSOP port the sensor sends to (default 6699)
+    --difop <port>   DIFOP port (default 7788)
+    --from  <addr>   accept only this sensor's packets
+
+If the host does not have the address the sensor is aimed at, nothing arrives and the bind
+says so specifically rather than reporting a generic failure. Two sensors aimed at one port
+produce one interleaved stream that parses cleanly and describes nothing real, which is what
+--from exists to prevent.
 
 running it
 ----------

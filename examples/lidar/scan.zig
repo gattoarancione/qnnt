@@ -177,6 +177,25 @@ pub fn Next(comptime _: type) type {
         /// A datagram arrived and was not a packet this driver understands -- wrong model,
         /// truncated, or not a LiDAR at all.
         malformed,
+        /// A datagram arrived from a sender other than the configured one.
+        foreign,
+    };
+}
+
+/// Compare two addresses by host, ignoring the port.
+///
+/// The port has to be ignored: a sensor's *source* port is whatever its stack chose, and
+/// nothing documents it. Only the address identifies the device.
+fn sameHost(a: std.Io.net.IpAddress, b: std.Io.net.IpAddress) bool {
+    return switch (a) {
+        .ip4 => |x| switch (b) {
+            .ip4 => |y| std.mem.eql(u8, &x.bytes, &y.bytes),
+            else => false,
+        },
+        .ip6 => |x| switch (b) {
+            .ip6 => |y| std.mem.eql(u8, &x.bytes, &y.bytes),
+            else => false,
+        },
     };
 }
 
@@ -203,9 +222,20 @@ pub fn Receiver(comptime Driver: type) type {
         /// into a decision instead of being the last thing a log ever says.
         calibration_timeout_ms: u32 = 3000,
 
+        /// Accept packets only from this address, ignoring its source port. Null accepts
+        /// any sender, which is the default and is right for one sensor on a port.
+        ///
+        /// It matters with more than one: MSOP carries no sender identity, so two sensors
+        /// configured to the same destination port produce one interleaved stream that
+        /// still parses cleanly and describes nothing real. Filtering is the only way to
+        /// pick one, short of giving each sensor its own port.
+        expected_source: ?std.Io.net.IpAddress = null,
+
         seq: u64 = 0,
         malformed: u64 = 0,
         timeouts: u64 = 0,
+        /// Datagrams discarded because they came from somewhere else.
+        foreign: u64 = 0,
         revolutions: u64 = 0,
         last_azimuth_cdeg: u16 = 0,
 
@@ -256,6 +286,13 @@ pub fn Receiver(comptime Driver: type) type {
                 else => return err,
             };
 
+            if (r.expected_source) |want| {
+                if (!sameHost(want, message.from)) {
+                    r.foreign += 1;
+                    return .foreign;
+                }
+            }
+
             r.seq += 1;
             const now_us: u64 = @intCast(std.Io.Timestamp.now(r.io, .real).toMicroseconds());
             const parsed = Driver.parseMsop(message.data, r.seq, now_us) catch {
@@ -263,8 +300,15 @@ pub fn Receiver(comptime Driver: type) type {
                 return .malformed;
             };
 
-            if (parsed.blocks[0].azimuth_cdeg < r.last_azimuth_cdeg) r.revolutions += 1;
-            r.last_azimuth_cdeg = parsed.blocks[blocks_per_packet - 1].azimuth_cdeg;
+            // Every block, not just the first against the last: a real sensor does not
+            // align revolutions to packet boundaries, so the wrap usually happens in the
+            // MIDDLE of a packet. Comparing only across packets counted zero revolutions
+            // against real hardware while looking correct against a fake -- because a fake
+            // whose blocks-per-revolution divides evenly always wraps on a boundary.
+            for (parsed.blocks) |block| {
+                if (block.azimuth_cdeg < r.last_azimuth_cdeg) r.revolutions += 1;
+                r.last_azimuth_cdeg = block.azimuth_cdeg;
+            }
             return .{ .scan = parsed };
         }
 
@@ -395,4 +439,52 @@ test "the calibration wait expires instead of staying open forever" {
     try std.testing.expect(receiver.calibrationSettled()); // and now it has
     // Settling does not fabricate a device table.
     try std.testing.expect(!receiver.calibration.from_device);
+}
+
+test "a source filter matches on address and ignores the sender's port" {
+    // The port must be ignored: a sensor's source port is whatever its stack picked, and
+    // no datasheet documents it. Only the address identifies the device.
+    const sensor: std.Io.net.IpAddress = try .parse("192.168.3.100", 6699);
+    const same_host_other_port: std.Io.net.IpAddress = try .parse("192.168.3.100", 41234);
+    const other_host: std.Io.net.IpAddress = try .parse("192.168.3.101", 6699);
+
+    try std.testing.expect(sameHost(sensor, same_host_other_port));
+    try std.testing.expect(!sameHost(sensor, other_host));
+
+    // Not comparable across families rather than accidentally equal.
+    const v6: std.Io.net.IpAddress = try .parse("::1", 6699);
+    try std.testing.expect(!sameHost(sensor, v6));
+}
+
+test "a revolution that wraps mid-packet is counted" {
+    // What real hardware does and what a fake with tidy arithmetic never does: a packet
+    // whose blocks cross 360 degrees. Counting only at packet boundaries reported zero
+    // revolutions for a sensor that was plainly spinning.
+    var last: u16 = 0;
+    var revolutions: u64 = 0;
+
+    // Two packets' worth of blocks, wrapping inside the second.
+    var azimuths: [24]u16 = undefined;
+    for (&azimuths, 0..) |*a, i| {
+        a.* = @intCast((35_800 + i * 20) % 36_000);
+    }
+
+    for (azimuths) |az| {
+        if (az < last) revolutions += 1;
+        last = az;
+    }
+
+    // 35800 climbs to 35980, wraps to 0, then climbs again: exactly one wrap, and it
+    // happens at block 10 of 24 -- nowhere near a 12-block boundary.
+    try std.testing.expectEqual(@as(u64, 1), revolutions);
+
+    const wrap_index = blk: {
+        var previous: u16 = 0;
+        for (azimuths, 0..) |az, i| {
+            if (az < previous) break :blk i;
+            previous = az;
+        }
+        break :blk azimuths.len;
+    };
+    try std.testing.expect(wrap_index % blocks_per_packet != 0);
 }
