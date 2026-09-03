@@ -1,6 +1,6 @@
 //! A fake RS-Helios-32 transmitting the format helios32.zig parses.
 //!
-//!   ./zig-out/bin/fake-helios32 [host] [msop_port]
+//!   ./zig-out/bin/fake-helios32 [host] [--msop port] [--difop port]
 //!
 //! Twice the RS-LiDAR-16's load through the same pipeline: 1500 packets/s and 576,000
 //! points/s, because 32 channels fill a block that the older model fills with two firings
@@ -23,14 +23,46 @@ const packets_per_rev = blocks_per_rev / helios.blocks_per_packet; // 150
 const packets_per_s: u32 = packets_per_rev * revs_per_s; // 1500
 const packet_period_ns: i96 = 1_000_000_000 / packets_per_s; // 666666 ns
 
+fn usage(what: []const u8) void {
+    std.debug.print(
+        \\fake-helios32: {s}
+        \\
+        \\usage: fake-helios32 [host] [options]
+        \\  host             where to send, as an RS-Helios-32 would (default 127.0.0.1)
+        \\  --msop  <port>   MSOP destination port (default {d})
+        \\  --difop <port>   DIFOP destination port (default {d})
+        \\
+        \\A sensor pushes to a destination; it does not listen. Point this at the host
+        \\running the driver, and give the driver the matching --msop and --difop.
+        \\
+    , .{ what, helios.msop_port, helios.difop_port });
+}
+
 pub fn main(init: std.process.Init.Minimal) !void {
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next();
-    const host = args.next() orelse "127.0.0.1";
-    const msop_port: u16 = if (args.next()) |a|
-        std.fmt.parseInt(u16, a, 10) catch helios.msop_port
-    else
-        helios.msop_port;
+    // Flags rather than positions, matching lidar-sensor's --msop and --difop, so the two
+    // sides of a non-default port pair are configured with the same words.
+    var host: []const u8 = "127.0.0.1";
+    var msop_port: u16 = helios.msop_port;
+    var difop_port: u16 = helios.difop_port;
+
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--msop")) {
+            const text = args.next() orelse return usage("--msop needs a port");
+            // Refused, not silently defaulted: a typo'd port used to fall back to 6699 and
+            // transmit somewhere the driver was not listening, which looks like a dead
+            // sensor rather than a mistyped argument.
+            msop_port = std.fmt.parseInt(u16, text, 10) catch return usage("--msop is not a port");
+        } else if (std.mem.eql(u8, arg, "--difop")) {
+            const text = args.next() orelse return usage("--difop needs a port");
+            difop_port = std.fmt.parseInt(u16, text, 10) catch return usage("--difop is not a port");
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return usage("unrecognised option (see below)");
+        } else {
+            host = arg;
+        }
+    }
 
     var io_impl: std.Io.Threaded = .init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -41,7 +73,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer socket.close(io);
 
     const msop_dest: std.Io.net.IpAddress = try .parse(host, msop_port);
-    const difop_dest: std.Io.net.IpAddress = try .parse(host, helios.difop_port);
+    const difop_dest: std.Io.net.IpAddress = try .parse(host, difop_port);
 
     // The table this device reports. Deliberately not uniform, and deliberately not the
     // placeholder the driver ships with, so that a downstream consumer visibly gets its
@@ -67,7 +99,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             calibration.model,
             host,
             msop_port,
-            helios.difop_port,
+            difop_port,
             calibration.rpm,
             packets_per_s,
             packets_per_s * helios.samples_per_block * helios.blocks_per_packet,

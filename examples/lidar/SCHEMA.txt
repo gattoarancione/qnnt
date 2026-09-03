@@ -265,6 +265,18 @@ or the other sensor, through the same viewer binary:
     ./zig-out/bin/lidar-sensor helios32
     ./zig-out/bin/lidar-viewer '' lidar/helios32
 
+Both fakes take the same --msop and --difop flags as the bridge, deliberately spelled the
+same way, because the two sides have to agree and a mismatch is invisible: the bridge just
+sits there reporting nothing. If you move one port, move it on both.
+
+    ./zig-out/bin/fake-helios32 127.0.0.1 --msop 6799 --difop 7888
+    ./zig-out/bin/lidar-sensor helios32   --msop 6799 --difop 7888
+
+A wrong port is refused rather than defaulted. The fake used to accept a positional MSOP
+port only, so `lidar-sensor --difop 7888` against it could never receive a calibration and
+fell back to the driver's built-in angle table -- reporting `angles driver`, which looks
+like a sensor that declined to send its DIFOP rather than a fake that could not.
+
 What each reports:
 
     fake-rs16: RS-LiDAR-16 -> 127.0.0.1:6699 (MSOP) and :7788 (DIFOP)
