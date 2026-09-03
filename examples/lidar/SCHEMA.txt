@@ -111,13 +111,24 @@ The 16 channels are fixed vertical angles, -15 deg to +15 deg in 2 deg steps:
 A block's 32 samples are firing 0 (channels 0..15) at `azimuth_cdeg`, then firing 1
 (channels 0..15) at `azimuth_cdeg + 20`, which is the 0.2 deg step. A point is then:
 
-    r = distance_mm / 1000
-    x = r * cos(elev) * sin(azim)
-    y = r * cos(elev) * cos(azim)
+    r     = distance_mm / 1000
+    block = azimuth_cdeg / 100 + firing * azimuth_step_cdeg / 100
+    azim  = block + azimuth_offsets_deg[channel]
+
+    x = r * cos(elev) * sin(azim) + lens_offset_m * sin(block)
+    y = r * cos(elev) * cos(azim) + lens_offset_m * cos(block)
     z = r * sin(elev)
 
-distance_mm of 0 means no return -- absorbed, sky, outside the model's rated window, or
-outside the model's rated window -- and must be skipped
+Two terms there were absent for a long time and both came from rs_driver's own decoder.
+`azimuth_offsets_deg` is the per-channel horizontal correction, up to 5 degrees on a
+two-column sensor -- see below, it is what split every wall in two. `lens_offset_m` is the
+lens centre: the optics do not sit on the rotation axis, so a return leaves from a point a
+few centimetres out along the block's pointing direction. Note which angle each uses -- the
+beam carries the per-channel correction, the lens offset does not, because the offset is
+where the mirror is aimed and the correction describes where each beam goes from there.
+
+distance_mm of 0 means no return -- absorbed, sky, or outside the model's rated window --
+and must be skipped
 rather than plotted at the origin.
 
 the scene
@@ -165,6 +176,30 @@ The angle table is still a fallback rather than a default to rely on: it is ONE 
 calibration, and the family covers several distributions. `anglesArePlaceholder()` reports
 when it is in use, and the driver prefers the device's own table -- which arrives within a
 second, as `angles device` in the bridge's output.
+
+the lens centre offset
+----------------------
+
+    RS-LiDAR-16   lens_offset_m = 0.03825
+    RS-Helios-32  lens_offset_m = 0.03498
+
+rs_driver's mech const params call this RX, and it moves every point a constant 34.98 mm
+(Helios) radially outward along the block azimuth -- measured over 15,357 real points, mean
+and maximum both exactly that, which is what a constant radial term should look like.
+
+It is applied at the BLOCK azimuth, not the per-channel corrected one, matching rs_driver:
+`x = ... + RX * cos(angle_horiz)` there uses `angle_horiz` while the beam term uses
+`angle_horiz_final`. Applying it at the corrected angle instead is wrong by
+RX * sin(correction), about 3 mm for a Helios -- too small for any test that checked only
+magnitudes, which is why there is one that checks the direction.
+
+rs_driver also carries an RY of about a centimetre per model, a tangential offset, and never
+uses it in its point computation. It is not applied here either. Matching the vendor's
+driver is worth more than inventing a correction it declines to make -- but it is the one
+remaining term in their own const params that nothing acts on, so it is worth knowing about
+rather than assuming the geometry is complete.
+
+RZ is zero on every model here and carried only so the frame is complete.
 
 the horizontal table, and the wall that rendered twice
 ------------------------------------------------------

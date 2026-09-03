@@ -47,6 +47,15 @@ pub const azimuth_step_cdeg = 20;
 /// Getting it wrong scales the whole cloud, so the per-model difference is deliberate.
 pub const distance_unit_mm: f32 = 5.0;
 
+/// Lens centre offset, metres: rs_driver's RX for this model. The optics sit this far off
+/// the rotation axis, so a return leaves from a point out along the block's pointing
+/// direction rather than from the origin. Small -- a few centimetres -- and constant, which
+/// is why it went unnoticed for as long as it did.
+///
+/// rs_driver also carries an RY of about a centimetre for this model and never applies it;
+/// see `scan.Calibration.lens_offset_m`.
+pub const lens_offset_m: f32 = 0.03825;
+
 /// The rated measurement window, 0.4 to 230 m, from the same rs_driver const params as the
 /// unit above. Returns outside it are reported as no-return. Both ends bind on this model:
 /// counts 1..79 fall under the minimum, and counts above 46,000 exceed the maximum, which a
@@ -91,6 +100,7 @@ pub fn defaultCalibration() Calibration {
         .firings_per_block = firings_per_block,
         .azimuth_step_cdeg = azimuth_step_cdeg,
         .elevations_deg = @splat(0),
+        .lens_offset_m = lens_offset_m,
         // Uniform 2 degree spacing IS this model's published table, so unlike the Helios
         // driver this default is trustworthy -- but DIFOP still overrides it, because a
         // unit may have been calibrated.

@@ -66,6 +66,15 @@ pub const azimuth_step_cdeg = 20;
 /// the entire cloud, so it is worth knowing this one is not a guess.
 pub const distance_unit_mm: f32 = 2.5;
 
+/// Lens centre offset, metres: rs_driver's RX for this model. The optics sit this far off
+/// the rotation axis, so a return leaves from a point out along the block's pointing
+/// direction rather than from the origin. Small -- a few centimetres -- and constant, which
+/// is why it went unnoticed for as long as it did.
+///
+/// rs_driver also carries an RY of about a centimetre for this model and never applies it;
+/// see `scan.Calibration.lens_offset_m`.
+pub const lens_offset_m: f32 = 0.03498;
+
 /// The rated measurement window, 0.1 to 180 m, from the same rs_driver const params as the
 /// unit above. Returns outside it are reported as no-return. The maximum never binds on
 /// this model: a u16 of counts at 2.5 mm tops out at 163.8 m, so every count the sensor can
@@ -125,6 +134,7 @@ pub fn defaultCalibration() scan.Calibration {
         .firings_per_block = firings_per_block,
         .azimuth_step_cdeg = azimuth_step_cdeg,
         .elevations_deg = @splat(0),
+        .lens_offset_m = lens_offset_m,
         .from_device = false,
     };
     @memcpy(cal.elevations_deg[0..channels], &placeholder_elevations_deg);

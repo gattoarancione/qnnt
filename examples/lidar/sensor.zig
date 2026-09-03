@@ -154,6 +154,10 @@ const CalibrationFrame = struct {
     /// these renders a two-column sensor as two clouds swung apart -- for the Helios here
     /// that is 8 degrees, which is not subtle.
     azimuth_offsets_deg: []const f32,
+    /// Lens centre offset, metres, radial along the block azimuth. A few centimetres, so a
+    /// consumer that ignores it is wrong by a few centimetres rather than visibly broken --
+    /// which is exactly why it is published rather than left for each consumer to know.
+    lens_offset_m: f32,
     /// False means the sensor did not supply these and the driver's own table is in use --
     /// worth surfacing, because for a Helios that means the geometry is a guess.
     from_device: bool,
@@ -176,6 +180,7 @@ fn publishCalibration(cal: scan.Calibration, cal_topic: []const u8) !void {
         .azimuth_step_cdeg = cal.azimuth_step_cdeg,
         .elevations_deg = cal.elevations_deg[0..cal.channels],
         .azimuth_offsets_deg = cal.azimuth_offsets_deg[0..cal.channels],
+        .lens_offset_m = cal.lens_offset_m,
         .from_device = cal.from_device,
     };
     try tld.packTo(allocator, &cal_buf, frame);

@@ -575,6 +575,8 @@ private:
                         m_elevations[static_cast<std::size_t>(i++)] =
                             static_cast<float>(angle.asFloat());
                     }
+                } else if (field.key == "lens_offset_m") {
+                    m_lens_offset_m = static_cast<double>(field.value.asFloat());
                 } else if (field.key == "azimuth_offsets_deg") {
                     int i = 0;
                     for (const qnnt::tld::Frame& angle : field.value.array()) {
@@ -643,6 +645,13 @@ private:
             const double firing_deg =
                 (azimuth_cdeg + firing * m_azimuth_step_cdeg) / 100.0;
 
+            // The lens sits off the rotation axis, so the ray starts here rather than at
+            // the origin. At the BLOCK azimuth, without the per-channel correction: the
+            // offset is where the mirror is aimed, not where each beam goes from there.
+            const double block_azim = firing_deg * M_PI / 180.0;
+            const double lens_x = m_lens_offset_m * std::sin(block_azim);
+            const double lens_y = m_lens_offset_m * std::cos(block_azim);
+
             for (int ch = 0; ch < m_channels; ++ch) {
                 const double azim =
                     (firing_deg + m_azimuth_offsets[static_cast<std::size_t>(ch)]) *
@@ -670,8 +679,8 @@ private:
                 const double horizontal = r * std::cos(elev);
                 // z was computed and thrown away while the only view was top-down. The
                 // first-person view needs it, and it costs one multiply per point.
-                m_view->addPoint(static_cast<float>(horizontal * sin_a),
-                                 static_cast<float>(horizontal * cos_a),
+                m_view->addPoint(static_cast<float>(horizontal * sin_a + lens_x),
+                                 static_cast<float>(horizontal * cos_a + lens_y),
                                  static_cast<float>(r * std::sin(elev)), intensity);
             }
         }
@@ -697,6 +706,9 @@ private:
     /// Per-channel horizontal correction, degrees. Zero-initialised, so a publisher that
     /// does not send them behaves as before rather than skewing the cloud.
     std::array<float, kMaxChannels> m_azimuth_offsets{};
+    /// Lens centre offset, metres, radial along the block azimuth. Zero until a calibration
+    /// frame supplies it.
+    double m_lens_offset_m = 0.0;
     bool m_have_calibration = false;
     bool m_angles_from_device = false;
     int m_last_azimuth_cdeg = 0;

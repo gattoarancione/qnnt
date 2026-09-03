@@ -101,6 +101,20 @@ pub const Calibration = struct {
     /// the cloud, it splits it -- a vertical wall renders as two walls, one swung left and
     /// one right, which is the visible symptom that led here.
     azimuth_offsets_deg: [max_channels]f32 = @splat(0),
+    /// Lens centre offset, metres. The optics do not sit on the rotation axis, so a return
+    /// leaves from a point `lens_offset_m` out along the block's pointing direction rather
+    /// than from the origin. Radial, and applied at the BLOCK azimuth rather than the
+    /// per-channel corrected one: the offset is a property of where the mirror is aimed,
+    /// while the per-channel correction describes where each beam goes from there.
+    ///
+    /// From rs_driver's mech const params, which call it RX. Their RY -- a tangential
+    /// offset of about a centimetre -- is carried in the same struct and then never used in
+    /// their point computation, so it is not applied here either: matching the vendor's
+    /// driver is worth more than inventing a correction it declines to make.
+    lens_offset_m: f32 = 0,
+    /// Vertical lens offset, metres, rs_driver's RZ. Zero on every model here, carried so
+    /// the frame is complete rather than because it currently does anything.
+    lens_z_m: f32 = 0,
     /// Whether the angles above came from the device or from a table compiled in. False is
     /// a warning sign for any sensor whose spacing is not uniform.
     from_device: bool = false,
@@ -132,17 +146,20 @@ pub fn resolve(
     // Degrees rather than hundredths from here, because the per-channel correction is a
     // signed fraction of a degree and pushing it back into the unsigned cdeg would need a
     // wrap that sin and cos do not care about.
-    const azim_deg = @as(f32, @floatFromInt(azimuth_cdeg)) / 100.0 +
-        cal.azimuth_offsets_deg[channel];
+    const block_deg = @as(f32, @floatFromInt(azimuth_cdeg)) / 100.0;
+    const azim_deg = block_deg + cal.azimuth_offsets_deg[channel];
     const azim = azim_deg * std.math.pi / 180.0;
     const elev = cal.elevations_deg[channel] * std.math.pi / 180.0;
     const r = @as(f32, @floatFromInt(sample.distance_mm)) / 1000.0;
     const horizontal = r * @cos(elev);
 
+    // The beam's direction carries the per-channel correction; the lens offset does not.
+    const block_azim = block_deg * std.math.pi / 180.0;
+
     return .{
-        .x = horizontal * @sin(azim),
-        .y = horizontal * @cos(azim),
-        .z = r * @sin(elev),
+        .x = horizontal * @sin(azim) + cal.lens_offset_m * @sin(block_azim),
+        .y = horizontal * @cos(azim) + cal.lens_offset_m * @cos(block_azim),
+        .z = r * @sin(elev) + cal.lens_z_m,
         .intensity = sample.intensity,
     };
 }
@@ -538,4 +555,69 @@ test "a revolution that wraps mid-packet is counted" {
         break :blk azimuths.len;
     };
     try std.testing.expect(wrap_index % blocks_per_packet != 0);
+}
+
+test "the lens offset displaces a point radially, along the block azimuth" {
+    var cal: Calibration = .{
+        .model = "test",
+        .rpm = 600,
+        .channels = 1,
+        .firings_per_block = 1,
+        .azimuth_step_cdeg = 20,
+        .elevations_deg = @splat(0),
+        .lens_offset_m = 0.04,
+    };
+
+    // Straight ahead (azimuth 0, elevation 0): the offset is along +y, which is where the
+    // beam points, so it adds to the range rather than moving the point sideways.
+    var block: Block = .{ .azimuth_cdeg = 0, .samples = @splat(.{ .distance_mm = 0, .intensity = 0 }) };
+    block.samples[0] = .{ .distance_mm = 10_000, .intensity = 1 };
+
+    const ahead = resolve(&cal, block, 0).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), ahead.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 10.04), ahead.y, 0.0001);
+
+    // A quarter turn: now the offset is along +x, with the beam.
+    block.azimuth_cdeg = 9000;
+    const right = resolve(&cal, block, 0).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 10.04), right.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), right.y, 0.0001);
+
+    // Radial, so it never changes the point's bearing -- only its range. That is the whole
+    // shape of this correction, and the reason it is invisible until measured.
+    block.azimuth_cdeg = 4500;
+    const diag = resolve(&cal, block, 0).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 10.04), @sqrt(diag.x * diag.x + diag.y * diag.y), 0.0001);
+    try std.testing.expectApproxEqAbs(diag.x, diag.y, 0.0001);
+
+    // Zero offset leaves the projection exactly as it was.
+    cal.lens_offset_m = 0;
+    block.azimuth_cdeg = 0;
+    const plain = resolve(&cal, block, 0).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), plain.y, 0.0001);
+}
+
+test "the lens offset uses the block azimuth, not the per-channel corrected one" {
+    // The detail worth pinning: rs_driver applies RX at the block azimuth while the beam
+    // direction carries the per-channel horizontal correction. Applying the offset at the
+    // corrected angle instead would be wrong by RX * sin(correction) -- about 3 mm for a
+    // Helios, which no test that only checked magnitudes would ever catch.
+    var cal: Calibration = .{
+        .model = "test",
+        .rpm = 600,
+        .channels = 1,
+        .firings_per_block = 1,
+        .azimuth_step_cdeg = 20,
+        .elevations_deg = @splat(0),
+        .lens_offset_m = 0.04,
+    };
+    cal.azimuth_offsets_deg[0] = 90.0; // a whole quarter turn, to make the difference plain
+
+    var block: Block = .{ .azimuth_cdeg = 0, .samples = @splat(.{ .distance_mm = 0, .intensity = 0 }) };
+    block.samples[0] = .{ .distance_mm = 10_000, .intensity = 1 };
+
+    // Beam at 90 degrees (+x), lens offset still at 0 degrees (+y).
+    const p = resolve(&cal, block, 0).?;
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), p.x, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.04), p.y, 0.0001);
 }
