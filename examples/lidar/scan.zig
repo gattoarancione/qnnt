@@ -22,33 +22,43 @@ pub const max_channels = 32;
 pub const Sample = struct {
     /// Millimetres. 0 means no return -- absorbed, past the sensor's rated range, or sky.
     /// Never plot it. See `sampleDistanceMm` for what else lands here.
-    distance_mm: u16,
+    ///
+    /// u32 rather than u16: millimetres in a u16 top out at 65.535 m, which is below both
+    /// models' rated maxima and so made the representation, not the sensor, the binding
+    /// limit outdoors. u32 puts the rated window back in charge -- the widest a count can
+    /// express is 65,535 at 5 mm, or 327 m, so this field never binds again.
+    distance_mm: u32,
     intensity: u8,
 };
-
-/// The largest range a `Sample` can carry, since it holds millimetres in a u16. This is
-/// below both models' rated maxima -- 180 m for the Helios, 230 m for the RS16 -- so it,
-/// not the sensor, is the binding limit outdoors. Widening the field is a wire-format
-/// change: sensor.zig packs each sample as u16 + u8 and viewer.cpp unpacks it that way.
-pub const representable_max_mm = 65535;
 
 /// One raw count converted to the millimetres a `Sample` carries, applying the model's
 /// rated measurement window. The window comes from RoboSense's own rs_driver, which
 /// discards returns outside it before they ever reach a cloud, and the drivers here now
 /// agree rather than passing near-field noise and impossible long returns downstream.
 ///
-/// Everything rejected becomes 0, the no-return sentinel `resolve` already skips. That
-/// includes a return the sensor measured but this representation cannot hold: dropping it
-/// is deliberate, because clamping -- which is what this code used to do -- draws a point
-/// at 65.535 m that the sensor never reported, and a fabricated point is worse than a
-/// missing one.
-pub fn sampleDistanceMm(counts: u16, unit_mm: f32, min_mm: u32, max_mm: u32) u16 {
+/// Everything rejected becomes 0, the no-return sentinel `resolve` already skips. The
+/// rated window is the only thing that rejects now: `Sample.distance_mm` is a u32, so it
+/// can hold anything a count can express and no return is dropped for being unrepresentable.
+pub fn sampleDistanceMm(counts: u16, unit_mm: f32, min_mm: u32, max_mm: u32) u32 {
     if (counts == 0) return 0; // the sensor's own no-return
     const mm = @as(f32, @floatFromInt(counts)) * unit_mm;
     if (mm < @as(f32, @floatFromInt(min_mm))) return 0;
     if (mm > @as(f32, @floatFromInt(max_mm))) return 0;
-    if (mm > @as(f32, @floatFromInt(representable_max_mm))) return 0;
     return @intFromFloat(mm);
+}
+
+/// The inverse, for the writers that stand in for a sensor. Millimetres back to a raw
+/// count, or 0 when no count could carry them.
+///
+/// The guard matters because `distance_mm` is a u32 while a count is a u16: at 2.5 mm,
+/// 400 m is 160,000 counts, which does not fit. Zero -- no return -- is the honest answer,
+/// since a sensor that cannot count that high could not have reported that range either.
+/// Saturating instead would put a 163.8 m return on the wire that nothing measured.
+pub fn sampleDistanceCounts(distance_mm: u32, unit_mm: f32) u16 {
+    if (distance_mm == 0) return 0;
+    const counts = @as(f32, @floatFromInt(distance_mm)) / unit_mm;
+    if (counts > @as(f32, std.math.maxInt(u16))) return 0;
+    return @intFromFloat(counts);
 }
 
 pub const Block = struct {

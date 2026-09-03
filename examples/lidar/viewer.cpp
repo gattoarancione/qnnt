@@ -337,6 +337,11 @@ private:
 
     void decodeBlock(const qnnt::tld::Frame& block) {
         int azimuth_cdeg = -1;
+        // 4 bytes of little-endian millimetres plus 1 of intensity. Named because the
+        // length guard below and the reader further down must never disagree: a buffer at
+        // the wrong stride still passes a too-small check and renders a plausible, wrong
+        // cloud rather than failing.
+        constexpr std::size_t kSampleStride = 5;
         qnnt::tld::Bytes samples{};
 
         for (const qnnt::tld::Field& field : block.object()) {
@@ -347,7 +352,8 @@ private:
             }
         }
         const int samples_needed = m_channels * m_firings_per_block;
-        if (azimuth_cdeg < 0 || samples.size() < static_cast<std::size_t>(samples_needed) * 3) {
+        if (azimuth_cdeg < 0 ||
+            samples.size() < static_cast<std::size_t>(samples_needed) * kSampleStride) {
             return;
         }
 
@@ -367,10 +373,16 @@ private:
             const double cos_a = std::cos(azim);
 
             for (int ch = 0; ch < m_channels; ++ch) {
-                const std::size_t at = static_cast<std::size_t>(firing * m_channels + ch) * 3;
-                const std::uint16_t distance_mm =
-                    static_cast<std::uint16_t>(samples[at] | (samples[at + 1] << 8));
-                const std::uint8_t intensity = samples[at + 2];
+                // The distance was 2 bytes until ranges past 65.535 m had to survive the
+                // trip; see kSampleStride above.
+                const std::size_t at =
+                    static_cast<std::size_t>(firing * m_channels + ch) * kSampleStride;
+                const std::uint32_t distance_mm =
+                    static_cast<std::uint32_t>(samples[at]) |
+                    (static_cast<std::uint32_t>(samples[at + 1]) << 8) |
+                    (static_cast<std::uint32_t>(samples[at + 2]) << 16) |
+                    (static_cast<std::uint32_t>(samples[at + 3]) << 24);
+                const std::uint8_t intensity = samples[at + 4];
 
                 ++m_points;
                 // 0 is no return -- absorbed, out of range or sky. Plotting it would put a

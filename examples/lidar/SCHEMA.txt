@@ -77,7 +77,7 @@ the frame, and why it is shaped this way
 ----------------------------------------
 
     Block   azimuth_cdeg  u16     hundredths of a degree, 0..35999, as MSOP carries it
-            samples       bytes   32 x (u16 distance_mm, u8 intensity) = 96 bytes
+            samples       bytes   32 x (u32 distance_mm, u8 intensity) = 160 bytes
 
     Packet  seq           u64     packet counter
             t_us          u64     the sensor's clock when the packet was assembled
@@ -117,7 +117,7 @@ A block's 32 samples are firing 0 (channels 0..15) at `azimuth_cdeg`, then firin
     z = r * sin(elev)
 
 distance_mm of 0 means no return -- absorbed, sky, outside the model's rated window, or
-past the 65.535 m a u16 of millimetres can hold -- and must be skipped
+outside the model's rated window -- and must be skipped
 rather than plotted at the origin.
 
 the scene
@@ -194,13 +194,20 @@ numbers, because the window differs per model while the logic does not.
 
 Two things about that window are worth knowing:
 
-  * a `Sample` holds millimetres in a u16, so it tops out at 65.535 m -- below both rated
-    maxima, which makes the representation and not the sensor the binding limit outdoors.
-    The Helios' 180 m never binds at all, since 65,535 counts at 2.5 mm is only 163.8 m.
-    Returns past 65.535 m are now dropped rather than clamped: the old code pinned them to
-    exactly 65535, which draws a point at a range the sensor never reported, and a
-    fabricated point is worse than a missing one. Widening the field would be a wire-format
-    change -- sensor.zig packs each sample as u16 + u8 and viewer.cpp unpacks it that way.
+  * `Sample.distance_mm` is a u32, and was a u16 until the rated window went in. Millimetres
+    in a u16 stop at 65.535 m, below both rated maxima, which made the representation rather
+    than the sensor the binding limit outdoors -- and the old code clamped anything longer to
+    exactly 65535, drawing a point at a range nothing measured. The window is now the only
+    thing that rejects a return: the widest a count can express is 65,535 at 5 mm, or 327 m,
+    so the field never binds. It cost 2 bytes per sample on the wire, 768 per frame, taking
+    a Helios frame from 1613 to 2381 bytes -- 3.6 MB/s at 1500 frames/s, against 2.4 before.
+    The Helios' rated 180 m still never binds, since 65,535 counts at 2.5 mm is only 163.8 m;
+    the RS16's 230 m does.
+  * the widening put a new edge on the write side, where the fakes turn millimetres back
+    into counts: a u32 of millimetres can name a range no u16 count can carry. That writes
+    0, no return, rather than wrapping -- a sensor that cannot count that high could not have
+    reported that range either, and saturating would invent a 163.8 m return. `scan.zig` has
+    both halves, `sampleDistanceMm` and `sampleDistanceCounts`, next to each other.
   * neither fake can exercise any of this. The nearest return either scene can produce is
     the floor under the steepest downward beam, 1.0 m / sin(49.59 deg) = 1.31 m, which is
     comfortably inside both windows. So the window is covered by unit tests over raw counts
@@ -314,7 +321,7 @@ What each reports:
     fake-rs16: 751 packets/s sent, azimuth 4.8 deg
 
     lidar-sensor: calibration from the device: 600 rpm, channel 0 at -15.00 deg, channel 15 at 15.00 deg
-    lidar-sensor: 751 packets/s in, 751 published, 0 malformed, 10 revs, 1608 byte frames, angles device
+    lidar-sensor: 751 packets/s in, 751 published, 0 malformed, 10 revs, 2376 byte frames, angles device
 
     lidar-viewer: RS-LiDAR-16, 16 channels, 2 firing(s)/block, angles -15.00..15.00 deg, from the device
     lidar-viewer: 750 frames/s, 288000 points/s, 38 revolutions, 28661 displayed, 0 dropped
@@ -322,7 +329,7 @@ What each reports:
 and for the Helios, from the same viewer:
 
     lidar-sensor: calibration from the device: 600 rpm, channel 0 at -50.00 deg, channel 31 at 15.00 deg
-    lidar-sensor: 1502 packets/s in, 1502 published, 0 malformed, 10 revs, 1613 byte frames, angles device
+    lidar-sensor: 1502 packets/s in, 1502 published, 0 malformed, 10 revs, 2381 byte frames, angles device
 
     lidar-viewer: RS-Helios-32, 32 channels, 1 firing(s)/block, angles -50.00..15.00 deg, from the device
     lidar-viewer: 1487 frames/s, 571008 points/s, 51 revolutions, 57461 displayed, 0 dropped

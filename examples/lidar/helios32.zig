@@ -67,9 +67,9 @@ pub const azimuth_step_cdeg = 20;
 pub const distance_unit_mm: f32 = 2.5;
 
 /// The rated measurement window, 0.1 to 180 m, from the same rs_driver const params as the
-/// unit above. Returns outside it are reported as no-return. Note the maximum never binds
-/// here: a u16 of counts at 2.5 mm tops out at 163.8 m, and `scan.representable_max_mm`
-/// binds well before either. The minimum does bind -- counts 1..39 are below it.
+/// unit above. Returns outside it are reported as no-return. The maximum never binds on
+/// this model: a u16 of counts at 2.5 mm tops out at 163.8 m, so every count the sensor can
+/// send is inside 180 m. The minimum does bind -- counts 1..39 are below it.
 pub const distance_min_mm: u32 = 100;
 pub const distance_max_mm: u32 = 180_000;
 
@@ -215,10 +215,7 @@ pub fn writeMsop(
 
         for (block.samples, 0..) |sample, s_i| {
             const s = raw[4 + s_i * sample_len ..][0..sample_len];
-            const counts: u16 = if (sample.distance_mm == 0)
-                0
-            else
-                @intFromFloat(@as(f32, @floatFromInt(sample.distance_mm)) / distance_unit_mm);
+            const counts = scan.sampleDistanceCounts(sample.distance_mm, distance_unit_mm);
             std.mem.writeInt(u16, s[0..2], counts, .big);
             s[2] = sample.intensity;
         }
@@ -438,15 +435,16 @@ test "returns outside the rated window are dropped, not clamped into the cloud" 
         @memcpy(blk[0..2], &block_flag);
     }
 
-    const cases = [_]struct { counts: u16, want: u16 }{
+    const cases = [_]struct { counts: u16, want: u32 }{
         .{ .counts = 0, .want = 0 }, // the sensor's own no-return
         .{ .counts = 39, .want = 0 }, // 97.5 mm, inside the blind zone
         .{ .counts = 40, .want = 100 }, // 100 mm, the nearest rated return
-        .{ .counts = 26_214, .want = 65_535 }, // 65.535 m, the last representable range
-        .{ .counts = 26_215, .want = 0 }, // 65.5375 m: measurable, but a u16 of mm cannot
-        // 163.8 m, all a u16 of 2.5 mm counts can express -- which is why this model's
-        // rated 180 m maximum never binds, and the representation is the real ceiling.
-        .{ .counts = 65_535, .want = 0 },
+        // Past where a u16 of millimetres used to give up, which is the point of the u32:
+        // these are ordinary returns now, not dropped ones.
+        .{ .counts = 26_215, .want = 65_537 }, // 65.5375 m, truncated toward zero
+        // 163.8 m, all a u16 of 2.5 mm counts can express, and still inside the rated
+        // 180 m -- so this model has no reachable maximum and nothing here to reject.
+        .{ .counts = 65_535, .want = 163_837 },
     };
 
     for (cases, 0..) |c, i| {
@@ -459,4 +457,20 @@ test "returns outside the rated window are dropped, not clamped into the cloud" 
             return e;
         };
     }
+}
+
+test "a distance no count can carry is written as no-return, not wrapped" {
+    // Widening distance_mm to u32 made this reachable: 400 m is 160,000 counts at 2.5 mm,
+    // which does not fit the u16 the wire uses. Before the widening both sides were u16 and
+    // the case could not arise, so this pins the guard that replaced the old arithmetic.
+    var blocks: [blocks_per_packet]scan.Block = std.mem.zeroes([blocks_per_packet]scan.Block);
+    blocks[0].samples[0] = .{ .distance_mm = 400_000, .intensity = 9 };
+    blocks[0].samples[1] = .{ .distance_mm = 100_000, .intensity = 9 }; // 40,000 counts, fits
+
+    var packet: [msop_packet_len]u8 = undefined;
+    writeMsop(&packet, &blocks, 0);
+    const parsed = try parseMsop(&packet, 0, 0);
+
+    try testing.expectEqual(@as(u32, 0), parsed.blocks[0].samples[0].distance_mm);
+    try testing.expectEqual(@as(u32, 100_000), parsed.blocks[0].samples[1].distance_mm);
 }

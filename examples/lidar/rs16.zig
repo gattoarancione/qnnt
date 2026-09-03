@@ -49,8 +49,9 @@ pub const distance_unit_mm: f32 = 5.0;
 
 /// The rated measurement window, 0.4 to 230 m, from the same rs_driver const params as the
 /// unit above. Returns outside it are reported as no-return. Both ends bind on this model:
-/// counts 1..79 fall under the minimum, and counts above 46,000 exceed the maximum, which
-/// a u16 of counts at 5 mm can reach.
+/// counts 1..79 fall under the minimum, and counts above 46,000 exceed the maximum, which a
+/// u16 of counts at 5 mm can reach -- this is the one model where the rated maximum is not
+/// hypothetical.
 pub const distance_min_mm: u32 = 400;
 pub const distance_max_mm: u32 = 230_000;
 
@@ -192,10 +193,7 @@ pub fn writeMsop(
 
         for (block.samples, 0..) |sample, i| {
             const s = raw[4 + i * sample_len ..][0..sample_len];
-            const counts: u16 = if (sample.distance_mm == 0)
-                0
-            else
-                @intFromFloat(@as(f32, @floatFromInt(sample.distance_mm)) / distance_unit_mm);
+            const counts = scan.sampleDistanceCounts(sample.distance_mm, distance_unit_mm);
             std.mem.writeInt(u16, s[0..2], counts, .big);
             s[2] = sample.intensity;
         }
@@ -333,8 +331,8 @@ test "no return stays no return, rather than becoming a point at the sensor" {
     writeMsop(&packet, &blocks, 0);
     const parsed = try parseMsop(&packet, 0, 0);
 
-    try testing.expectEqual(@as(u16, 0), parsed.blocks[0].samples[0].distance_mm);
-    try testing.expectEqual(@as(u16, distance_min_mm), parsed.blocks[0].samples[1].distance_mm);
+    try testing.expectEqual(@as(u32, 0), parsed.blocks[0].samples[0].distance_mm);
+    try testing.expectEqual(@as(u32, distance_min_mm), parsed.blocks[0].samples[1].distance_mm);
 }
 
 test "returns outside the rated window are dropped, not clamped into the cloud" {
@@ -352,13 +350,14 @@ test "returns outside the rated window are dropped, not clamped into the cloud" 
         @memcpy(blk[0..2], &block_flag);
     }
 
-    const cases = [_]struct { counts: u16, want: u16 }{
+    const cases = [_]struct { counts: u16, want: u32 }{
         .{ .counts = 0, .want = 0 }, // the sensor's own no-return
         .{ .counts = 79, .want = 0 }, // 395 mm, inside the blind zone
         .{ .counts = 80, .want = 400 }, // 400 mm, the nearest rated return
-        .{ .counts = 13_107, .want = 65_535 }, // 65.535 m, the last representable range
-        .{ .counts = 13_108, .want = 0 }, // 65.540 m: measurable, but a u16 of mm cannot
-        .{ .counts = 46_001, .want = 0 }, // 230.005 m, past the rated maximum
+        // Past where a u16 of millimetres used to give up, which is the point of the u32.
+        .{ .counts = 13_108, .want = 65_540 }, // 65.540 m, an ordinary return now
+        .{ .counts = 46_000, .want = 230_000 }, // 230 m, exactly the rated maximum
+        .{ .counts = 46_001, .want = 0 }, // 230.005 m, past it
     };
 
     for (cases, 0..) |c, i| {

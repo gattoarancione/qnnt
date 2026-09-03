@@ -72,7 +72,7 @@ fn boxDistance(sin_a: f32, cos_a: f32, phase: f32) ?f32 {
     return null;
 }
 
-pub const Hit = struct { distance_mm: u16, intensity: u8 };
+pub const Hit = struct { distance_mm: u32, intensity: u8 };
 
 /// One beam against the room. `at_cdeg` is hundredths of a degree; the elevation is degrees.
 pub fn beam(at_cdeg: u32, elevation_deg: f32, phase: f32) Hit {
@@ -117,7 +117,8 @@ pub fn beam(at_cdeg: u32, elevation_deg: f32, phase: f32) Hit {
 
     if (range > 60.0) return .{ .distance_mm = 0, .intensity = 0 };
     return .{
-        .distance_mm = @intFromFloat(@min(range * 1000.0, 65535.0)),
+        // No clamp: the scene caps range at 60 m above, and distance_mm is a u32.
+        .distance_mm = @intFromFloat(range * 1000.0),
         .intensity = intensity,
     };
 }

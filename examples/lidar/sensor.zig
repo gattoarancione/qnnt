@@ -118,8 +118,11 @@ const Driver = union(enum) {
 
 const Block = struct {
     azimuth_cdeg: u16,
-    /// 32 x (u16 distance_mm little-endian, u8 intensity). A buffer rather than 32 named
-    /// objects: naming every channel would cost ten times the samples in key bytes.
+    /// 32 x (u32 distance_mm little-endian, u8 intensity) = 160 bytes. A buffer rather
+    /// than 32 named objects: naming every channel would cost ten times the samples in key
+    /// bytes. The distance was a u16 until millimetres past 65.535 m had to survive the
+    /// trip, which is 2 bytes per sample -- 768 per frame -- for range this example could
+    /// not previously carry outdoors.
     samples: tld.Bytes,
 };
 
@@ -153,7 +156,9 @@ const CalibrationFrame = struct {
 };
 
 var frame_buf: std.ArrayList(u8) = .empty;
-var sample_bytes: [scan.blocks_per_packet][scan.samples_per_block * 3]u8 = undefined;
+/// 5 bytes per sample: 4 of little-endian millimetres and 1 of intensity.
+const sample_stride = 5;
+var sample_bytes: [scan.blocks_per_packet][scan.samples_per_block * sample_stride]u8 = undefined;
 var block_storage: [scan.blocks_per_packet]Block = undefined;
 var cal_buf: std.ArrayList(u8) = .empty;
 
@@ -179,9 +184,9 @@ fn pack(s: scan.Scan, cal: scan.Calibration) ![]const u8 {
     for (s.blocks, 0..) |block, b| {
         var out: usize = 0;
         for (block.samples) |sample| {
-            std.mem.writeInt(u16, sample_bytes[b][out..][0..2], sample.distance_mm, .little);
-            sample_bytes[b][out + 2] = sample.intensity;
-            out += 3;
+            std.mem.writeInt(u32, sample_bytes[b][out..][0..4], sample.distance_mm, .little);
+            sample_bytes[b][out + 4] = sample.intensity;
+            out += sample_stride;
         }
         block_storage[b] = .{
             .azimuth_cdeg = block.azimuth_cdeg,
