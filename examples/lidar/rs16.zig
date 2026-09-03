@@ -20,6 +20,7 @@
 //! this at real hardware.
 
 const std = @import("std");
+const scan = @import("scan");
 
 // -- wire format --------------------------------------------------------------------
 //
@@ -67,33 +68,30 @@ comptime {
 // of a degree, and the vertical angles supplied alongside so a consumer needs no table of
 // its own. A consumer of this has no reason to know the sensor's make.
 
-pub const Sample = struct {
-    /// 0 means no return -- absorbed, out of range, or sky. Never plot it as a point.
-    distance_mm: u16,
-    intensity: u8,
-};
+// The vocabulary is scan.zig's, shared with the Helios driver next door, so a consumer
+// written against one works with the other. Aliased rather than re-declared: two structs
+// with the same fields are still two types, and the whole point is that they are not.
+pub const Sample = scan.Sample;
+pub const Block = scan.Block;
+pub const Scan = scan.Scan;
+pub const Calibration = scan.Calibration;
 
-pub const Block = struct {
-    azimuth_cdeg: u16,
-    samples: [samples_per_block]Sample,
-};
-
-pub const Scan = struct {
-    /// Monotonic count of packets received, not anything from the wire.
-    seq: u64,
-    /// The sensor's timestamp if the header carried one, else the host's receive time.
-    t_us: u64,
-    blocks: [blocks_per_packet]Block,
-};
-
-pub const Calibration = struct {
-    /// Vertical angle per channel, in degrees. Overwritten if a DIFOP packet supplies one.
-    elevations_deg: [channels]f32 = default_elevations_deg,
-    rpm: u16 = 600,
-    model: []const u8 = "RS-LiDAR-16",
-    /// Whether the angles above came from the device rather than from this table.
-    from_device: bool = false,
-};
+pub fn defaultCalibration() Calibration {
+    var cal: Calibration = .{
+        .model = "RS-LiDAR-16",
+        .rpm = 600,
+        .channels = channels,
+        .firings_per_block = firings_per_block,
+        .azimuth_step_cdeg = azimuth_step_cdeg,
+        .elevations_deg = @splat(0),
+        // Uniform 2 degree spacing IS this model's published table, so unlike the Helios
+        // driver this default is trustworthy -- but DIFOP still overrides it, because a
+        // unit may have been calibrated.
+        .from_device = false,
+    };
+    @memcpy(cal.elevations_deg[0..channels], &default_elevations_deg);
+    return cal;
+}
 
 /// The published RS-LiDAR-16 distribution: -15 to +15 in uniform 2 degree steps. Other
 /// RoboSense models -- the Helios family in particular -- do NOT use uniform spacing, which
@@ -113,7 +111,7 @@ pub fn parseMsop(bytes: []const u8, seq: u64, received_us: u64) ParseError!Scan 
     if (bytes.len < msop_packet_len) return error.ShortPacket;
     if (!std.mem.eql(u8, bytes[0..msop_magic.len], &msop_magic)) return error.BadMagic;
 
-    var scan: Scan = .{
+    var out: Scan = .{
         .seq = seq,
         .t_us = timestampFromHeader(bytes[0..msop_header_len]) orelse received_us,
         .blocks = undefined,
@@ -126,19 +124,19 @@ pub fn parseMsop(bytes: []const u8, seq: u64, received_us: u64) ParseError!Scan 
 
         // Big-endian, both here and for distances: RoboSense puts these on the wire
         // network order, which is the single easiest thing to get wrong in this format.
-        scan.blocks[b].azimuth_cdeg = std.mem.readInt(u16, raw[2..4], .big);
+        out.blocks[b].azimuth_cdeg = std.mem.readInt(u16, raw[2..4], .big);
 
         for (0..samples_per_block) |i| {
             const s = raw[4 + i * sample_len ..][0..sample_len];
             const counts = std.mem.readInt(u16, s[0..2], .big);
             const mm = @as(f32, @floatFromInt(counts)) * distance_unit_mm;
-            scan.blocks[b].samples[i] = .{
+            out.blocks[b].samples[i] = .{
                 .distance_mm = if (counts == 0) 0 else @intFromFloat(@min(mm, 65535.0)),
                 .intensity = s[2],
             };
         }
     }
-    return scan;
+    return out;
 }
 
 /// The header's 10-byte timestamp, in microseconds since the epoch, if it looks populated.
@@ -213,8 +211,8 @@ pub fn writeDifop(out: *[difop_packet_len]u8, cal: *const Calibration) void {
     std.mem.writeInt(u16, out[difop_rpm_offset..][0..2], cal.rpm, .big);
 
     // Angles as signed hundredths of a degree, which is how RoboSense expresses them.
-    for (cal.elevations_deg, 0..) |deg, i| {
-        const cdeg: i16 = @intFromFloat(deg * 100.0);
+    for (0..channels) |i| {
+        const cdeg: i16 = @intFromFloat(cal.elevations_deg[i] * 100.0);
         std.mem.writeInt(i16, out[difop_angles_offset + i * 2 ..][0..2], cdeg, .big);
     }
 }
@@ -248,7 +246,7 @@ pub const Receiver = struct {
     io: std.Io,
     msop: std.Io.net.Socket,
     difop: ?std.Io.net.Socket,
-    calibration: Calibration = .{},
+    calibration: Calibration = undefined,
 
     seq: u64 = 0,
     malformed: u64 = 0,
@@ -269,7 +267,12 @@ pub const Receiver = struct {
             difop_socket = difop_address.bind(io, .{ .mode = .dgram }) catch null;
         }
 
-        return .{ .io = io, .msop = msop_socket, .difop = difop_socket };
+        return .{
+            .io = io,
+            .msop = msop_socket,
+            .difop = difop_socket,
+            .calibration = defaultCalibration(),
+        };
     }
 
     pub fn deinit(r: *Receiver) void {
@@ -284,15 +287,14 @@ pub const Receiver = struct {
         r.seq += 1;
 
         const now_us: u64 = @intCast(std.Io.Timestamp.now(r.io, .real).toMicroseconds());
-        const scan = parseMsop(message.data, r.seq, now_us) catch {
+        const parsed = parseMsop(message.data, r.seq, now_us) catch {
             r.malformed += 1;
             return null;
         };
 
-        const first = scan.blocks[0].azimuth_cdeg;
-        if (first < r.last_azimuth_cdeg) r.revolutions += 1;
-        r.last_azimuth_cdeg = scan.blocks[blocks_per_packet - 1].azimuth_cdeg;
-        return scan;
+        if (parsed.blocks[0].azimuth_cdeg < r.last_azimuth_cdeg) r.revolutions += 1;
+        r.last_azimuth_cdeg = parsed.blocks[blocks_per_packet - 1].azimuth_cdeg;
+        return parsed;
     }
 
     /// Drain any pending DIFOP packet without blocking, applying its calibration. Call it
@@ -337,9 +339,9 @@ test "an MSOP packet survives a write and a parse" {
     // Azimuth is big-endian on the wire: the single easiest thing to get wrong here.
     try testing.expectEqual(@as(u16, 20 * 2), std.mem.readInt(u16, packet[msop_header_len + 100 + 2 ..][0..2], .big));
 
-    const scan = try parseMsop(&packet, 7, 999);
-    try testing.expectEqual(@as(u64, 7), scan.seq);
-    for (scan.blocks, blocks) |got, want| {
+    const parsed = try parseMsop(&packet, 7, 999);
+    try testing.expectEqual(@as(u64, 7), parsed.seq);
+    for (parsed.blocks, blocks) |got, want| {
         try testing.expectEqual(want.azimuth_cdeg, got.azimuth_cdeg);
         for (got.samples, want.samples) |g, w| {
             try testing.expectEqual(w.distance_mm, g.distance_mm);
@@ -373,32 +375,33 @@ test "no return stays no return, rather than becoming a point at the sensor" {
 
     var packet: [msop_packet_len]u8 = undefined;
     writeMsop(&packet, &blocks, 0);
-    const scan = try parseMsop(&packet, 0, 0);
+    const parsed = try parseMsop(&packet, 0, 0);
 
-    try testing.expectEqual(@as(u16, 0), scan.blocks[0].samples[0].distance_mm);
-    try testing.expectEqual(@as(u16, 5), scan.blocks[0].samples[1].distance_mm);
+    try testing.expectEqual(@as(u16, 0), parsed.blocks[0].samples[0].distance_mm);
+    try testing.expectEqual(@as(u16, 5), parsed.blocks[0].samples[1].distance_mm);
 }
 
 test "DIFOP carries the calibration a driver should prefer over its own table" {
-    var cal: Calibration = .{};
+    var cal = defaultCalibration();
     // A non-uniform table, as the Helios family has and RS-LiDAR-16 does not: the point of
     // reading DIFOP is that the driver does not have to know which it is talking to.
-    cal.elevations_deg = .{ -20, -16, -12, -9, -7, -5.5, -4, -2.5, -1, 0.5, 2, 4, 6.5, 9, 13, 18 };
+    const angles = [channels]f32{ -20, -16, -12, -9, -7, -5.5, -4, -2.5, -1, 0.5, 2, 4, 6.5, 9, 13, 18 };
+    @memcpy(cal.elevations_deg[0..channels], &angles);
     cal.rpm = 1200;
 
     var packet: [difop_packet_len]u8 = undefined;
     writeDifop(&packet, &cal);
 
-    var received: Calibration = .{};
+    var received = defaultCalibration();
     try testing.expect(parseDifop(&packet, &received));
     try testing.expect(received.from_device);
     try testing.expectEqual(@as(u16, 1200), received.rpm);
-    for (cal.elevations_deg, received.elevations_deg) |want, got| {
-        try testing.expectApproxEqAbs(want, got, 0.01);
+    for (0..channels) |i| {
+        try testing.expectApproxEqAbs(cal.elevations_deg[i], received.elevations_deg[i], 0.01);
     }
 
     // Something that is not a DIFOP packet leaves the calibration alone.
-    var untouched: Calibration = .{};
+    var untouched = defaultCalibration();
     try testing.expect(!parseDifop("not a difop packet", &untouched));
     try testing.expect(!untouched.from_device);
 }

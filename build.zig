@@ -86,12 +86,40 @@ pub fn build(b: *Build) void {
     // The driver is its own module, imported by both the fake sensor and the bridge, so
     // the MSOP layout has exactly one definition. It depends on nothing from qnnt: a
     // sensor driver has no business knowing about the transport that carries its output.
+    // Shared vocabulary first: both drivers produce these types, so a consumer written
+    // against one works with the other.
+    const scan_mod = b.createModule(.{
+        .root_source_file = b.path("examples/lidar/scan.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    // The synthetic room, shared by both fakes so the two sensors are comparable.
+    const scene_mod = b.createModule(.{
+        .root_source_file = b.path("examples/lidar/scene.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
     const rs16_mod = b.createModule(.{
         .root_source_file = b.path("examples/lidar/rs16.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
+    rs16_mod.addImport("scan", scan_mod);
+
+    const helios_mod = b.createModule(.{
+        .root_source_file = b.path("examples/lidar/helios32.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    helios_mod.addImport("scan", scan_mod);
+    // Only for the test that proves the two formats are not interchangeable.
+    helios_mod.addImport("rs16", rs16_mod);
 
     // The fake sensor: no qnnt at all, just UDP. It pretends to be hardware.
     const fake_mod = b.createModule(.{
@@ -101,9 +129,25 @@ pub fn build(b: *Build) void {
         .link_libc = true,
     });
     fake_mod.addImport("rs16", rs16_mod);
+    fake_mod.addImport("scan", scan_mod);
+    fake_mod.addImport("scene", scene_mod);
     const fake_rs16 = b.addExecutable(.{ .name = "fake-rs16", .root_module = fake_mod });
     b.installArtifact(fake_rs16);
     lidar_step.dependOn(&b.addInstallArtifact(fake_rs16, .{}).step);
+
+    // The second device: twice the packet rate through the same pipeline.
+    const fake_helios_mod = b.createModule(.{
+        .root_source_file = b.path("examples/lidar/fake_helios32.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    fake_helios_mod.addImport("helios32", helios_mod);
+    fake_helios_mod.addImport("scan", scan_mod);
+    fake_helios_mod.addImport("scene", scene_mod);
+    const fake_helios = b.addExecutable(.{ .name = "fake-helios32", .root_module = fake_helios_mod });
+    b.installArtifact(fake_helios);
+    lidar_step.dependOn(&b.addInstallArtifact(fake_helios, .{}).step);
 
     // The bridge: driver in, TLD topic out.
     const lidar_mod = b.createModule(.{
@@ -114,6 +158,8 @@ pub fn build(b: *Build) void {
     });
     lidar_mod.addImport("qnnt", qnnt_lib_mod);
     lidar_mod.addImport("rs16", rs16_mod);
+    lidar_mod.addImport("helios32", helios_mod);
+    lidar_mod.addImport("scan", scan_mod);
     const lidar_sensor = b.addExecutable(.{ .name = "lidar-sensor", .root_module = lidar_mod });
     lidar_sensor.root_module.linkLibrary(qnnt_lib);
     b.installArtifact(lidar_sensor);
@@ -323,9 +369,7 @@ pub fn build(b: *Build) void {
     // These used to need serialising, because every node contended for one well-known
     // registry port and build steps run in parallel. Each now uses a port of its own
     // (22300 tests, 22301 the C node demo, 22302 Python), so they are independent.
-    // examples/lidar/rs16.zig is in here because it is pure wire-format logic with no
-    // qnnt dependency, and the endianness and offsets it pins are exactly what drifts.
-    for ([_][]const u8{ "lib/tld.zig", "lib/resolve.zig", "lib/env.zig", "lib/qnnt.zig", "examples/lidar/rs16.zig" }) |src| {
+    for ([_][]const u8{ "lib/tld.zig", "lib/resolve.zig", "lib/env.zig", "lib/qnnt.zig", "examples/lidar/scan.zig" }) |src| {
         const tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(src),
@@ -335,6 +379,42 @@ pub fn build(b: *Build) void {
             }),
         });
         test_step.dependOn(&b.addRunArtifact(tests).step);
+    }
+
+    // The two LiDAR drivers: pure wire-format logic with no qnnt dependency, and the
+    // endianness, offsets and distance units they pin are exactly what drifts. They need
+    // their module graph, so they cannot ride the simple loop above.
+    //
+    // Declared here rather than beside the lidar step because `test` must not depend on
+    // the example's build options.
+    {
+        const t_scan = b.createModule(.{
+            .root_source_file = b.path("examples/lidar/scan.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        const t_rs16 = b.createModule(.{
+            .root_source_file = b.path("examples/lidar/rs16.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        t_rs16.addImport("scan", t_scan);
+
+        const t_helios = b.createModule(.{
+            .root_source_file = b.path("examples/lidar/helios32.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        t_helios.addImport("scan", t_scan);
+        t_helios.addImport("rs16", t_rs16);
+
+        for ([_]*Build.Module{ t_rs16, t_helios }) |mod| {
+            const tests = b.addTest(.{ .root_module = mod });
+            test_step.dependOn(&b.addRunArtifact(tests).step);
+        }
     }
 
     // A C program compiled against the header and linked to the static library. This is

@@ -15,124 +15,12 @@
 
 const std = @import("std");
 const rs16 = @import("rs16");
-
-// -- the synthetic room -------------------------------------------------------------
-
-const sensor_height_m: f32 = 1.0;
-const room_half_x: f32 = 10.0;
-const room_half_y: f32 = 7.0;
-
-const Pillar = struct { x: f32, y: f32, r: f32 };
-const pillars = [_]Pillar{
-    .{ .x = 3.0, .y = 2.0, .r = 0.4 },
-    .{ .x = -4.0, .y = -3.0, .r = 0.6 },
-};
-
-const intensity_wall: u8 = 120;
-const intensity_pillar: u8 = 220;
-const intensity_floor: u8 = 60;
-const intensity_box: u8 = 255;
-
-fn wallDistance(sin_a: f32, cos_a: f32) f32 {
-    var best: f32 = 1e9;
-    if (sin_a > 1e-6) best = @min(best, room_half_x / sin_a);
-    if (sin_a < -1e-6) best = @min(best, -room_half_x / sin_a);
-    if (cos_a > 1e-6) best = @min(best, room_half_y / cos_a);
-    if (cos_a < -1e-6) best = @min(best, -room_half_y / cos_a);
-    return best;
-}
-
-fn circleDistance(sin_a: f32, cos_a: f32, cx: f32, cy: f32, r: f32) ?f32 {
-    const b = 2.0 * (sin_a * -cx + cos_a * -cy);
-    const c = cx * cx + cy * cy - r * r;
-    const disc = b * b - 4.0 * c;
-    if (disc < 0) return null;
-    const root = @sqrt(disc);
-    const t0 = (-b - root) / 2.0;
-    if (t0 > 0.05) return t0;
-    const t1 = (-b + root) / 2.0;
-    if (t1 > 0.05) return t1;
-    return null;
-}
-
-fn boxDistance(sin_a: f32, cos_a: f32, phase: f32) ?f32 {
-    const cx = 6.0 * @sin(phase);
-    const cy: f32 = 4.5;
-    const half: f32 = 0.7;
-
-    var t_min: f32 = 0.05;
-    var t_max: f32 = 1e9;
-
-    if (@abs(sin_a) < 1e-6) {
-        if (@abs(-cx) > half) return null;
-    } else {
-        const t1 = (cx - half) / sin_a;
-        const t2 = (cx + half) / sin_a;
-        t_min = @max(t_min, @min(t1, t2));
-        t_max = @min(t_max, @max(t1, t2));
-    }
-    if (@abs(cos_a) < 1e-6) {
-        if (@abs(-cy) > half) return null;
-    } else {
-        const t1 = (cy - half) / cos_a;
-        const t2 = (cy + half) / cos_a;
-        t_min = @max(t_min, @min(t1, t2));
-        t_max = @min(t_max, @max(t1, t2));
-    }
-    if (t_min <= t_max and t_min > 0.05) return t_min;
-    return null;
-}
-
-/// One beam against the room. Distances come out in millimetres, which the writer converts
-/// to the sensor's count units.
-fn beam(at_cdeg: u32, elevation_deg: f32, phase: f32) rs16.Sample {
-    const azim = @as(f32, @floatFromInt(at_cdeg)) * std.math.pi / 18000.0;
-    const elev = elevation_deg * std.math.pi / 180.0;
-    const sin_a = @sin(azim);
-    const cos_a = @cos(azim);
-
-    var horizontal = wallDistance(sin_a, cos_a);
-    var intensity = intensity_wall;
-
-    for (pillars) |p| {
-        if (circleDistance(sin_a, cos_a, p.x, p.y, p.r)) |d| {
-            if (d < horizontal) {
-                horizontal = d;
-                intensity = intensity_pillar;
-            }
-        }
-    }
-    if (boxDistance(sin_a, cos_a, phase)) |d| {
-        if (d < horizontal) {
-            horizontal = d;
-            intensity = intensity_box;
-        }
-    }
-
-    const cos_e = @cos(elev);
-    var range = if (cos_e > 1e-6) horizontal / cos_e else 1e9;
-    if (elev < -1e-6) {
-        const floor = sensor_height_m / @sin(-elev);
-        if (floor < range) {
-            range = floor;
-            intensity = intensity_floor;
-        }
-    } else if (elev > 1e-6) {
-        // Upward past the walls is sky: no return at all, which is 0 on the wire.
-        const ceiling = 3.0 / @sin(elev);
-        if (ceiling < range) return .{ .distance_mm = 0, .intensity = 0 };
-    }
-
-    if (range > 60.0) return .{ .distance_mm = 0, .intensity = 0 };
-    return .{
-        .distance_mm = @intFromFloat(@min(range * 1000.0, 65535.0)),
-        .intensity = intensity,
-    };
-}
+const scan = @import("scan");
+const scene = @import("scene");
 
 // -- transmission -------------------------------------------------------------------
 
-const calibration: rs16.Calibration = .{};
+const calibration = rs16.defaultCalibration();
 const revs_per_s = calibration.rpm / 60; // 10
 const azimuths_per_rev = 1800;
 const blocks_per_rev = azimuths_per_rev / rs16.firings_per_block; // 900
@@ -181,7 +69,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var difop: [rs16.difop_packet_len]u8 = undefined;
     rs16.writeDifop(&difop, &calibration);
 
-    var blocks: [rs16.blocks_per_packet]rs16.Block = undefined;
+    var blocks: [rs16.blocks_per_packet]scan.Block = undefined;
     var azimuth_cdeg: u32 = 0;
     var sent: u64 = 0;
     var last_report_us: u64 = @intCast(std.Io.Timestamp.now(io, .real).toMicroseconds());
@@ -197,8 +85,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
             var i: usize = 0;
             for (0..rs16.firings_per_block) |f| {
                 const fired_at = (azimuth_cdeg + @as(u32, @intCast(f)) * rs16.azimuth_step_cdeg) % 36000;
-                for (calibration.elevations_deg) |elev| {
-                    block.samples[i] = beam(fired_at, elev, phase);
+                for (calibration.elevations_deg[0..rs16.channels]) |elev| {
+                    const hit = scene.beam(fired_at, elev, phase);
+                    block.samples[i] = .{ .distance_mm = hit.distance_mm, .intensity = hit.intensity };
                     i += 1;
                 }
             }

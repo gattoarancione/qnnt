@@ -1,16 +1,52 @@
 Fake RoboSense LiDAR over TLD
 =============================
 
-Four processes, each doing one job, because that is how this looks with real hardware:
+Two sensors, one pipeline, because that is how this looks with real hardware:
 
-    fake_rs16.zig   pretends to be the device: MSOP and DIFOP over UDP, no qnnt at all
-        |  UDP :6699 (MSOP, 750 packets/s) and :7788 (DIFOP, 1/s)
-    rs16.zig        the driver: RoboSense's wire format in, model-independent scans out
-        |  (a Zig module, imported -- not a process)
-    sensor.zig      the bridge: driver in, TLD frames on a qnnt topic out
-        |  qnnt topic "lidar/rs16"
-    viewer.cpp      Qt/QML: subscribes, decodes, renders the point cloud
+    fake_rs16.zig       pretends to be an RS-LiDAR-16      750 packets/s
+    fake_helios32.zig   pretends to be an RS-Helios-32    1500 packets/s
+        |  UDP :6699 (MSOP) and :7788 (DIFOP, 1/s) -- no qnnt in either fake
+    rs16.zig            driver: first-generation MSOP in, model-independent scans out
+    helios32.zig        driver: Helios MSOP in, the same scans out
+    scan.zig            the vocabulary both produce, and the geometry maths
+        |  (Zig modules, imported -- not processes)
+    sensor.zig          the bridge: `lidar-sensor rs16` or `lidar-sensor helios32`
+        |  topics "lidar/<model>" and "lidar/<model>/calibration"
+    viewer.cpp          Qt/QML: one binary, either sensor -- it learns the geometry
     + main.qml
+
+what the second driver settled
+------------------------------
+
+Adding the Helios-32 was the test of whether the first driver's boundaries were in the
+right place. They mostly were, and the two places they were not are now fixed:
+
+  * scan.zig did not exist. The first driver declared its own Sample, Block, Scan and
+    Calibration, so a second driver would have produced structurally identical but
+    unrelated types. Both now produce scan.zig's, so a consumer written against one works
+    with the other.
+  * the geometry was compiled into the viewer. Sixteen angles in a constant array, which is
+    fine until a 32-channel sensor arrives. The angle table now travels on its own topic
+    and the viewer reads channel count and firings-per-block out of each frame.
+
+how the two models differ, which is the interesting part
+--------------------------------------------------------
+
+                    RS-LiDAR-16           RS-Helios-32
+    channels        16                    32
+    a block is      two firings of 16     one firing of 32
+    blocks/packet   12                    12          (same 1248-byte packet)
+    azimuths/rev    1800 in 900 blocks    1800 in 1800 blocks
+    packets/s       750                   1500        at 600 rpm
+    points/s        288,000               576,000
+    distance unit   5 mm                  2.5 mm      same counts, half the range
+    header          42 bytes, date        32 bytes, UTC seconds + microseconds
+    angles          -15..+15, uniform     non-uniform, denser near the horizon
+
+Both are 1248 bytes with 0xFFEE block flags and big-endian azimuths and distances, so only
+the MSOP magic distinguishes them on the wire. Each driver checks it and refuses the
+other's packets, and a test asserts both directions -- because a packet parsed by the wrong
+driver would not error, it would produce plausible nonsense at half or double the range.
 
 Replacing the fake with a real RS-LiDAR-16 means pointing the sensor at this host and
 running nothing differently: the driver binds the same port either way. That is the reason
@@ -105,10 +141,16 @@ the fields inside the 42-byte header beyond the magic and the timestamp, the DIF
 That last one is `distance_unit_mm` and it scales the whole cloud -- check it before
 pointing this at hardware.
 
-Note also that RS-LiDAR-16 is the first-generation 16-beam unit, with vertical angles in
-uniform 2 degree steps. The Helios family that succeeded it does NOT use uniform spacing,
-which is exactly why the driver prefers the angle table the device sends over DIFOP to the
-one compiled into it. `Calibration.from_device` says which it is using.
+The Helios driver goes further: it has no angle table worth trusting, so its default is
+named `placeholder_elevations_deg` and `anglesArePlaceholder()` reports that it is in use.
+Its shape is right -- denser near the horizon -- but the numbers are invented, and a unit
+running on them is misreporting geometry. Read them from the device; the fake sends them,
+and real hardware does too.
+
+That asymmetry between the drivers is deliberate. The RS-LiDAR-16's uniform 2 degree
+spacing IS its published table, so its default is trustworthy. The Helios has no single
+table -- the family covers several distributions -- so any default here would be wrong for
+most units.
 
 running it
 ----------
@@ -116,19 +158,34 @@ running it
     zig build lidar                                  # fake sensor + bridge
     zig build lidar -Dqt=/path/to/Qt/6.10.3/macos    # and the viewer
 
-    ./zig-out/bin/fake-rs16       # terminal 1: the device (or use real hardware)
-    ./zig-out/bin/lidar-sensor    # terminal 2: driver + qnnt publisher
-    ./zig-out/bin/lidar-viewer    # terminal 3: from the project root
+    ./zig-out/bin/fake-rs16                        # terminal 1: the device
+    ./zig-out/bin/lidar-sensor rs16                # terminal 2: driver + publisher
+    ./zig-out/bin/lidar-viewer                     # terminal 3: from the project root
+
+or the other sensor, through the same viewer binary:
+
+    ./zig-out/bin/fake-helios32
+    ./zig-out/bin/lidar-sensor helios32
+    ./zig-out/bin/lidar-viewer '' lidar/helios32
 
 What each reports:
 
     fake-rs16: RS-LiDAR-16 -> 127.0.0.1:6699 (MSOP) and :7788 (DIFOP)
     fake-rs16: 751 packets/s sent, azimuth 4.8 deg
 
-    lidar-sensor: calibration from the device: 600 rpm, channel 0 at -15.0 deg
-    lidar-sensor: 751 packets/s in, 751 published, 0 malformed, 10 revs, 1550 byte frames
+    lidar-sensor: calibration from the device: 600 rpm, channel 0 at -15.00 deg, channel 15 at 15.00 deg
+    lidar-sensor: 751 packets/s in, 751 published, 0 malformed, 10 revs, 1608 byte frames, angles device
 
-    lidar-viewer: 750 frames/s, 288000 points/s, 38 revolutions, 28661 displayed
+    lidar-viewer: RS-LiDAR-16, 16 channels, 2 firing(s)/block, angles -15.00..15.00 deg, from the device
+    lidar-viewer: 750 frames/s, 288000 points/s, 38 revolutions, 28661 displayed, 0 dropped
+
+and for the Helios, from the same viewer:
+
+    lidar-sensor: calibration from the device: 600 rpm, channel 0 at -50.00 deg, channel 31 at 15.00 deg
+    lidar-sensor: 1502 packets/s in, 1502 published, 0 malformed, 10 revs, 1613 byte frames, angles device
+
+    lidar-viewer: RS-Helios-32, 32 channels, 1 firing(s)/block, angles -50.00..15.00 deg, from the device
+    lidar-viewer: 1487 frames/s, 571008 points/s, 51 revolutions, 57461 displayed, 0 dropped
 
 `zig build test` includes rs16.zig: a write/parse round trip, refusal of short packets and
 bad magic and bad block flags, no-return staying no-return, and a non-uniform DIFOP angle

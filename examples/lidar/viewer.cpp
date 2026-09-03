@@ -32,16 +32,10 @@
 #include <vector>
 
 namespace {
-constexpr auto kTopic = "lidar/rs16";
+/// Default topic; override with an argument to view a different sensor.
+constexpr auto kDefaultTopic = "lidar/rs16";
 
-/// The 16 fixed vertical angles of an RS-LiDAR-16, in degrees.
-constexpr std::array<float, 16> kElevations{
-    -15, -13, -11, -9, -7, -5, -3, -1, 1, 3, 5, 7, 9, 11, 13, 15,
-};
-
-constexpr int kChannels = 16;
-constexpr int kFiringsPerBlock = 2;
-constexpr int kAzimuthStepCdeg = 20; // 0.2 degrees
+constexpr int kMaxChannels = 32;
 
 /// A point cloud is drawn in a few passes, one per surface class, so each pass is a single
 /// drawPoints call with one pen rather than a pen change per point.
@@ -171,7 +165,10 @@ class Sensor : public QObject
     Q_PROPERTY(QString status READ status NOTIFY statsChanged)
 
 public:
-    explicit Sensor(QObject* parent = nullptr) : QObject{parent} {}
+    explicit Sensor(QString topic, QObject* parent = nullptr)
+        : QObject{parent},
+          m_topic{std::move(topic)},
+          m_calibration_topic{m_topic + QStringLiteral("/calibration")} {}
 
     void setView(LidarView* view) { m_view = view; }
 
@@ -199,14 +196,18 @@ public:
 
         node->configureFromEnvironment();
         // The queue must hold a second of packets, or a hitch in the GUI thread costs
-        // frames: 750/s, so 2048 is a comfortable margin over one revolution's 75.
-        node->reserveQueue(2048);
+        // frames. A Helios-32 sends 1500/s, twice the RS-LiDAR-16, so this is sized for
+        // the faster of the two.
+        node->reserveQueue(4096);
         if (!node->start()) return false;
-        if (!node->addSubscriber(QString::fromLatin1(kTopic),
-                                 qnnt::QnntNode::Delivery::Frames)) {
+        if (!node->addSubscriber(m_topic, qnnt::QnntNode::Delivery::Frames)) return false;
+        // The angle table arrives on its own topic: it is 32 floats that change
+        // approximately never, and putting it in every frame would be 192 KB/s of
+        // unchanging data at the Helios rate.
+        if (!node->addSubscriber(m_calibration_topic, qnnt::QnntNode::Delivery::Frames)) {
             return false;
         }
-        m_status = QStringLiteral("waiting for %1").arg(QString::fromLatin1(kTopic));
+        m_status = QStringLiteral("waiting for %1").arg(m_topic);
 
         auto* ticker = new QTimer(this);
         connect(ticker, &QTimer::timeout, this, &Sensor::tick);
@@ -215,9 +216,16 @@ public:
     }
 
 private Q_SLOTS:
-    void onFrame(const QString&, const QByteArray& frame) {
+    void onFrame(const QString& topic, const QByteArray& frame) {
+        if (topic == m_calibration_topic) {
+            onCalibration(frame);
+            return;
+        }
+
         ++m_frames;
-        if (m_view == nullptr) return;
+        // Nothing can be plotted without the angle table, and it arrives on its own topic:
+        // dropping these few frames is better than inventing geometry for them.
+        if (m_view == nullptr || !m_have_calibration) return;
 
         try {
             const qnnt::tld::Frame packet = qnnt::tld::decode(qnnt::tld::Bytes{
@@ -236,6 +244,12 @@ private Q_SLOTS:
                     }
                 } else if (field.key == "rpm") {
                     m_rpm = static_cast<int>(field.value.asUint());
+                } else if (field.key == "channels") {
+                    m_channels = static_cast<int>(field.value.asUint());
+                } else if (field.key == "firings_per_block") {
+                    m_firings_per_block = static_cast<int>(field.value.asUint());
+                } else if (field.key == "azimuth_step_cdeg") {
+                    m_azimuth_step_cdeg = static_cast<int>(field.value.asUint());
                 } else if (field.key == "blocks") {
                     for (const qnnt::tld::Frame& block : field.value.array()) {
                         decodeBlock(block);
@@ -257,13 +271,70 @@ private Q_SLOTS:
         m_points_last = m_points;
         Q_EMIT statsChanged();
 
-        std::printf("lidar-viewer: %d frames/s, %d points/s, %d revolutions, %d displayed\n",
+        // The drop count belongs in this line: at the Helios rate the GUI thread decodes
+        // 576,000 points/s, and if it falls behind the queue sheds frames rather than
+        // growing. Reporting frames/s without it would hide the loss.
+        std::printf("lidar-viewer: %d frames/s, %d points/s, %d revolutions, %d displayed, "
+                    "%llu dropped\n",
                     m_frames_per_second, m_points_per_second, revolutions(),
-                    displayedPoints());
+                    displayedPoints(),
+                    static_cast<unsigned long long>(
+                        qnnt::QnntNode::instance()->droppedCount()));
         std::fflush(stdout);
     }
 
 private:
+    void onCalibration(const QByteArray& frame) {
+        try {
+            const qnnt::tld::Frame packet = qnnt::tld::decode(qnnt::tld::Bytes{
+                reinterpret_cast<const std::uint8_t*>(frame.constData()),
+                static_cast<std::size_t>(frame.size())});
+
+            for (const qnnt::tld::Field& field : packet.object()) {
+                if (field.key == "model") {
+                    const std::string_view text = field.value.asString();
+                    m_model = QString::fromUtf8(text.data(),
+                                                static_cast<qsizetype>(text.size()));
+                } else if (field.key == "rpm") {
+                    m_rpm = static_cast<int>(field.value.asUint());
+                } else if (field.key == "channels") {
+                    m_channels = static_cast<int>(field.value.asUint());
+                } else if (field.key == "firings_per_block") {
+                    m_firings_per_block = static_cast<int>(field.value.asUint());
+                } else if (field.key == "azimuth_step_cdeg") {
+                    m_azimuth_step_cdeg = static_cast<int>(field.value.asUint());
+                } else if (field.key == "from_device") {
+                    m_angles_from_device = field.value.asBool();
+                } else if (field.key == "elevations_deg") {
+                    int i = 0;
+                    for (const qnnt::tld::Frame& angle : field.value.array()) {
+                        if (i >= kMaxChannels) break;
+                        m_elevations[static_cast<std::size_t>(i++)] =
+                            static_cast<float>(angle.asFloat());
+                    }
+                }
+            }
+
+            if (m_channels > 0 && m_firings_per_block > 0) {
+                const bool first = !m_have_calibration;
+                m_have_calibration = true;
+                if (first) {
+                    std::printf("lidar-viewer: %s, %d channels, %d firing(s)/block, "
+                                "angles %.2f..%.2f deg, %s\n",
+                                qPrintable(m_model), m_channels, m_firings_per_block,
+                                m_elevations[0],
+                                m_elevations[static_cast<std::size_t>(m_channels - 1)],
+                                m_angles_from_device ? "from the device"
+                                                     : "from the driver's table");
+                    std::fflush(stdout);
+                }
+                Q_EMIT statsChanged();
+            }
+        } catch (const qnnt::tld::Error&) {
+            ++m_malformed;
+        }
+    }
+
     void decodeBlock(const qnnt::tld::Frame& block) {
         int azimuth_cdeg = -1;
         qnnt::tld::Bytes samples{};
@@ -275,7 +346,10 @@ private:
                 samples = field.value.asBuffer();
             }
         }
-        if (azimuth_cdeg < 0 || samples.size() < kChannels * kFiringsPerBlock * 3) return;
+        const int samples_needed = m_channels * m_firings_per_block;
+        if (azimuth_cdeg < 0 || samples.size() < static_cast<std::size_t>(samples_needed) * 3) {
+            return;
+        }
 
         // A wrap in azimuth is the end of a revolution.
         if (azimuth_cdeg < m_last_azimuth_cdeg && m_view != nullptr) {
@@ -283,14 +357,17 @@ private:
         }
         m_last_azimuth_cdeg = azimuth_cdeg;
 
-        for (int firing = 0; firing < kFiringsPerBlock; ++firing) {
+        for (int firing = 0; firing < m_firings_per_block; ++firing) {
+            // With two firings per block the second half of the samples belongs to the
+            // NEXT azimuth, not this one. With one firing they all share it. Getting this
+            // wrong smears the cloud by a fifth of a degree and looks almost right.
             const double azim =
-                (azimuth_cdeg + firing * kAzimuthStepCdeg) * M_PI / 18000.0;
+                (azimuth_cdeg + firing * m_azimuth_step_cdeg) * M_PI / 18000.0;
             const double sin_a = std::sin(azim);
             const double cos_a = std::cos(azim);
 
-            for (int ch = 0; ch < kChannels; ++ch) {
-                const std::size_t at = static_cast<std::size_t>(firing * kChannels + ch) * 3;
+            for (int ch = 0; ch < m_channels; ++ch) {
+                const std::size_t at = static_cast<std::size_t>(firing * m_channels + ch) * 3;
                 const std::uint16_t distance_mm =
                     static_cast<std::uint16_t>(samples[at] | (samples[at + 1] << 8));
                 const std::uint8_t intensity = samples[at + 2];
@@ -301,7 +378,7 @@ private:
                 if (distance_mm == 0) continue;
 
                 const double r = distance_mm / 1000.0;
-                const double elev = kElevations[static_cast<std::size_t>(ch)] * M_PI / 180.0;
+                const double elev = m_elevations[static_cast<std::size_t>(ch)] * M_PI / 180.0;
                 const double horizontal = r * std::cos(elev);
                 m_view->addPoint(static_cast<float>(horizontal * sin_a),
                                  static_cast<float>(horizontal * cos_a), intensity);
@@ -316,7 +393,18 @@ private:
     LidarView* m_view = nullptr;
     QString m_model;
     QString m_status;
+    QString m_topic;
+    QString m_calibration_topic;
     int m_rpm = 0;
+    /// Geometry, taken from the stream rather than compiled in: an RS-LiDAR-16 sends 16
+    /// channels in two firings per block, a Helios-32 sends 32 in one, and their angle
+    /// tables are nothing alike.
+    int m_channels = 0;
+    int m_firings_per_block = 0;
+    int m_azimuth_step_cdeg = 20;
+    std::array<float, kMaxChannels> m_elevations{};
+    bool m_have_calibration = false;
+    bool m_angles_from_device = false;
     int m_last_azimuth_cdeg = 0;
     int m_frames = 0, m_frames_last = 0, m_frames_per_second = 0;
     int m_points = 0, m_points_last = 0, m_points_per_second = 0;
@@ -328,14 +416,20 @@ int main(int argc, char** argv) {
 
     qmlRegisterType<LidarView>("Qnnt.Lidar", 1, 0, "LidarView");
 
-    Sensor sensor;
+    // Which sensor to view: the topic prefix, defaulting to the RS-LiDAR-16's.
+    //   ./lidar-viewer                       -> lidar/rs16
+    //   ./lidar-viewer '' lidar/helios32     -> the Helios, same binary
+    const QString topic = argc > 2 ? QString::fromLocal8Bit(argv[2])
+                                   : QString::fromLatin1(kDefaultTopic);
+    Sensor sensor{topic};
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("sensor"), &sensor);
 
     // Loaded from the source tree rather than a resource, so the QML can be edited without
     // rebuilding. Run from the project root, or pass a path.
-    const QString qml = argc > 1 ? QString::fromLocal8Bit(argv[1])
-                                 : QStringLiteral("examples/lidar/main.qml");
+    const QString qml = (argc > 1 && argv[1][0] != '\0')
+                            ? QString::fromLocal8Bit(argv[1])
+                            : QStringLiteral("examples/lidar/main.qml");
     engine.load(QUrl::fromLocalFile(qml));
     if (engine.rootObjects().isEmpty()) {
         std::printf("lidar-viewer: could not load %s (run from the project root, or pass a "
