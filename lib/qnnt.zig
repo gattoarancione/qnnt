@@ -837,6 +837,12 @@ pub const Qnnt = struct {
     pub const subscribe = &subscribeRun;
     pub const subscribeFrames = &subscribeFramesRun;
 
+    /// The topics the registry knows, for discovery: see `listTopics`.
+    pub const listTopics = &@import("qnnt.zig").listTopics;
+
+    /// One command to the registry, reply returned verbatim: see `registryCommand`.
+    pub const registryCommand = &@import("qnnt.zig").registryCommand;
+
     /// Buffered subscription: messages land in a queue the caller drains with `poll`,
     /// rather than arriving on a library thread. See the notes above `QueuedMessage`.
     pub const subscribeQueue = &subscribeQueueRun;
@@ -845,6 +851,9 @@ pub const Qnnt = struct {
     pub const queueDropped = &queueDroppedCount;
     pub const deinit = &nodeDeinit;
     pub const sleepMs = &sleepMsFn;
+    /// Microsecond sleep, for anything pacing itself against the scheduler's own unit --
+    /// a capture replayed at its recorded rate, for instance.
+    pub const sleepUs = &sleepUsFn;
     pub const nowMicros = &nowMicrosFn;
 
     /// Registry port control. Set before `run()`; see `setRegistryPort`.
@@ -2050,6 +2059,91 @@ fn registerLoop(topic: []const u8, endpoint: net.IpAddress) void {
         registerOnce(topic, endpoint) catch {}; // registry not up yet / mid-failover
         if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
     }
+}
+
+/// Send one command to the registry and return its reply, copied into `buf`.
+///
+/// The general primitive, so a tool that wants `subs` or `status` can pass the registry's
+/// own answer straight through instead of parsing a table only to reformat it. Informational
+/// '#' lines are kept for that reason -- they are most of what those replies say.
+pub fn registryCommand(command: []const u8, buf: []u8) ![]const u8 {
+    const reg: net.IpAddress = try net.IpAddress.parse("127.0.0.1", registry_port);
+    var conn = try reg.connect(io, .{ .mode = .stream });
+    defer conn.close(io);
+
+    // Short-lived, but it blocks on a read: tracked so a shutdown mid-exchange does not
+    // hold the worker until the peer answers.
+    if (!trackSocket(conn.socket, .stream)) return error.ShuttingDown;
+    defer untrackSocket(conn.socket);
+
+    var writer = conn.writer(io, &.{});
+    try writer.interface.writeAll(command);
+    try writer.interface.writeAll("\n");
+
+    var rbuf: [1024]u8 = undefined;
+    var reader = conn.reader(io, &rbuf);
+
+    // Two terminators to expect, not one. The registry greets every connection with a
+    // banner of its own, itself terminated, so the first `# end` closes the greeting and
+    // the second closes the reply. `takeReply` cannot be used here because it skips every
+    // '#' line -- including the terminators -- which is right for a one-line reply and
+    // wrong for anything longer.
+    const end = response_terminator[0 .. response_terminator.len - 1];
+    var greeted = false;
+    var used: usize = 0;
+
+    while (true) {
+        const line = reader.interface.takeDelimiterInclusive('\n') catch break;
+        if (std.mem.startsWith(u8, line, end)) {
+            if (greeted) break;
+            greeted = true;
+            continue;
+        }
+        if (!greeted) continue; // still inside the greeting
+        if (used + line.len > buf.len) break;
+
+        // Copied straight away: the slice points into the reader's buffer, which the next
+        // read reuses.
+        @memcpy(buf[used..][0..line.len], line);
+        used += line.len;
+    }
+
+    return buf[0..used];
+}
+
+/// Ask the registry which topics it currently knows. Names are copied into `buf` and `out`
+/// is filled with slices into it; returns how many were written.
+///
+/// Here rather than in a tool because the table being parsed is written by `writeTopicList`
+/// a few hundred lines up: keeping both halves in one file means a column added or reordered
+/// is a local change rather than a silent break in something downstream. Only the first
+/// column is read, which is the topic.
+pub fn listTopics(out: [][]const u8, buf: []u8) !usize {
+    // Heap rather than a stack buffer: a busy registry's table is a few KB and this runs on
+    // whatever thread the caller is on, including library workers.
+    const reply = try allocator.alloc(u8, 64 * 1024);
+    defer allocator.free(reply);
+    const text = try registryCommand("list", reply);
+
+    var count: usize = 0;
+    var used: usize = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.mem.startsWith(u8, line, comment_prefix)) continue;
+
+        var it = std.mem.tokenizeAny(u8, line, " \t\r");
+        const name = it.next() orelse continue;
+        if (count == out.len or used + name.len > buf.len) break;
+
+        @memcpy(buf[used..][0..name.len], name);
+        out[count] = buf[used..][0..name.len];
+        used += name.len;
+        count += 1;
+    }
+
+    return count;
 }
 
 // Ask the registry (well-known port) where `topic` is published and return the

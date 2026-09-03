@@ -21,6 +21,23 @@ pub fn build(b: *Build) void {
             .link_libc = true,
     });
 
+    // Glob matching and the '/'-segment tree, shared by the console tools so qnnt-ls and
+    // qnnt-cat cannot disagree about what a pattern means -- what one lists must be what
+    // the other subscribes to.
+    const topics_mod = b.createModule(.{
+        .root_source_file = b.path("src/topics.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Buffered stdout for the tools: their output is data for a pipe, and std.debug.print
+    // goes to stderr.
+    const stdout_mod = b.createModule(.{
+        .root_source_file = b.path("src/stdout.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const qnnt_lib = b.addLibrary(.{
         .linkage = .static,
         .name = "qnnt",
@@ -369,15 +386,35 @@ pub fn build(b: *Build) void {
     // These used to need serialising, because every node contended for one well-known
     // registry port and build steps run in parallel. Each now uses a port of its own
     // (22300 tests, 22301 the C node demo, 22302 Python), so they are independent.
-    for ([_][]const u8{ "lib/tld.zig", "lib/resolve.zig", "lib/env.zig", "lib/qnnt.zig", "examples/lidar/scan.zig" }) |src| {
-        const tests = b.addTest(.{
-            .root_module = b.createModule(.{
-                .root_source_file = b.path(src),
-                .target = target,
-                .optimize = optimize,
-                .link_libc = true, // threads and getenv, as above
-            }),
+    for ([_][]const u8{
+        "lib/tld.zig",
+        "lib/resolve.zig",
+        "lib/env.zig",
+        "lib/qnnt.zig",
+        "examples/lidar/scan.zig",
+        "src/topics.zig",
+        "src/ls.zig",
+        "src/cat.zig",
+    }) |src| {
+        const test_mod = b.createModule(.{
+            .root_source_file = b.path(src),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true, // threads and getenv, as above
         });
+
+        // The tools under src/ reach the library through the `qnnt` module the way any
+        // consumer does, so their tests need it wired up; the lib/ files are the library.
+        // src/topics.zig deliberately needs neither -- it touches no network, which is why
+        // its tests are the cheap ones.
+        if (std.mem.startsWith(u8, src, "src/") and !std.mem.eql(u8, src, "src/topics.zig")) {
+            test_mod.linkLibrary(qnnt_lib);
+            test_mod.addImport("qnnt", qnnt_lib_mod);
+            test_mod.addImport("topics", topics_mod);
+            test_mod.addImport("stdout", stdout_mod);
+        }
+
+        const tests = b.addTest(.{ .root_module = test_mod });
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
 
@@ -630,7 +667,12 @@ pub fn build(b: *Build) void {
         // pair above because a round trip needs one clock, not two agreeing ones.
         .{ .name = "qnnt-node-5", .src = "src/node-5.zig", .step = "run-5" },
         .{ .name = "qnnt-node-6", .src = "src/node-6.zig", .step = "run-6" },
+        // Not demo nodes but tools, split the way the shell splits things: one lists, one
+        // moves data. `zig build ls -- --tree` passes arguments through.
+        .{ .name = "qnnt-ls", .src = "src/ls.zig", .step = "ls" },
+        .{ .name = "qnnt-cat", .src = "src/cat.zig", .step = "cat" },
     };
+
 
     for (nodes) |node| {
         const exe_mod = b.createModule(.{
@@ -652,6 +694,8 @@ pub fn build(b: *Build) void {
 
         exe.root_module.linkLibrary(qnnt_lib);
         exe.root_module.addImport("qnnt", qnnt_lib_mod);
+        exe.root_module.addImport("topics", topics_mod);
+        exe.root_module.addImport("stdout", stdout_mod);
 
         b.installArtifact(exe);
 

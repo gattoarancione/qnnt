@@ -462,3 +462,47 @@ test "events are buffered for a poller, not only pushed to a handler" {
     try testing.expectEqual(@as(usize, 0), qnnt.pollEvents(&again).len);
     try testing.expectEqual(@as(u64, 0), qnnt.eventsDropped());
 }
+
+test "listTopics reads back the topics the registry is publishing" {
+    try startNode();
+    defer qnnt.deinit();
+
+    // Two topics, so the test would catch a parser that returns only the first row, and a
+    // name with a slash, since that is what every real topic looks like.
+    try testing.expect(qnnt.runPublisher("test/listed-one", eventSource, 20_000, null));
+    try testing.expect(qnnt.runPublisher("test/listed/two", eventSource, 20_000, null));
+
+    var names: [32][]const u8 = undefined;
+    var buf: [1024]u8 = undefined;
+
+    // Registration is another thread's work, so the listing may be empty for a moment.
+    var found_one = false;
+    var found_two = false;
+    var attempts: usize = 0;
+    while (attempts < 50 and !(found_one and found_two)) : (attempts += 1) {
+        const n = try qnnt.listTopics(&names, &buf);
+        for (names[0..n]) |name| {
+            if (std.mem.eql(u8, name, "test/listed-one")) found_one = true;
+            if (std.mem.eql(u8, name, "test/listed/two")) found_two = true;
+        }
+        if (found_one and found_two) break;
+        qnnt.sleepMs(20);
+    }
+
+    try testing.expect(found_one);
+    try testing.expect(found_two);
+
+    // Only the first column, and nothing from the header or the summary: a row's remaining
+    // columns are addresses and counts, and both bracketing lines start with '#'.
+    const n = try qnnt.listTopics(&names, &buf);
+    for (names[0..n]) |name| {
+        try testing.expect(name.len > 0);
+        try testing.expect(!std.mem.startsWith(u8, name, "#"));
+        try testing.expect(std.mem.indexOfAny(u8, name, " \t") == null);
+        try testing.expect(!std.mem.eql(u8, name, "topic"));
+    }
+
+    // The caller's buffer bounds the answer instead of overrunning it.
+    var tiny: [1][]const u8 = undefined;
+    try testing.expect(try qnnt.listTopics(&tiny, &buf) <= 1);
+}

@@ -812,3 +812,172 @@ Where the work happens. Frames arrive as signals on the GUI thread and are decod
 points accumulate into the revolution being swept, and the item repaints at 30 Hz from the
 last completed one. Repainting per packet would be 750 paints/s of a 28,800-point cloud.
 QML does layout, chrome and controls; the cloud is a QQuickPaintedItem in C++.
+
+--------------------------------------------------------------------------------
+ 12. The console tools: qnnt-ls and qnnt-cat
+--------------------------------------------------------------------------------
+
+Two commands, split the way the shell splits things: one reports on the bus, one moves data
+across it.
+
+    qnnt-ls                     what is published
+    qnnt-cat                    the payloads, in or out
+
+That division is not tidiness. `qnnt-ls` writes a report about data and `qnnt-cat` writes
+data, and the two want different destinations, different formats and different exit
+conditions. One command with a --list flag would have to be two programs wearing one name.
+
+qnnt-ls
+-------
+
+    ./zig-out/bin/qnnt-ls                        every topic, one per line
+    ./zig-out/bin/qnnt-ls 'lidar/*'              only matching topics
+    ./zig-out/bin/qnnt-ls --tree                 grouped by '/' segment
+    ./zig-out/bin/qnnt-ls -n                     numbered, for --subs
+    ./zig-out/bin/qnnt-ls --subs lidar/helios32  who is subscribed
+    ./zig-out/bin/qnnt-ls --subs 3               the same, by its number from -n
+
+    lidar/                      test/
+    └── helios32                ├── bench
+        └── calibration         ├── topic-a
+                                └── topic-b
+
+The trailing slash carries the one distinction a flat list cannot: `lidar/` is not a topic,
+only a prefix shared by others, while `helios32` has no slash even though it has a child --
+it is a real topic AND a parent, which is what the lidar bridge publishes. Roots carry no
+connector, because drawing them as siblings would imply a parent above them that does not
+exist.
+
+`--subs` passes the registry's own answer straight through rather than reformatting it. The
+registry already lays out subscriber, connected and msgs, and its '#' lines carry the part
+that matters most -- whether the publisher has reported at all, which is a different fact
+from having no subscribers.
+
+A `--subs` number is resolved against the listing as it stands at that moment, which is why
+`-n` prints the numbers beside the names it just fetched: a topic registered or expired in
+between shifts every number after it. A name is tried first, so a topic actually called "3"
+still works.
+
+qnnt-cat
+--------
+
+    ./zig-out/bin/qnnt-cat 'lidar/*'                    decoded, to stdout
+    ./zig-out/bin/qnnt-cat --hex test/bench             one hex line per message
+    ./zig-out/bin/qnnt-cat --raw test/bench > cap.bin   the frames, verbatim
+    ./zig-out/bin/qnnt-cat --publish --raw test/bench < cap.bin     replay it, unpaced
+    ./zig-out/bin/qnnt-cat --dump 'lidar/*' > cap.tld   with arrival times and topics
+    ./zig-out/bin/qnnt-cat --restore < cap.tld          replay at the recorded pace
+    ./zig-out/bin/qnnt-cat --restore --throttle 4 < cap.tld     four times faster
+    ./zig-out/bin/qnnt-cat --publish test/notes         each stdin line is a message
+
+    test/bench {"seq":324,"t":1788463155061346,"data":<buffer 6B 000102030405>}
+    lidar/helios32/calibration {"model":"RS-Helios-32","rpm":600,"channels":32,...}
+
+Data goes to stdout and notices to stderr, so a redirect or a pipe carries only the payload.
+`--raw` writes no topic name, no timestamp and no separator, which is what makes the capture
+byte-exact:
+
+    qnnt-cat --max 4 --raw test/bench > cap.bin     # 124 bytes, four frames
+    qnnt-cat --publish --raw test/replay < cap.bin  # byte-identical on the far side
+
+It round-trips with no side-channel because a TLD frame carries its own length --
+`tld.frameSize` returns null while the bytes so far are only a prefix of one -- so a file of
+concatenated frames needs no index. `--hex` round-trips too, and stays hand-editable:
+whitespace between pairs is ignored.
+
+capture and restore: --dump and --restore
+-----------------------------------------
+
+`--raw` records the payloads and nothing else, and two things are missing from "nothing
+else". It does not record when anything arrived, so a replay runs as fast as the pipe
+allows -- a 2 Hz stream comes back in under a millisecond. And it does not record which
+topic each message came from, so a capture over a glob merges several topics into one
+stream that cannot be separated again.
+
+`--dump` wraps each message in a small TLD envelope that carries both, and `--restore`
+reads it back:
+
+    { "t": <arrival time, microseconds>, "topic": "<name>", "data": <the payload> }
+
+    qnnt-cat --dump 'test/topic-*' > cap.tld
+    qnnt-cat --restore < cap.tld                  # same pace, same topics
+    qnnt-cat --restore --throttle 4 < cap.tld     # four times faster
+    qnnt-cat --restore --throttle 0.25 < cap.tld  # four times slower
+    qnnt-cat --restore test/replay < cap.tld      # redirected to one topic
+
+The pair is named for the operation rather than the payload, and that is the point: one flag
+that meant "write envelopes" while reading and "expect envelopes" while publishing was one
+flag with two meanings, which is exactly the thing nobody remembers. `--dump` only exists in
+the reading direction, `--restore` only in the writing one, and `--restore` implies
+publishing -- there is no `--publish --dump` to get the wrong way round.
+
+Restoring needs no topic argument at all: the topics are in the file, and each publisher is
+registered the moment its first message appears on stdin. Give a topic and everything goes
+there instead, still at the recorded pace.
+
+Measured on a 2 Hz publisher, six messages captured and replayed, gaps at the subscriber:
+
+    --raw replay              0.2, 0.0, 0.0, 0.0 ms    as fast as the pipe allows
+    --restore                 500, 487, 513, 501 ms    the recorded cadence
+    --restore --throttle 4    129, 121, 129, 124 ms    a quarter of the period
+    --restore --throttle 0.5  996, 972, 1038 ms        twice the period
+    --dump --throttle 4, then --restore
+                              129, 125, 122, 124 ms    scaled at capture instead
+
+`--throttle` is a period DIVIDER, and it works on both sides: 4 makes every interval a
+quarter as long, so the stream runs four times faster; 0.25 makes each one four times longer.
+On `--dump` it scales the intervals recorded, on `--restore` the intervals waited, and the
+two compose -- dumping at 4 and restoring at 0.25 gives the original pace back. It is exact
+at 1.0 rather than passing through a float, so a dump taken without it carries the arrival
+times it claims to.
+
+An envelope rather than a format of its own, because then a capture is still a stream of
+TLD frames: `frameSize` splits it, `qnnt-cat --hex` reads it, and any language with a TLD
+decoder can too. The timestamp is when the capturing process received the message, which is
+what reproduces the pace actually observed -- a publish time inside someone's payload is
+their schema's business, not the envelope's.
+
+Two honest limits. A restore that cannot keep up says so, reporting how far behind the
+recorded pace it fell, rather than quietly stretching the stream. And a `--raw` capture fed
+to `--restore` is recognised and refused: a payload with its own "t" field would otherwise
+be replayed as though those were timings, which is the kind of wrong that looks like it
+worked.
+
+Four things about it are decisions rather than accidents:
+
+  * TLD or text is chosen when SUBSCRIBING, not when printing, so it cannot be guessed from
+    a topic name -- hence `--text` rather than a heuristic. A TLD frame is length-prefixed
+    and its payload contains 0x0A freely; a text topic is newline-delimited. Read a TLD
+    topic as text and the newlines inside frames split and join them into garbage.
+  * globs read but do not write. A glob matches against the registry's list of topics that
+    EXIST, and publishing is how a topic comes to exist, so a wildcard under `--publish` is
+    refused rather than quietly matching nothing.
+  * `--publish` and `--restore` both take an optional topic -- `--restore test/replay` --
+    and only treat the next argument as one when it does not start with '-', so
+    `--restore --throttle 4` does not swallow the flag. Topics may also be given positionally,
+    which is how one stdin stream fans out to several.
+  * `--publish` waits up to `--wait` ms (default 2000) for a subscriber before starting,
+    because the alternative is silent loss: a publisher with nobody attached has nowhere to
+    put its first messages, and a replay missing its opening frames reads as a corrupt
+    capture rather than a race. `--wait 0` skips it.
+  * `--max` is enforced in the delivery callback, not in the main loop. The main loop sleeps
+    between glob rescans and a 1 kHz topic delivers thousands of messages inside one of
+    those sleeps.
+
+They compose, which was the point of splitting them:
+
+    qnnt-ls 'test/topic-*' | xargs qnnt-cat --text
+
+QUOTE YOUR GLOBS in both. `lidar/*` unquoted is expanded by the shell first, and zsh fails
+the command outright when nothing matches on disk. Note also that `*` crosses '/' here,
+unlike a shell: `lidar/*` matches `lidar/helios32/calibration` too, which is what makes it
+useful on a topic tree.
+
+`zig build ls -- --tree` and `zig build cat -- 'lidar/*'` pass arguments through.
+
+Underneath, discovery is `Qnnt.listTopics` and `Qnnt.registryCommand`: the first asks the
+registry for the same table its `list` command prints and reads back the first column, the
+second sends any command and hands the reply back verbatim. Both live in the library next to
+the code that writes those replies, so a column added or reordered is a local change rather
+than a silent break out here. Glob matching and the tree live in one shared module for the
+same reason: what `qnnt-ls` shows must be exactly what `qnnt-cat` subscribes to.
