@@ -361,6 +361,52 @@ or the other sensor, through the same viewer binary:
     ./zig-out/bin/lidar-sensor helios32
     ./zig-out/bin/lidar-viewer '' lidar/helios32
 
+The viewer draws the same revolution two ways. The segmented toggle at the top right swaps
+between them, and so does the V key:
+
+    bird           top-down and orthographic, z dropped. Rings every 2 m.
+    first person   a pinhole projection from a camera beside the sensor: drag to look,
+                   WASD and Q/E to move, wheel or the slider for field of view, R to reset.
+
+    ./zig-out/bin/lidar-viewer '' lidar/helios32 first-person   # open in perspective
+
+Both are worth having for different reasons. The bird view is the measuring instrument: it
+drops z, so a vertical surface collapses onto one line and any per-channel azimuth error
+shows up as a fan -- which is how the missing horizontal table was caught. The first-person
+view is the one that reads as a place rather than a plot, and it is the only one where the
+32 channels' vertical spread is visible at all.
+
+The projection is a plain pinhole, and it starts 9 m south of the sensor and 2 m up rather
+than at the sensor. That placement is the whole subtlety of the mode, and getting it wrong
+is instructive.
+
+A pinhole camera AT the scanner origin is degenerate. Screen radius comes out as
+focal * tan(angle between the point and the view axis) -- range cancels exactly -- and a
+scan holds exactly one range per direction, so the image is a function of the sampling grid
+and of nothing else. It is not a bad picture of the room; it is not a picture of the room.
+Every point sits where its channel and azimuth put it whatever it hit, which reads on screen
+as curves of evenly spaced points at fixed distances from the centre.
+
+The cheapest way to see this is to flatten the scene: force every range to a constant, which
+throws the geometry away entirely, and reproject. Over one revolution of the fake:
+
+    eye at the sensor origin    flattening moves each point     0.00 px
+    eye 9 m south, 2 m up       flattening moves each point   383.72 px
+
+Zero, exactly, at the origin -- the image cannot depend on the scene. Range is only visible
+through parallax, and parallax needs the eye somewhere the rangefinder is not. Walking back
+to the origin still works, and the viewer says so on screen rather than leaving a degenerate
+projection to be rediscovered as a bug.
+
+Two smaller details. Points behind the near plane are discarded rather than clamped: a
+negative depth would otherwise draw them mirrored in front of the camera. And points off the
+viewport edges are culled before the transform, because most of a 360 degree cloud is
+off-screen at any one time and Qt would clip them only after transforming every one.
+
+"points shown" now means points actually painted, not the size of the revolution -- in the
+bird view with the floor showing those are the same number, and in first person they are
+not.
+
 Both fakes take the same --msop and --difop flags as the bridge, deliberately spelled the
 same way, because the two sides have to agree and a mismatch is invisible: the bridge just
 sits there reporting nothing. If you move one port, move it on both.

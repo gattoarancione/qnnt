@@ -4,8 +4,16 @@
 //   ./zig-out/bin/lidar-sensor          # terminal 1
 //   ./zig-out/bin/lidar-viewer          # terminal 2, from the project root
 //
+//   ./zig-out/bin/lidar-viewer '' lidar/helios32 first-person   # open in perspective
+//
 // The split this demonstrates: the sensor is a Zig node, the display is QML, and neither
 // knows the other's language -- only the topic and the TLD schema.
+//
+// Two projections of the same revolution, swapped with V: a top-down orthographic view that
+// drops z, and a pinhole first-person view from a camera beside the sensor. The first is the
+// better instrument -- dropping z collapses a vertical wall onto one line, so a per-channel
+// azimuth error shows as a fan -- and the second is the one that reads as a place. See
+// kDefaultEye for why the camera must not start at the sensor itself.
 //
 // Where the work happens matters at this rate. 750 frames a second arrive as signals on the
 // GUI thread (the poller inside QnntNode marshals them there), and each is decoded into
@@ -29,6 +37,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 namespace {
@@ -36,6 +45,13 @@ namespace {
 constexpr auto kDefaultTopic = "lidar/rs16";
 
 constexpr int kMaxChannels = 32;
+
+/// One returned sample in sensor-frame metres: x east, y north, z up, the sensor at the
+/// origin. The bird view drops z, which is why it was never carried before; the first-person
+/// view needs all three.
+struct Point3 {
+    float x, y, z;
+};
 
 /// A point cloud is drawn in a few passes, one per surface class, so each pass is a single
 /// drawPoints call with one pen rather than a pen change per point.
@@ -49,15 +65,25 @@ SurfaceClass classify(std::uint8_t intensity) {
 }
 } // namespace
 
-/// The rendered item: a top-down view of the last completed revolution.
+/// The rendered item: the last completed revolution, drawn either from above or from the
+/// sensor's own position.
 class LidarView : public QQuickPaintedItem
 {
     Q_OBJECT
     QML_ELEMENT
     Q_PROPERTY(double metresAcross MEMBER m_metres_across NOTIFY viewChanged)
     Q_PROPERTY(bool showFloor MEMBER m_show_floor NOTIFY viewChanged)
+    Q_PROPERTY(ViewMode viewMode MEMBER m_mode NOTIFY viewChanged)
+    Q_PROPERTY(double fovDeg MEMBER m_fov_deg NOTIFY viewChanged)
+    Q_PROPERTY(double yawDeg READ yawDeg NOTIFY viewChanged)
+    Q_PROPERTY(double pitchDeg READ pitchDeg NOTIFY viewChanged)
+    Q_PROPERTY(QString eyeText READ eyeText NOTIFY viewChanged)
+    Q_PROPERTY(bool atOrigin READ atOrigin NOTIFY viewChanged)
 
 public:
+    enum ViewMode { Bird, FirstPerson };
+    Q_ENUM(ViewMode)
+
     explicit LidarView(QQuickItem* parent = nullptr) : QQuickPaintedItem{parent} {
         setFillColor(QColor{16, 18, 22});
         for (auto& pass : m_display) pass.reserve(16000);
@@ -65,8 +91,8 @@ public:
     }
 
     /// Called from the decoder for every returned sample of the revolution in progress.
-    void addPoint(float x, float y, std::uint8_t intensity) {
-        m_building[classify(intensity)].append(QPointF{x, y});
+    void addPoint(float x, float y, float z, std::uint8_t intensity) {
+        m_building[classify(intensity)].append(Point3{x, y, z});
     }
 
     /// The sweep passed 360 degrees: the revolution being built becomes the one displayed.
@@ -79,8 +105,61 @@ public:
 
     void paint(QPainter* painter) override {
         m_dirty = false;
+        m_drawn = 0;
         painter->setRenderHint(QPainter::Antialiasing, false);
+        if (m_mode == FirstPerson) {
+            paintFirstPerson(painter);
+        } else {
+            paintBird(painter);
+        }
+    }
 
+    /// Look around, in degrees. Pitch stops just short of straight up and down: at exactly
+    /// +/-90 the yaw becomes meaningless and the view spins on the spot.
+    Q_INVOKABLE void look(double d_yaw, double d_pitch) {
+        m_yaw_deg = std::fmod(m_yaw_deg + d_yaw, 360.0);
+        m_pitch_deg = std::clamp(m_pitch_deg + d_pitch, -89.0, 89.0);
+        m_dirty = true;
+        Q_EMIT viewChanged();
+    }
+
+    /// Walk: forward and strafe in the horizontal plane, rise straight up.
+    Q_INVOKABLE void moveBy(double forward, double strafe, double rise = 0.0) {
+        const double yaw = m_yaw_deg * M_PI / 180.0;
+        m_eye.x += static_cast<float>(forward * std::sin(yaw) + strafe * std::cos(yaw));
+        m_eye.y += static_cast<float>(forward * std::cos(yaw) - strafe * std::sin(yaw));
+        m_eye.z += static_cast<float>(rise);
+        m_dirty = true;
+        Q_EMIT viewChanged();
+    }
+
+    Q_INVOKABLE void resetView() {
+        m_eye = kDefaultEye;
+        m_yaw_deg = 0.0;
+        m_pitch_deg = kDefaultPitch;
+        m_dirty = true;
+        Q_EMIT viewChanged();
+    }
+
+    /// True when the eye is close enough to the scanner origin for the perspective to be
+    /// degenerate. Surfaced so the UI can say so: the view does not look broken in a way
+    /// that suggests moving, it looks like a bug.
+    bool atOrigin() const {
+        return std::hypot(std::hypot(m_eye.x, m_eye.y), m_eye.z) < 0.75;
+    }
+
+    double yawDeg() const { return m_yaw_deg < 0 ? m_yaw_deg + 360.0 : m_yaw_deg; }
+    double pitchDeg() const { return m_pitch_deg; }
+
+    QString eyeText() const {
+        return QStringLiteral("%1, %2, %3 m")
+            .arg(static_cast<double>(m_eye.x), 0, 'f', 1)
+            .arg(static_cast<double>(m_eye.y), 0, 'f', 1)
+            .arg(static_cast<double>(m_eye.z), 0, 'f', 1);
+    }
+
+private:
+    void paintBird(QPainter* painter) {
         const double side = std::min(width(), height());
         const double scale = side / m_metres_across; // pixels per metre
         painter->translate(width() / 2.0, height() / 2.0);
@@ -100,16 +179,17 @@ public:
             if (points.isEmpty()) continue;
 
             // Scaled here rather than at decode time: the decoder should not have to know
-            // the zoom, and rescaling 28,800 points is cheaper than the paint itself.
-            QVarLengthArray<QPointF, 1> unused;
-            Q_UNUSED(unused);
+            // the zoom, and rescaling 28,800 points is cheaper than the paint itself. z is
+            // simply dropped, which is what makes this view flatten a vertical wall onto a
+            // single line and so a good test of per-channel azimuth.
             m_scratch.resize(points.size());
             for (qsizetype i = 0; i < points.size(); ++i) {
-                m_scratch[i] = QPointF{points[i].x() * scale, -points[i].y() * scale};
+                m_scratch[i] = QPointF{points[i].x * scale, -points[i].y * scale};
             }
 
             painter->setPen(QPen{colours[pass], pass == kFloor ? 1.0 : 2.0});
             painter->drawPoints(m_scratch.constData(), static_cast<int>(m_scratch.size()));
+            m_drawn += static_cast<int>(m_scratch.size());
         }
 
         // The sensor itself.
@@ -118,19 +198,180 @@ public:
         painter->drawEllipse(QPointF{0, 0}, 4, 4);
     }
 
+public:
     int revolutions() const { return m_revolutions; }
     bool dirty() const { return m_dirty; }
 
-    int displayedPoints() const {
-        int total = 0;
-        for (const auto& pass : m_display) total += static_cast<int>(pass.size());
-        return total;
-    }
+    /// Points actually put on screen by the last paint, not the size of the revolution.
+    /// Those differ once a view can hide some: the floor toggle already made the old count
+    /// an overstatement, and first person shows only what is inside the frustum.
+    int displayedPoints() const { return m_drawn; }
 
 Q_SIGNALS:
     void viewChanged();
 
 private:
+    /// The camera basis for the current yaw and pitch, in the world frame the cloud is in:
+    /// x east, y north, z up.
+    struct Basis {
+        double fx, fy, fz; // forward
+        double rx, ry, rz; // right
+        double ux, uy, uz; // up
+    };
+
+    Basis basis() const {
+        const double yaw = m_yaw_deg * M_PI / 180.0;
+        const double pitch = m_pitch_deg * M_PI / 180.0;
+        const double cy = std::cos(yaw), sy = std::sin(yaw);
+        const double cp = std::cos(pitch), sp = std::sin(pitch);
+
+        Basis b{};
+        b.fx = sy * cp;
+        b.fy = cy * cp;
+        b.fz = sp;
+        // Right is forward turned a quarter turn in the horizontal plane, so it stays level
+        // however far the view pitches.
+        b.rx = cy;
+        b.ry = -sy;
+        b.rz = 0.0;
+        // Up completes the frame as right x forward, which tilts with pitch as it should.
+        b.ux = b.ry * b.fz - b.rz * b.fy;
+        b.uy = b.rz * b.fx - b.rx * b.fz;
+        b.uz = b.rx * b.fy - b.ry * b.fx;
+        return b;
+    }
+
+    /// Anything at or behind this is discarded rather than clamped: a point behind the
+    /// camera has a negative depth and would otherwise be drawn mirrored in front of it.
+    static constexpr double kNear = 0.15;
+
+    /// A pinhole projection: metres to pixels relative to the centre of the item, the
+    /// caller having already translated the painter there.
+    bool project(const Point3& p, const Basis& b, double focal, QPointF& out) const {
+        const double dx = static_cast<double>(p.x) - m_eye.x;
+        const double dy = static_cast<double>(p.y) - m_eye.y;
+        const double dz = static_cast<double>(p.z) - m_eye.z;
+
+        const double depth = dx * b.fx + dy * b.fy + dz * b.fz;
+        if (depth < kNear) return false;
+
+        const double h = dx * b.rx + dy * b.ry + dz * b.rz;
+        const double vv = dx * b.ux + dy * b.uy + dz * b.uz;
+        out = QPointF{h / depth * focal, -vv / depth * focal};
+        return true;
+    }
+
+    void paintFirstPerson(QPainter* painter) {
+        // Horizontal field of view to a focal length in pixels -- off the width, so the
+        // number in the UI is the angle actually spanned left to right, and the vertical
+        // angle follows from the aspect ratio. Halving the FOV doubles the magnification,
+        // which is what a zoom control should feel like.
+        const double half_w = width() / 2.0;
+        const double half_h = height() / 2.0;
+        const double focal = half_w / std::tan(m_fov_deg * M_PI / 360.0);
+        painter->translate(half_w, half_h);
+
+        const Basis b = basis();
+        drawHorizon(painter, b, focal);
+        drawRangeRings(painter, b, focal);
+
+        static const QColor colours[kSurfaceCount]{
+            QColor{70, 80, 95},
+            QColor{120, 190, 255},
+            QColor{255, 200, 90},
+            QColor{255, 90, 120},
+        };
+
+        for (int pass = 0; pass < kSurfaceCount; ++pass) {
+            if (pass == kFloor && !m_show_floor) continue;
+            const auto& points = m_display[pass];
+            if (points.isEmpty()) continue;
+
+            // Compacted rather than resized: points behind the camera or off the edges
+            // leave gaps, and drawPoints takes a count, so only the kept prefix is handed
+            // over. Culling here rather than inside project() because the rings and the
+            // horizon need endpoints off-screen to draw the segment between them -- and
+            // culling at all because half a 360 degree cloud lies behind the viewport
+            // edges, which Qt would clip only after transforming every one of them.
+            m_scratch.resize(points.size());
+            qsizetype kept = 0;
+            for (qsizetype i = 0; i < points.size(); ++i) {
+                QPointF at;
+                if (!project(points[i], b, focal, at)) continue;
+                if (std::abs(at.x()) > half_w + 2.0 || std::abs(at.y()) > half_h + 2.0) {
+                    continue;
+                }
+                m_scratch[kept++] = at;
+            }
+
+            painter->setPen(QPen{colours[pass], pass == kFloor ? 1.0 : 2.0});
+            painter->drawPoints(m_scratch.constData(), static_cast<int>(kept));
+            m_drawn += static_cast<int>(kept);
+        }
+
+        drawCrosshair(painter);
+    }
+
+    /// A plane's vanishing line is straight whatever height the eye is at, so two distant
+    /// points on z = 0 place the horizon; extending the line across the item avoids caring
+    /// which way the view is turned.
+    void drawHorizon(QPainter* painter, const Basis& b, double focal) {
+        const double far = 1.0e5;
+        const double yaw = m_yaw_deg * M_PI / 180.0;
+        // Two directions in the plane, well to either side of straight ahead, so both stay
+        // in front of the camera and well separated whatever the pitch.
+        const Point3 left{static_cast<float>(m_eye.x + far * std::sin(yaw - 0.7)),
+                          static_cast<float>(m_eye.y + far * std::cos(yaw - 0.7)), 0.0f};
+        const Point3 right{static_cast<float>(m_eye.x + far * std::sin(yaw + 0.7)),
+                           static_cast<float>(m_eye.y + far * std::cos(yaw + 0.7)), 0.0f};
+
+        QPointF a, c;
+        if (!project(left, b, focal, a) || !project(right, b, focal, c)) return;
+
+        const QPointF d = c - a;
+        const double len = std::hypot(d.x(), d.y());
+        if (len < 1.0e-6) return;
+        const QPointF unit{d.x() / len, d.y() / len};
+        const double reach = width() + height();
+
+        painter->setPen(QPen{QColor{54, 60, 70}, 1.0});
+        painter->drawLine(a - unit * reach, a + unit * reach);
+    }
+
+    /// The same rings the bird view draws, on the sensor's own horizontal plane. In
+    /// perspective they are the strongest depth cue available -- without them a cloud of
+    /// points has no scale at all.
+    void drawRangeRings(QPainter* painter, const Basis& b, double focal) {
+        painter->setPen(QPen{QColor{40, 44, 52}, 1.0});
+        const int segments = 180;
+
+        for (int m = 2; m <= static_cast<int>(m_metres_across / 2); m += 2) {
+            QPointF prev;
+            bool have_prev = false;
+            for (int i = 0; i <= segments; ++i) {
+                const double t = 2.0 * M_PI * i / segments;
+                const Point3 p{static_cast<float>(m * std::sin(t)),
+                               static_cast<float>(m * std::cos(t)), 0.0f};
+                QPointF at;
+                const bool ok = project(p, b, focal, at);
+                // Only join consecutive points that both projected: a segment straddling
+                // the near plane would otherwise be drawn right across the viewport.
+                if (ok && have_prev) painter->drawLine(prev, at);
+                prev = at;
+                have_prev = ok;
+            }
+        }
+    }
+
+    /// Where the view is pointing. Small, because it is an aiming aid rather than chrome.
+    void drawCrosshair(QPainter* painter) {
+        painter->setPen(QPen{QColor{90, 255, 160, 140}, 1.0});
+        painter->drawLine(QPointF{-7, 0}, QPointF{-2, 0});
+        painter->drawLine(QPointF{2, 0}, QPointF{7, 0});
+        painter->drawLine(QPointF{0, -7}, QPointF{0, -2});
+        painter->drawLine(QPointF{0, 2}, QPointF{0, 7});
+    }
+
     void drawGrid(QPainter* painter, double scale) {
         painter->setPen(QPen{QColor{40, 44, 52}, 1.0});
         for (int m = 2; m <= static_cast<int>(m_metres_across / 2); m += 2) {
@@ -141,13 +382,35 @@ private:
         painter->drawLine(QPointF{0, -height()}, QPointF{0, height()});
     }
 
-    std::array<QList<QPointF>, kSurfaceCount> m_display{};
-    std::array<QList<QPointF>, kSurfaceCount> m_building{};
+    std::array<QList<Point3>, kSurfaceCount> m_display{};
+    std::array<QList<Point3>, kSurfaceCount> m_building{};
     QList<QPointF> m_scratch;
     double m_metres_across = 26.0;
     bool m_show_floor = true;
     int m_revolutions = 0;
     bool m_dirty = false;
+    int m_drawn = 0;
+
+    ViewMode m_mode = Bird;
+    /// Horizontal field of view. 70 degrees reads as neither a fisheye nor a telescope.
+    double m_fov_deg = 70.0;
+    double m_yaw_deg = 0.0;
+    double m_pitch_deg = kDefaultPitch;
+    /// Beside the sensor, not at it, and this is the whole subtlety of the mode.
+    ///
+    /// A pinhole camera AT the scanner origin is degenerate. Screen radius comes out as
+    /// focal * tan(angle between the point and the view axis), with range cancelling
+    /// exactly -- and a scan holds one range per direction, so the image is the angular
+    /// sampling lattice and nothing else: each channel a ring of evenly spaced points, the
+    /// scene invisible. Range only becomes visible through parallax, which needs the eye
+    /// somewhere the rangefinder is not.
+    ///
+    /// 9 m south and 2 m up, looking north over the sensor, puts a 26 m room in frame.
+    static constexpr Point3 kDefaultEye{0.0f, -9.0f, 2.0f};
+    static constexpr double kDefaultPitch = -8.0;
+
+    /// The eye, in sensor-frame metres.
+    Point3 m_eye = kDefaultEye;
 };
 
 /// Owns the subscription, decodes frames, and reports what it is seeing to QML.
@@ -405,8 +668,11 @@ private:
                 const double r = distance_mm / 1000.0;
                 const double elev = m_elevations[static_cast<std::size_t>(ch)] * M_PI / 180.0;
                 const double horizontal = r * std::cos(elev);
+                // z was computed and thrown away while the only view was top-down. The
+                // first-person view needs it, and it costs one multiply per point.
                 m_view->addPoint(static_cast<float>(horizontal * sin_a),
-                                 static_cast<float>(horizontal * cos_a), intensity);
+                                 static_cast<float>(horizontal * cos_a),
+                                 static_cast<float>(r * std::sin(elev)), intensity);
             }
         }
     }
@@ -447,6 +713,7 @@ int main(int argc, char** argv) {
     // Which sensor to view: the topic prefix, defaulting to the RS-LiDAR-16's.
     //   ./lidar-viewer                       -> lidar/rs16
     //   ./lidar-viewer '' lidar/helios32     -> the Helios, same binary
+    //   ./lidar-viewer '' '' first-person    -> open in perspective rather than top-down
     const QString topic = argc > 2 ? QString::fromLocal8Bit(argv[2])
                                    : QString::fromLatin1(kDefaultTopic);
     Sensor sensor{topic};
@@ -473,6 +740,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     sensor.setView(view);
+
+    if (argc > 3 && std::strncmp(argv[3], "first", 5) == 0) {
+        view->setProperty("viewMode", LidarView::FirstPerson);
+    }
 
     if (!sensor.start()) {
         std::printf("lidar-viewer: failed to start the qnnt node\n");
