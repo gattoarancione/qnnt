@@ -1,9 +1,21 @@
 Fake RoboSense LiDAR over TLD
 =============================
 
-examples/lidar/sensor.zig fakes an RS-LiDAR-16 and publishes it as TLD; viewer.cpp plus
-main.qml subscribe and render the point cloud. A Zig sensor feeding a Qt/QML display is the
-split this is meant to show: the data path in the systems language, the presentation in QML.
+Four processes, each doing one job, because that is how this looks with real hardware:
+
+    fake_rs16.zig   pretends to be the device: MSOP and DIFOP over UDP, no qnnt at all
+        |  UDP :6699 (MSOP, 750 packets/s) and :7788 (DIFOP, 1/s)
+    rs16.zig        the driver: RoboSense's wire format in, model-independent scans out
+        |  (a Zig module, imported -- not a process)
+    sensor.zig      the bridge: driver in, TLD frames on a qnnt topic out
+        |  qnnt topic "lidar/rs16"
+    viewer.cpp      Qt/QML: subscribes, decodes, renders the point cloud
+    + main.qml
+
+Replacing the fake with a real RS-LiDAR-16 means pointing the sensor at this host and
+running nothing differently: the driver binds the same port either way. That is the reason
+for the split -- the earlier version of this example generated the scene and packed TLD in
+one process, which demonstrated the transport but not how a driver is actually written.
 
 what is being imitated
 ----------------------
@@ -79,11 +91,47 @@ moves, so a viewer shows something recognisable rather than noise: four walls, t
 and a rectangle that drifts across the floor. Intensity distinguishes wall from pillar from
 floor, so a renderer colouring by intensity separates them.
 
+the driver's honest boundaries
+-----------------------------
+
+What is faithful: the 1248-byte packet as 42-byte header, 12 blocks of 100 bytes, 6-byte
+tail; the 8-byte MSOP magic; the 0xFFEE block flag; big-endian azimuths in hundredths of a
+degree and big-endian distances -- network order, which is the single easiest thing to get
+wrong in this format.
+
+What is NOT verified against a datasheet, and is marked as such in rs16.zig: the offsets of
+the fields inside the 42-byte header beyond the magic and the timestamp, the DIFOP layout
+(the fake's own, not RoboSense's), and whether this model's distance unit is 5 mm or 2.5 mm.
+That last one is `distance_unit_mm` and it scales the whole cloud -- check it before
+pointing this at hardware.
+
+Note also that RS-LiDAR-16 is the first-generation 16-beam unit, with vertical angles in
+uniform 2 degree steps. The Helios family that succeeded it does NOT use uniform spacing,
+which is exactly why the driver prefers the angle table the device sends over DIFOP to the
+one compiled into it. `Calibration.from_device` says which it is using.
+
 running it
 ----------
 
-    zig build lidar                                  # the sensor
+    zig build lidar                                  # fake sensor + bridge
     zig build lidar -Dqt=/path/to/Qt/6.10.3/macos    # and the viewer
 
-    ./zig-out/bin/lidar-sensor                       # terminal 1
-    ./zig-out/bin/lidar-viewer                       # terminal 2
+    ./zig-out/bin/fake-rs16       # terminal 1: the device (or use real hardware)
+    ./zig-out/bin/lidar-sensor    # terminal 2: driver + qnnt publisher
+    ./zig-out/bin/lidar-viewer    # terminal 3: from the project root
+
+What each reports:
+
+    fake-rs16: RS-LiDAR-16 -> 127.0.0.1:6699 (MSOP) and :7788 (DIFOP)
+    fake-rs16: 751 packets/s sent, azimuth 4.8 deg
+
+    lidar-sensor: calibration from the device: 600 rpm, channel 0 at -15.0 deg
+    lidar-sensor: 751 packets/s in, 751 published, 0 malformed, 10 revs, 1550 byte frames
+
+    lidar-viewer: 750 frames/s, 288000 points/s, 38 revolutions, 28661 displayed
+
+`zig build test` includes rs16.zig: a write/parse round trip, refusal of short packets and
+bad magic and bad block flags, no-return staying no-return, and a non-uniform DIFOP angle
+table surviving the trip. A round trip cannot prove the format matches RoboSense's -- only
+hardware settles that -- but it catches the drift that actually happens: an offset changed
+on one side, a flipped endianness, a distance unit edited in one place.

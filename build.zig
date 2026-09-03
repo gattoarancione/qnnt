@@ -83,6 +83,29 @@ pub fn build(b: *Build) void {
     // -Dqt=... and it builds the viewer too, which needs Qt Quick rather than only Core.
     const lidar_step = b.step("lidar", "Build the fake LiDAR sensor, and the viewer with -Dqt=...");
 
+    // The driver is its own module, imported by both the fake sensor and the bridge, so
+    // the MSOP layout has exactly one definition. It depends on nothing from qnnt: a
+    // sensor driver has no business knowing about the transport that carries its output.
+    const rs16_mod = b.createModule(.{
+        .root_source_file = b.path("examples/lidar/rs16.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    // The fake sensor: no qnnt at all, just UDP. It pretends to be hardware.
+    const fake_mod = b.createModule(.{
+        .root_source_file = b.path("examples/lidar/fake_rs16.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    fake_mod.addImport("rs16", rs16_mod);
+    const fake_rs16 = b.addExecutable(.{ .name = "fake-rs16", .root_module = fake_mod });
+    b.installArtifact(fake_rs16);
+    lidar_step.dependOn(&b.addInstallArtifact(fake_rs16, .{}).step);
+
+    // The bridge: driver in, TLD topic out.
     const lidar_mod = b.createModule(.{
         .root_source_file = b.path("examples/lidar/sensor.zig"),
         .target = target,
@@ -90,6 +113,7 @@ pub fn build(b: *Build) void {
         .link_libc = true,
     });
     lidar_mod.addImport("qnnt", qnnt_lib_mod);
+    lidar_mod.addImport("rs16", rs16_mod);
     const lidar_sensor = b.addExecutable(.{ .name = "lidar-sensor", .root_module = lidar_mod });
     lidar_sensor.root_module.linkLibrary(qnnt_lib);
     b.installArtifact(lidar_sensor);
@@ -299,7 +323,9 @@ pub fn build(b: *Build) void {
     // These used to need serialising, because every node contended for one well-known
     // registry port and build steps run in parallel. Each now uses a port of its own
     // (22300 tests, 22301 the C node demo, 22302 Python), so they are independent.
-    for ([_][]const u8{ "lib/tld.zig", "lib/resolve.zig", "lib/env.zig", "lib/qnnt.zig" }) |src| {
+    // examples/lidar/rs16.zig is in here because it is pure wire-format logic with no
+    // qnnt dependency, and the endianness and offsets it pins are exactly what drifts.
+    for ([_][]const u8{ "lib/tld.zig", "lib/resolve.zig", "lib/env.zig", "lib/qnnt.zig", "examples/lidar/rs16.zig" }) |src| {
         const tests = b.addTest(.{
             .root_module = b.createModule(.{
                 .root_source_file = b.path(src),

@@ -761,16 +761,23 @@ is what keeps seq 1 the first sample anybody sees.
 A fake LiDAR, and a QML view of it
 ----------------------------------
 
-examples/lidar/ is a fake RS-LiDAR-16 publishing at the rate a real one transmits, and a
-Qt/QML viewer that renders the point cloud. A Zig sensor feeding a QML display, neither
-knowing the other's language -- only the topic and the schema. examples/lidar/SCHEMA.txt has
-the packet layout and the reasoning behind it.
+examples/lidar/ is four pieces in the shape real hardware forces:
 
-    zig build lidar                                  # the sensor
+    fake-rs16      pretends to be the device -- MSOP and DIFOP over UDP, no qnnt in it
+    rs16.zig       the driver module: RoboSense's wire format in, model-independent out
+    lidar-sensor   the bridge: driver in, TLD on a qnnt topic out
+    lidar-viewer   Qt/QML: subscribes and renders the cloud
+
+Swapping the fake for a real RS-LiDAR-16 means pointing the sensor at this host. Nothing
+else changes -- the driver binds the same port either way. examples/lidar/SCHEMA.txt has the
+packet layout, and is explicit about which parts are datasheet-faithful and which are not.
+
+    zig build lidar                                  # fake sensor + bridge
     zig build lidar -Dqt=/Users/you/Qt/6.10.3/macos   # and the viewer
 
-    ./zig-out/bin/lidar-sensor                       # terminal 1
-    ./zig-out/bin/lidar-viewer                       # terminal 2, from the project root
+    ./zig-out/bin/fake-rs16                          # terminal 1: the device
+    ./zig-out/bin/lidar-sensor                       # terminal 2: driver + publisher
+    ./zig-out/bin/lidar-viewer                       # terminal 3, from the project root
 
 The rate is the datasheet's, not a convenient fraction of it: 600 rpm, 12 blocks per packet,
 32 samples per block, so 750 packets/s and 288,000 points/s. Both ends report it:
