@@ -116,7 +116,8 @@ A block's 32 samples are firing 0 (channels 0..15) at `azimuth_cdeg`, then firin
     y = r * cos(elev) * cos(azim)
     z = r * sin(elev)
 
-distance_mm of 0 means no return -- absorbed, out of range, or sky -- and must be skipped
+distance_mm of 0 means no return -- absorbed, sky, outside the model's rated window, or
+past the 65.535 m a u16 of millimetres can hold -- and must be skipped
 rather than plotted at the origin.
 
 the scene
@@ -136,10 +137,8 @@ degree and big-endian distances -- network order, which is the single easiest th
 wrong in this format.
 
 What is NOT verified against a datasheet, and is marked as such in rs16.zig: the offsets of
-the fields inside the 42-byte header beyond the magic and the timestamp, the DIFOP layout
-(the fake's own, not RoboSense's), and whether this model's distance unit is 5 mm or 2.5 mm.
-That last one is `distance_unit_mm` and it scales the whole cloud -- check it before
-pointing this at hardware.
+the fields inside the 42-byte header beyond the magic and the timestamp, and the DIFOP
+layout (the fake's own, not RoboSense's). The distance unit IS now settled -- see below.
 
 The Helios driver is now verified against a real RS-Helios-32, and most of what had been
 guessed was wrong. What a live unit at 192.168.3.221 actually sends:
@@ -171,10 +170,42 @@ Two things the measurements changed beyond constants:
     so the driver treats anything before 2020 as unset and falls back to the host clock:
     otherwise a consumer measuring latency against it would be seven years out rather than
     obviously unsynchronised.
-  * the distance unit remains 2.5 mm, now with supporting rather than conclusive evidence.
-    The largest count seen in a revolution was 10,834, which is 27 m at 2.5 mm and 54 m at
-    5 mm, and 63% of returns fell under 5 m at 2.5 mm. Both are physically possible; the
-    2.5 mm reading matches an indoor scene and the documented figure for the family.
+  * the distance unit is 2.5 mm. This was the last circumstantial figure and it is now
+    settled against RoboSense's own driver rather than inferred from the scene: rs_driver's
+    decoder_RSHELIOS.hpp initialises DISTANCE_RES to 0.0025f, where decoder_RS16.hpp and
+    decoder_RS32.hpp both use 0.005f. The earlier hardware evidence agreed but could not
+    prove it -- the largest count in a revolution was 10,834, which is 27 m at 2.5 mm and
+    54 m at 5 mm, and both were physically possible for the room.
+
+That same file settles the rest of the layout, and it agrees with every constant the
+packet capture had already forced: msop len 1248, a 4-byte MSOP id of 55 AA 05 5A, an
+8-byte DIFOP id, block id FF EE, 12 blocks of 32 channels, and a header of id[4] +
+protocol_version[2] + reserved[14] before a 10-byte UTC timestamp -- which puts the
+timestamp at offset 20 and makes the header 42 bytes, then 4 bytes of index and a 2-byte
+tail to reach 1248. Two independent routes to the same numbers is the strongest form this
+gets without RoboSense's protocol document.
+
+The drivers now apply the same rated window rs_driver does, rather than passing everything
+a count can express: 0.1 to 180 m for the Helios, 0.4 to 230 m for the RS16, from the same
+const params as the distance unit. Anything outside becomes 0, the no-return sentinel that
+`resolve` already skips, so near-field noise and impossible long returns stop reaching the
+cloud. The rule is in one place -- `scan.sampleDistanceMm` -- and each driver passes its own
+numbers, because the window differs per model while the logic does not.
+
+Two things about that window are worth knowing:
+
+  * a `Sample` holds millimetres in a u16, so it tops out at 65.535 m -- below both rated
+    maxima, which makes the representation and not the sensor the binding limit outdoors.
+    The Helios' 180 m never binds at all, since 65,535 counts at 2.5 mm is only 163.8 m.
+    Returns past 65.535 m are now dropped rather than clamped: the old code pinned them to
+    exactly 65535, which draws a point at a range the sensor never reported, and a
+    fabricated point is worse than a missing one. Widening the field would be a wire-format
+    change -- sensor.zig packs each sample as u16 + u8 and viewer.cpp unpacks it that way.
+  * neither fake can exercise any of this. The nearest return either scene can produce is
+    the floor under the steepest downward beam, 1.0 m / sin(49.59 deg) = 1.31 m, which is
+    comfortably inside both windows. So the window is covered by unit tests over raw counts
+    and not by running the example -- the same shape of blind spot as the mid-packet azimuth
+    wrap the fakes hid, and worth remembering before trusting a green pipeline here.
 
 That asymmetry between the drivers is deliberate. The RS-LiDAR-16's uniform 2 degree
 spacing IS its published table, so its default is trustworthy. The Helios has no single

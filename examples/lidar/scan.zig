@@ -20,10 +20,36 @@ pub const samples_per_block = 32;
 pub const max_channels = 32;
 
 pub const Sample = struct {
-    /// Millimetres. 0 means no return -- absorbed, out of range, or sky. Never plot it.
+    /// Millimetres. 0 means no return -- absorbed, past the sensor's rated range, or sky.
+    /// Never plot it. See `sampleDistanceMm` for what else lands here.
     distance_mm: u16,
     intensity: u8,
 };
+
+/// The largest range a `Sample` can carry, since it holds millimetres in a u16. This is
+/// below both models' rated maxima -- 180 m for the Helios, 230 m for the RS16 -- so it,
+/// not the sensor, is the binding limit outdoors. Widening the field is a wire-format
+/// change: sensor.zig packs each sample as u16 + u8 and viewer.cpp unpacks it that way.
+pub const representable_max_mm = 65535;
+
+/// One raw count converted to the millimetres a `Sample` carries, applying the model's
+/// rated measurement window. The window comes from RoboSense's own rs_driver, which
+/// discards returns outside it before they ever reach a cloud, and the drivers here now
+/// agree rather than passing near-field noise and impossible long returns downstream.
+///
+/// Everything rejected becomes 0, the no-return sentinel `resolve` already skips. That
+/// includes a return the sensor measured but this representation cannot hold: dropping it
+/// is deliberate, because clamping -- which is what this code used to do -- draws a point
+/// at 65.535 m that the sensor never reported, and a fabricated point is worse than a
+/// missing one.
+pub fn sampleDistanceMm(counts: u16, unit_mm: f32, min_mm: u32, max_mm: u32) u16 {
+    if (counts == 0) return 0; // the sensor's own no-return
+    const mm = @as(f32, @floatFromInt(counts)) * unit_mm;
+    if (mm < @as(f32, @floatFromInt(min_mm))) return 0;
+    if (mm > @as(f32, @floatFromInt(max_mm))) return 0;
+    if (mm > @as(f32, @floatFromInt(representable_max_mm))) return 0;
+    return @intFromFloat(mm);
+}
 
 pub const Block = struct {
     /// Hundredths of a degree, 0..35999. The azimuth of the block's first firing.

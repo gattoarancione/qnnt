@@ -13,11 +13,9 @@
 //! Fidelity, stated plainly. The packet structure is faithful: 1248 bytes as 42-byte
 //! header, 12 blocks of 100 bytes, 6-byte tail; each block a 0xFFEE flag, a big-endian
 //! azimuth in hundredths of a degree, then 32 channels of big-endian distance and one
-//! intensity byte. The 8-byte MSOP magic is faithful. What is NOT verified against a
-//! datasheet: the exact offsets of the fields inside the 42-byte header beyond the magic
-//! and the timestamp, and whether this model's distance unit is 5 mm or 2.5 mm -- the
-//! constant is named `distance_unit_mm` and is the one number to check before pointing
-//! this at real hardware.
+//! intensity byte. The 8-byte MSOP magic is faithful. The distance unit is confirmed at
+//! 5 mm against RoboSense's rs_driver. What is NOT verified against a datasheet: the exact
+//! offsets of the fields inside the 42-byte header beyond the magic and the timestamp.
 
 const std = @import("std");
 const scan = @import("scan");
@@ -44,9 +42,17 @@ pub const sample_len = 3; // u16 distance (big endian) + u8 intensity
 /// 0.2 degrees, in hundredths, between the two firings of a block.
 pub const azimuth_step_cdeg = 20;
 
-/// One distance count. The datasheet figure to verify per model: RS-LiDAR-16 is documented
-/// at 5 mm, and some RoboSense models use 2.5 mm. Getting it wrong scales the whole cloud.
+/// 5 mm per count, confirmed against RoboSense's own rs_driver: decoder_RS16.hpp (and
+/// decoder_RS32.hpp) initialise DISTANCE_RES to 0.005f, where the Helios uses 0.0025f.
+/// Getting it wrong scales the whole cloud, so the per-model difference is deliberate.
 pub const distance_unit_mm: f32 = 5.0;
+
+/// The rated measurement window, 0.4 to 230 m, from the same rs_driver const params as the
+/// unit above. Returns outside it are reported as no-return. Both ends bind on this model:
+/// counts 1..79 fall under the minimum, and counts above 46,000 exceed the maximum, which
+/// a u16 of counts at 5 mm can reach.
+pub const distance_min_mm: u32 = 400;
+pub const distance_max_mm: u32 = 230_000;
 
 pub const msop_magic = [8]u8{ 0x55, 0xAA, 0x05, 0x0A, 0x5A, 0xA5, 0x50, 0xA0 };
 pub const difop_magic = [8]u8{ 0xA5, 0xFF, 0x00, 0x5A, 0x11, 0x11, 0x55, 0x55 };
@@ -129,9 +135,13 @@ pub fn parseMsop(bytes: []const u8, seq: u64, received_us: u64) ParseError!Scan 
         for (0..samples_per_block) |i| {
             const s = raw[4 + i * sample_len ..][0..sample_len];
             const counts = std.mem.readInt(u16, s[0..2], .big);
-            const mm = @as(f32, @floatFromInt(counts)) * distance_unit_mm;
             out.blocks[b].samples[i] = .{
-                .distance_mm = if (counts == 0) 0 else @intFromFloat(@min(mm, 65535.0)),
+                .distance_mm = scan.sampleDistanceMm(
+                    counts,
+                    distance_unit_mm,
+                    distance_min_mm,
+                    distance_max_mm,
+                ),
                 .intensity = s[2],
             };
         }
@@ -261,9 +271,13 @@ test "an MSOP packet survives a write and a parse" {
     for (&blocks, 0..) |*block, b| {
         block.azimuth_cdeg = @intCast(b * azimuth_step_cdeg * firings_per_block);
         for (&block.samples, 0..) |*sample, i| {
-            // Multiples of the distance unit, so the count conversion is exact both ways.
+            // Multiples of the distance unit, so the count conversion is exact both
+            // ways, and offset past `distance_min_mm`: the driver now drops anything
+            // inside the sensor's blind zone, so a fixture that started at 5 mm was
+            // testing a range this model cannot measure.
             sample.* = .{
-                .distance_mm = @intCast((b * 32 + i) * @as(usize, @intFromFloat(distance_unit_mm))),
+                .distance_mm = @intCast(distance_min_mm +
+                    (b * 32 + i) * @as(usize, @intFromFloat(distance_unit_mm))),
                 .intensity = @intCast((b * 32 + i) % 256),
             };
         }
@@ -310,14 +324,53 @@ test "a malformed packet is refused rather than misread" {
 test "no return stays no return, rather than becoming a point at the sensor" {
     var blocks: [blocks_per_packet]Block = std.mem.zeroes([blocks_per_packet]Block);
     blocks[0].samples[0] = .{ .distance_mm = 0, .intensity = 0 };
-    blocks[0].samples[1] = .{ .distance_mm = 5, .intensity = 42 };
+    // The nearest measurable return rather than one count: the point of this test is that
+    // a real short return is not mistaken for no-return, and a one-count return is now
+    // dropped for being inside the blind zone, which would pass for the wrong reason.
+    blocks[0].samples[1] = .{ .distance_mm = distance_min_mm, .intensity = 42 };
 
     var packet: [msop_packet_len]u8 = undefined;
     writeMsop(&packet, &blocks, 0);
     const parsed = try parseMsop(&packet, 0, 0);
 
     try testing.expectEqual(@as(u16, 0), parsed.blocks[0].samples[0].distance_mm);
-    try testing.expectEqual(@as(u16, 5), parsed.blocks[0].samples[1].distance_mm);
+    try testing.expectEqual(@as(u16, distance_min_mm), parsed.blocks[0].samples[1].distance_mm);
+}
+
+test "returns outside the rated window are dropped, not clamped into the cloud" {
+    // Counts either side of 0.4 m and 230 m, the window rs_driver enforces. Written as raw
+    // counts rather than through writeMsop, because that writer takes millimetres from a
+    // u16 and so cannot express a return past 65.535 m at all. The writer is deliberately
+    // left permissive: it stands in for a sensor, which is free to put any count on the
+    // wire, and enforcing the window is the driver's job -- which is what this pins.
+    var packet: [msop_packet_len]u8 = std.mem.zeroes([msop_packet_len]u8);
+    @memcpy(packet[0..msop_magic.len], &msop_magic);
+    // Every block needs its flag or the parser rejects the packet before reaching the
+    // sample under test.
+    for (0..blocks_per_packet) |b| {
+        const blk = packet[msop_header_len + b * block_len ..][0..block_len];
+        @memcpy(blk[0..2], &block_flag);
+    }
+
+    const cases = [_]struct { counts: u16, want: u16 }{
+        .{ .counts = 0, .want = 0 }, // the sensor's own no-return
+        .{ .counts = 79, .want = 0 }, // 395 mm, inside the blind zone
+        .{ .counts = 80, .want = 400 }, // 400 mm, the nearest rated return
+        .{ .counts = 13_107, .want = 65_535 }, // 65.535 m, the last representable range
+        .{ .counts = 13_108, .want = 0 }, // 65.540 m: measurable, but a u16 of mm cannot
+        .{ .counts = 46_001, .want = 0 }, // 230.005 m, past the rated maximum
+    };
+
+    for (cases, 0..) |c, i| {
+        const block = packet[msop_header_len..][0..block_len];
+        std.mem.writeInt(u16, block[4..][0..2], c.counts, .big);
+
+        const parsed = try parseMsop(&packet, 0, 0);
+        testing.expectEqual(c.want, parsed.blocks[0].samples[0].distance_mm) catch |e| {
+            std.debug.print("case {d}: {d} counts\n", .{ i, c.counts });
+            return e;
+        };
+    }
 }
 
 test "DIFOP carries the calibration a driver should prefer over its own table" {

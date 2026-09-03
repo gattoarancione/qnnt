@@ -31,11 +31,8 @@
 //!     `Calibration.from_device` starts false and `angles_are_placeholder` says so loudly.
 //!     Read them from the device over DIFOP, which is what the real driver does and what
 //!     this one does.
-//!   * the exact field offsets inside the 32-byte header beyond the magic and the
-//!     timestamp, and the DIFOP layout, which is this directory's own rather than
-//!     RoboSense's.
-//!   * whether a given unit is 2.5 mm or 5 mm per count. `distance_unit_mm` is one
-//!     constant and it scales the entire cloud.
+//!   * the DIFOP layout beyond the magic, the rpm and the angle table, which is this
+//!     directory's own rather than RoboSense's.
 //!
 //! Point it at real hardware and the angle table arrives from the sensor within a second.
 //! Point it at the fake next door and the fake supplies a plausible non-uniform table so
@@ -64,8 +61,17 @@ pub const sample_len = 3;
 /// now covers one azimuth rather than two.
 pub const azimuth_step_cdeg = 20;
 
-/// 2.5 mm per count. The figure to check per unit; see the header note.
+/// 2.5 mm per count, confirmed against RoboSense's own rs_driver: decoder_RSHELIOS.hpp
+/// initialises DISTANCE_RES to 0.0025f, against 0.005f for the RS16 and RS32. It scales
+/// the entire cloud, so it is worth knowing this one is not a guess.
 pub const distance_unit_mm: f32 = 2.5;
+
+/// The rated measurement window, 0.1 to 180 m, from the same rs_driver const params as the
+/// unit above. Returns outside it are reported as no-return. Note the maximum never binds
+/// here: a u16 of counts at 2.5 mm tops out at 163.8 m, and `scan.representable_max_mm`
+/// binds well before either. The minimum does bind -- counts 1..39 are below it.
+pub const distance_min_mm: u32 = 100;
+pub const distance_max_mm: u32 = 180_000;
 
 /// Four bytes, measured. An earlier guess extended it to eight, which would have rejected
 /// every real packet.
@@ -151,10 +157,16 @@ pub fn parseMsop(bytes: []const u8, seq: u64, received_us: u64) ParseError!scan.
             const s = raw[4 + i * sample_len ..][0..sample_len];
             const counts = std.mem.readInt(u16, s[0..2], .big);
             // The unit differs from the first generation, which is why this is not shared
-            // code: the same count means a different range.
-            const mm = @as(f32, @floatFromInt(counts)) * distance_unit_mm;
+            // code: the same count means a different range. The windowing rule that
+            // follows it IS shared, so it lives in scan.zig and is passed this model's
+            // numbers.
             out.blocks[b].samples[i] = .{
-                .distance_mm = if (counts == 0) 0 else @intFromFloat(@min(mm, 65535.0)),
+                .distance_mm = scan.sampleDistanceMm(
+                    counts,
+                    distance_unit_mm,
+                    distance_min_mm,
+                    distance_max_mm,
+                ),
                 .intensity = s[2],
             };
         }
@@ -297,7 +309,9 @@ test "a Helios MSOP packet survives a write and a parse" {
         for (&block.samples, 0..) |*sample, i| {
             // Multiples of 5 so the 2.5 mm unit divides exactly in both directions.
             sample.* = .{
-                .distance_mm = @intCast((b * 32 + i) * 5),
+                // Past `distance_min_mm`, which the driver now enforces, and a multiple
+                // of 5 mm so it survives the 2.5 mm count conversion exactly.
+                .distance_mm = @intCast(distance_min_mm + (b * 32 + i) * 5),
                 .intensity = @intCast((b * 32 + i) % 256),
             };
         }
@@ -409,4 +423,40 @@ test "a device clock that was never set is not passed off as a timestamp" {
     writeMsop(&packet, &blocks, 1_800_000_000_000_000); // a device that is synchronised
     const fresh = try parseMsop(&packet, 0, 99_000_000);
     try testing.expectEqual(@as(u64, 1_800_000_000_000_000), fresh.t_us);
+}
+
+test "returns outside the rated window are dropped, not clamped into the cloud" {
+    // Counts either side of the 0.1 m minimum and the representable ceiling. Written as
+    // raw counts rather than through writeMsop, because that writer takes millimetres from
+    // a u16 and so cannot express a return past 65.535 m at all. The writer is deliberately
+    // left permissive: it stands in for a sensor, which is free to put any count on the
+    // wire, and enforcing the window is the driver's job -- which is what this pins.
+    var packet: [msop_packet_len]u8 = std.mem.zeroes([msop_packet_len]u8);
+    @memcpy(packet[0..msop_magic.len], &msop_magic);
+    for (0..blocks_per_packet) |b| {
+        const blk = packet[msop_header_len + b * block_len ..][0..block_len];
+        @memcpy(blk[0..2], &block_flag);
+    }
+
+    const cases = [_]struct { counts: u16, want: u16 }{
+        .{ .counts = 0, .want = 0 }, // the sensor's own no-return
+        .{ .counts = 39, .want = 0 }, // 97.5 mm, inside the blind zone
+        .{ .counts = 40, .want = 100 }, // 100 mm, the nearest rated return
+        .{ .counts = 26_214, .want = 65_535 }, // 65.535 m, the last representable range
+        .{ .counts = 26_215, .want = 0 }, // 65.5375 m: measurable, but a u16 of mm cannot
+        // 163.8 m, all a u16 of 2.5 mm counts can express -- which is why this model's
+        // rated 180 m maximum never binds, and the representation is the real ceiling.
+        .{ .counts = 65_535, .want = 0 },
+    };
+
+    for (cases, 0..) |c, i| {
+        const block = packet[msop_header_len..][0..block_len];
+        std.mem.writeInt(u16, block[4..][0..2], c.counts, .big);
+
+        const parsed = try parseMsop(&packet, 0, 0);
+        testing.expectEqual(c.want, parsed.blocks[0].samples[0].distance_mm) catch |e| {
+            std.debug.print("case {d}: {d} counts\n", .{ i, c.counts });
+            return e;
+        };
+    }
 }
