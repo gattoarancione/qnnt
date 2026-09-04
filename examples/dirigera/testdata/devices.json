@@ -1,0 +1,859 @@
+[
+ {
+  "id": "beb79d77-9bc0-4820-fa3a-d2a23859c392",
+  "type": "light",
+  "deviceType": "light",
+  "createdAt": "2025-04-13T02:04:58.000Z",
+  "isReachable": true,
+  "lastSeen": "2026-09-04T18:33:04.000Z",
+  "attributes": {
+   "customName": "Hall light",
+   "model": "TRADFRI bulb E27 WS globe 1055lm",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "3.0.23",
+   "hardwareVersion": "1",
+   "serialNumber": "cf8df230a587a72d",
+   "productCode": "LED2201G8",
+   "isOn": false,
+   "startupOnOff": "startOn",
+   "lightLevel": 70,
+   "startUpCurrentLevel": -1,
+   "colorTemperature": 1721,
+   "colorTemperatureMin": 4000,
+   "colorTemperatureMax": 2202,
+   "startupTemperature": -1,
+   "colorMode": "temperature",
+   "identifyStarted": "2000-01-01T00:00:00.000Z",
+   "identifyPeriod": 0,
+   "permittingJoin": false,
+   "otaStatus": "upToDate",
+   "otaState": "readyToCheck",
+   "otaProgress": 0,
+   "otaPolicy": "autoUpdate",
+   "otaScheduleStart": "00:00",
+   "otaScheduleEnd": "00:00",
+   "deviceOnBehavior": {
+    "behavior": "adaptiveProfile",
+    "profileId": "0ba2361f-cb30-439e-93ca-d5f00b8b8f8b"
+   }
+  },
+  "capabilities": {
+   "canSend": [],
+   "canReceive": [
+    "customName",
+    "isOn",
+    "lightLevel",
+    "colorTemperature"
+   ]
+  },
+  "room": {
+   "id": "e7251923-68b3-6d95-5fe2-64319aa4cbc5",
+   "name": "Room A",
+   "color": "ikea_beige_1",
+   "icon": "rooms_band_aid"
+  },
+  "deviceSet": [],
+  "remoteLinks": [
+   "ac4db241-dcca-432a-9b17-e526c3989900_1",
+   "1f7d9dee-1893-4058-ae1f-e838e35cbf9b_1"
+  ],
+  "isHidden": false,
+  "adaptiveProfile": {
+   "id": "0ba2361f-cb30-439e-93ca-d5f00b8b8f8b",
+   "active": true
+  }
+ },
+ {
+  "id": "74a7290a-ff81-3a6e-ab3e-4e6bdc1b0f34",
+  "type": "controller",
+  "deviceType": "lightController",
+  "createdAt": "2025-04-25T12:42:45.000Z",
+  "isReachable": true,
+  "lastSeen": "2026-09-04T16:22:42.000Z",
+  "attributes": {
+   "customName": "Remote A",
+   "model": "TRADFRI remote control",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "24.4.5",
+   "hardwareVersion": "1",
+   "serialNumber": "158052408f7ab017",
+   "productCode": "E1810",
+   "batteryPercentage": 90,
+   "isOn": false,
+   "lightLevel": 1,
+   "permittingJoin": false,
+   "otaStatus": "upToDate",
+   "otaState": "readyToCheck",
+   "otaProgress": 0,
+   "otaPolicy": "autoUpdate",
+   "otaScheduleStart": "00:00",
+   "otaScheduleEnd": "00:00",
+   "circadianPresets": []
+  },
+  "capabilities": {
+   "canSend": [
+    "isOn",
+    "lightLevel"
+   ],
+   "canReceive": [
+    "customName"
+   ]
+  },
+  "room": {
+   "id": "236dc9e2-e15f-cbb0-7ca0-bcfb2ec8a640",
+   "name": "Room B",
+   "color": "ikea_yellow_no_24",
+   "icon": "rooms_bed"
+  },
+  "deviceSet": [],
+  "remoteLinks": [],
+  "isHidden": false
+ },
+ {
+  "id": "5443a350-10c0-8fa3-5888-b897f3f1360d",
+  "type": "controller",
+  "deviceType": "lightController",
+  "createdAt": "2025-04-12T12:17:02.000Z",
+  "isReachable": true,
+  "lastSeen": "2026-09-04T00:31:46.000Z",
+  "attributes": {
+   "customName": "Remote B",
+   "model": "Remote Control N2",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "2.4.17",
+   "hardwareVersion": "1",
+   "serialNumber": "3bbfec3abcac5473",
+   "productCode": "E2313",
+   "batteryPercentage": 100,
+   "isOn": false,
+   "lightLevel": 1,
+   "permittingJoin": false,
+   "otaStatus": "upToDate",
+   "otaState": "readyToCheck",
+   "otaProgress": 0,
+   "otaPolicy": "autoUpdate",
+   "otaScheduleStart": "00:00",
+   "otaScheduleEnd": "00:00",
+   "circadianPresets": []
+  },
+  "capabilities": {
+   "canSend": [
+    "isOn",
+    "lightLevel"
+   ],
+   "canReceive": [
+    "customName"
+   ]
+  },
+  "room": {
+   "id": "ed9e33e4-35c6-b3d8-b4d6-88a8b09fd388",
+   "name": "Room C",
+   "color": "ikea_yellow_no_31",
+   "icon": "rooms_door"
+  },
+  "deviceSet": [],
+  "remoteLinks": [],
+  "isHidden": false
+ },
+ {
+  "id": "0b56fb70-f52d-8a88-be1e-c4866770c327",
+  "relationId": "1c68153b-8fc1-64bc-683c-7623b1966090",
+  "type": "sensor",
+  "deviceType": "motionSensor",
+  "createdAt": "2025-04-12T12:42:22.000Z",
+  "isReachable": true,
+  "lastSeen": "2026-09-04T17:29:23.000Z",
+  "attributes": {
+   "customName": "Motion A",
+   "model": "VALLHORN Wireless Motion Sensor",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "1.0.64",
+   "hardwareVersion": "1",
+   "serialNumber": "348630037f224c41",
+   "productCode": "E2134",
+   "batteryPercentage": 100,
+   "isOn": false,
+   "motionDetectedDelay": 20,
+   "isDetected": false,
+   "identifyStarted": "2000-01-01T00:00:00.000Z",
+   "identifyPeriod": 0,
+   "permittingJoin": false,
+   "sensorConfig": {
+    "scheduleOn": false,
+    "onDuration": 60
+   },
+   "circadianPresets": []
+  },
+  "capabilities": {
+   "canSend": [],
+   "canReceive": [
+    "customName"
+   ]
+  },
+  "room": {
+   "id": "ed9e33e4-35c6-b3d8-b4d6-88a8b09fd388",
+   "name": "Room C",
+   "color": "ikea_yellow_no_31",
+   "icon": "rooms_door"
+  },
+  "deviceSet": [],
+  "remoteLinks": [],
+  "isHidden": false
+ },
+ {
+  "id": "52b841f2-530e-fcd9-7508-e63aecbd404a",
+  "relationId": "1c68153b-8fc1-64bc-683c-7623b1966090",
+  "type": "unknown",
+  "deviceType": "lightSensor",
+  "createdAt": "2025-04-12T12:42:22.000Z",
+  "isReachable": true,
+  "lastSeen": "2026-09-04T17:29:23.000Z",
+  "attributes": {
+   "customName": "",
+   "model": "VALLHORN Wireless Motion Sensor",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "1.0.64",
+   "hardwareVersion": "1",
+   "serialNumber": "348630037f224c41",
+   "productCode": "E2134",
+   "illuminance": 0,
+   "identifyStarted": "2000-01-01T00:00:00.000Z",
+   "identifyPeriod": 0,
+   "permittingJoin": false
+  },
+  "capabilities": {
+   "canSend": [],
+   "canReceive": [
+    "customName"
+   ]
+  },
+  "deviceSet": [],
+  "remoteLinks": [],
+  "isHidden": false
+ },
+ {
+  "id": "eba094ef-7904-7450-1a1a-c9e25a6b4d7c",
+  "type": "controller",
+  "deviceType": "lightController",
+  "createdAt": "2025-04-13T15:32:22.000Z",
+  "isReachable": true,
+  "lastSeen": "2026-09-04T08:28:11.000Z",
+  "attributes": {
+   "customName": "Remote C",
+   "model": "Remote Control N2",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "2.4.16",
+   "hardwareVersion": "1",
+   "serialNumber": "2f7c84e51d047071",
+   "productCode": "E2002",
+   "batteryPercentage": 100,
+   "isOn": false,
+   "lightLevel": 1,
+   "permittingJoin": false,
+   "otaStatus": "upToDate",
+   "otaState": "readyToCheck",
+   "otaProgress": 0,
+   "otaPolicy": "autoUpdate",
+   "otaScheduleStart": "00:00",
+   "otaScheduleEnd": "00:00",
+   "circadianPresets": []
+  },
+  "capabilities": {
+   "canSend": [
+    "isOn",
+    "lightLevel"
+   ],
+   "canReceive": [
+    "customName"
+   ]
+  },
+  "room": {
+   "id": "a6f4e309-c96b-a9ac-17db-2ba15088c606",
+   "name": "Room D",
+   "color": "ikea_green_no_65",
+   "icon": "rooms_sofa"
+  },
+  "deviceSet": [],
+  "remoteLinks": [],
+  "isHidden": false
+ },
+ {
+  "id": "f689fb46-bd9a-88ce-ef3f-8dfa57d06a99",
+  "relationId": "06ff3668-34da-335d-97d2-566c356022ce",
+  "type": "sensor",
+  "deviceType": "motionSensor",
+  "createdAt": "2025-04-12T12:20:52.000Z",
+  "isReachable": true,
+  "lastSeen": "2026-09-04T17:34:04.000Z",
+  "attributes": {
+   "customName": "Motion B",
+   "model": "VALLHORN Wireless Motion Sensor",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "1.0.64",
+   "hardwareVersion": "1",
+   "serialNumber": "b2d76eabe2b6cd80",
+   "productCode": "E2134",
+   "batteryPercentage": 99,
+   "isOn": false,
+   "motionDetectedDelay": 20,
+   "isDetected": false,
+   "identifyStarted": "2000-01-01T00:00:00.000Z",
+   "identifyPeriod": 0,
+   "permittingJoin": false,
+   "sensorConfig": {
+    "scheduleOn": false,
+    "onDuration": 60,
+    "schedule": {
+     "onCondition": {
+      "time": "18:00"
+     },
+     "offCondition": {
+      "time": "06:00"
+     }
+    }
+   },
+   "circadianPresets": []
+  },
+  "capabilities": {
+   "canSend": [],
+   "canReceive": [
+    "customName"
+   ]
+  },
+  "room": {
+   "id": "e7251923-68b3-6d95-5fe2-64319aa4cbc5",
+   "name": "Room A",
+   "color": "ikea_beige_1",
+   "icon": "rooms_band_aid"
+  },
+  "deviceSet": [],
+  "remoteLinks": [],
+  "isHidden": false
+ },
+ {
+  "id": "84483bed-998b-a110-a7c8-25564674a789",
+  "relationId": "06ff3668-34da-335d-97d2-566c356022ce",
+  "type": "unknown",
+  "deviceType": "lightSensor",
+  "createdAt": "2025-04-12T12:20:52.000Z",
+  "isReachable": true,
+  "lastSeen": "2026-09-04T17:34:04.000Z",
+  "attributes": {
+   "customName": "",
+   "model": "VALLHORN Wireless Motion Sensor",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "1.0.64",
+   "hardwareVersion": "1",
+   "serialNumber": "b2d76eabe2b6cd80",
+   "productCode": "E2134",
+   "illuminance": 0,
+   "identifyStarted": "2000-01-01T00:00:00.000Z",
+   "identifyPeriod": 0,
+   "permittingJoin": false
+  },
+  "capabilities": {
+   "canSend": [],
+   "canReceive": [
+    "customName"
+   ]
+  },
+  "deviceSet": [],
+  "remoteLinks": [],
+  "isHidden": false
+ },
+ {
+  "id": "1ad2bace-4047-7972-7ff5-f23a725e612d",
+  "type": "light",
+  "deviceType": "light",
+  "createdAt": "2025-04-13T11:04:37.000Z",
+  "isReachable": true,
+  "lastSeen": "2026-09-04T16:36:01.000Z",
+  "attributes": {
+   "customName": "Desk lamp",
+   "model": "TRADFRI Driver 10W",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "1.0.4",
+   "hardwareVersion": "1",
+   "serialNumber": "04d543c1f273a499",
+   "productCode": "ICPSHC2410EUIL2",
+   "isOn": false,
+   "startupOnOff": "startOn",
+   "lightLevel": 94,
+   "startUpCurrentLevel": -1,
+   "colorHue": 29.107938257746014,
+   "colorSaturation": 0.3571345694224767,
+   "colorMode": "color",
+   "identifyStarted": "2000-01-01T00:00:00.000Z",
+   "identifyPeriod": 0,
+   "permittingJoin": false,
+   "otaStatus": "upToDate",
+   "otaState": "readyToCheck",
+   "otaProgress": 0,
+   "otaPolicy": "autoUpdate",
+   "otaScheduleStart": "00:00",
+   "otaScheduleEnd": "00:00",
+   "deviceOnBehavior": {
+    "behavior": "lastValue",
+    "profileId": ""
+   }
+  },
+  "capabilities": {
+   "canSend": [],
+   "canReceive": [
+    "customName",
+    "isOn",
+    "lightLevel",
+    "colorHue",
+    "colorSaturation"
+   ]
+  },
+  "room": {
+   "id": "236dc9e2-e15f-cbb0-7ca0-bcfb2ec8a640",
+   "name": "Room B",
+   "color": "ikea_yellow_no_24",
+   "icon": "rooms_bed"
+  },
+  "deviceSet": [],
+  "remoteLinks": [
+   "d64d5cd9-32d9-47f1-b2dc-b200d4f07c8d_1"
+  ],
+  "isHidden": false,
+  "adaptiveProfile": {}
+ },
+ {
+  "id": "26175d06-9ba8-8324-7ab3-e7c9d62c5459",
+  "relationId": "9391550d-376c-375a-c2ed-bbe347e00482",
+  "type": "gateway",
+  "deviceType": "gateway",
+  "createdAt": "2024-03-07T15:49:59.570Z",
+  "isReachable": true,
+  "lastSeen": "2026-09-04T18:50:03.072Z",
+  "attributes": {
+   "customName": "test-hub",
+   "model": "DIRIGERA Hub for smart products",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "2.975.3",
+   "hardwareVersion": "P2.5",
+   "serialNumber": "551064daef605c88",
+   "identifyStarted": "2000-01-01T00:00:00.000Z",
+   "identifyPeriod": 0,
+   "otaStatus": "upToDate",
+   "otaState": "readyToCheck",
+   "otaProgress": 100,
+   "otaPolicy": "autoDownload",
+   "otaScheduleStart": "00:00",
+   "otaScheduleEnd": "00:00",
+   "permittingJoin": false,
+   "backendConnected": true,
+   "backendConnectionPersistent": true,
+   "backendOnboardingComplete": true,
+   "backendRegion": "eu-west-1",
+   "backendCountryCode": "XZ",
+   "userConsents": [
+    {
+     "name": "analytics",
+     "value": "disabled"
+    },
+    {
+     "name": "diagnostics",
+     "value": "enabled"
+    }
+   ],
+   "logLevel": 3,
+   "coredump": false,
+   "timezone": "Etc/UTC",
+   "nextSunSet": null,
+   "nextSunRise": null,
+   "sunPosition": "sunUnknown",
+   "homestate": "home",
+   "countryCode": "XZ",
+   "isOn": false
+  },
+  "capabilities": {
+   "canSend": [],
+   "canReceive": [
+    "customName",
+    "permittingJoin",
+    "userConsents",
+    "logLevel",
+    "time",
+    "timezone",
+    "countryCode",
+    "coordinates"
+   ]
+  },
+  "deviceSet": [],
+  "remoteLinks": [],
+  "dynamicFeatures": [
+   {
+    "type": "matterControllerEnabled",
+    "enabled": true,
+    "featureVersion": "26.4.0"
+   }
+  ]
+ },
+ {
+  "id": "b80e81d9-89c0-ea87-84df-b749c9840cc5",
+  "type": "light",
+  "deviceType": "light",
+  "createdAt": "2025-04-13T01:32:23.000Z",
+  "isReachable": true,
+  "lastSeen": "2026-09-04T17:29:05.000Z",
+  "attributes": {
+   "customName": "Ceiling panel",
+   "model": "JETSTROM 40100",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "2.4.8",
+   "hardwareVersion": "1",
+   "serialNumber": "0b8200375dcb6e21",
+   "productCode": "L2208",
+   "isOn": true,
+   "startupOnOff": "startOn",
+   "lightLevel": 100,
+   "startUpCurrentLevel": -1,
+   "colorTemperature": 4000,
+   "colorTemperatureMin": 4000,
+   "colorTemperatureMax": 2202,
+   "startupTemperature": -1,
+   "colorMode": "temperature",
+   "identifyStarted": "2000-01-01T00:00:00.000Z",
+   "identifyPeriod": 0,
+   "permittingJoin": false,
+   "otaStatus": "upToDate",
+   "otaState": "readyToCheck",
+   "otaProgress": 0,
+   "otaPolicy": "autoUpdate",
+   "otaScheduleStart": "00:00",
+   "otaScheduleEnd": "00:00",
+   "deviceOnBehavior": {
+    "behavior": "lastValue",
+    "profileId": ""
+   }
+  },
+  "capabilities": {
+   "canSend": [],
+   "canReceive": [
+    "customName",
+    "isOn",
+    "lightLevel",
+    "colorTemperature"
+   ]
+  },
+  "room": {
+   "id": "b221411d-3e19-c07a-21f0-ef591ceb8fea",
+   "name": "Room E",
+   "color": "ikea_blue_no_58",
+   "icon": "rooms_kitchen"
+  },
+  "deviceSet": [],
+  "remoteLinks": [
+   "daa71159-8e7d-4e5b-a57f-07fd852a069c_1",
+   "c5b5a20f-667b-4671-90c7-ec71096690b5_1"
+  ],
+  "isHidden": false,
+  "adaptiveProfile": {}
+ },
+ {
+  "id": "9da311dc-89d8-12b0-f13f-9fc20865b151",
+  "type": "controller",
+  "deviceType": "lightController",
+  "createdAt": "2025-04-13T02:07:06.000Z",
+  "isReachable": true,
+  "lastSeen": "2026-09-04T17:24:14.000Z",
+  "attributes": {
+   "customName": "Remote D",
+   "model": "Remote Control N2",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "2.4.16",
+   "hardwareVersion": "1",
+   "serialNumber": "c9490bb248c7af86",
+   "productCode": "E2002",
+   "batteryPercentage": 100,
+   "isOn": false,
+   "lightLevel": 1,
+   "permittingJoin": false,
+   "otaStatus": "upToDate",
+   "otaState": "readyToCheck",
+   "otaProgress": 0,
+   "otaPolicy": "autoUpdate",
+   "otaScheduleStart": "00:00",
+   "otaScheduleEnd": "00:00",
+   "circadianPresets": []
+  },
+  "capabilities": {
+   "canSend": [
+    "isOn",
+    "lightLevel"
+   ],
+   "canReceive": [
+    "customName"
+   ]
+  },
+  "room": {
+   "id": "b221411d-3e19-c07a-21f0-ef591ceb8fea",
+   "name": "Room E",
+   "color": "ikea_blue_no_58",
+   "icon": "rooms_kitchen"
+  },
+  "deviceSet": [],
+  "remoteLinks": [],
+  "isHidden": false
+ },
+ {
+  "id": "171e16e8-1ff6-0fec-a071-a8fc35ce210a",
+  "relationId": "d58ee6e5-bc60-8742-a458-b6e48baf2266",
+  "type": "sensor",
+  "deviceType": "motionSensor",
+  "createdAt": "2026-08-19T20:47:02.000Z",
+  "isReachable": true,
+  "lastSeen": "2026-09-04T17:34:02.000Z",
+  "attributes": {
+   "customName": "Motion C",
+   "model": "VALLHORN Wireless Motion Sensor",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "1.0.64",
+   "hardwareVersion": "1",
+   "serialNumber": "449eac718110c40b",
+   "productCode": "E2134",
+   "batteryPercentage": 100,
+   "isOn": false,
+   "motionDetectedDelay": 20,
+   "isDetected": false,
+   "identifyStarted": "2000-01-01T00:00:00.000Z",
+   "identifyPeriod": 0,
+   "permittingJoin": false,
+   "sensorConfig": {
+    "scheduleOn": false,
+    "onDuration": 60,
+    "schedule": {
+     "onCondition": {
+      "time": "22:00"
+     },
+     "offCondition": {
+      "time": "06:00"
+     }
+    }
+   },
+   "circadianPresets": []
+  },
+  "capabilities": {
+   "canSend": [],
+   "canReceive": [
+    "customName"
+   ]
+  },
+  "room": {
+   "id": "e7251923-68b3-6d95-5fe2-64319aa4cbc5",
+   "name": "Room A",
+   "color": "ikea_beige_1",
+   "icon": "rooms_band_aid"
+  },
+  "deviceSet": [],
+  "remoteLinks": [],
+  "isHidden": false
+ },
+ {
+  "id": "9a67e399-a9ee-a68d-cf93-215df0820177",
+  "relationId": "d58ee6e5-bc60-8742-a458-b6e48baf2266",
+  "type": "unknown",
+  "deviceType": "lightSensor",
+  "createdAt": "2026-08-19T20:47:02.000Z",
+  "isReachable": true,
+  "lastSeen": "2026-09-04T17:34:02.000Z",
+  "attributes": {
+   "customName": "",
+   "model": "VALLHORN Wireless Motion Sensor",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "1.0.64",
+   "hardwareVersion": "1",
+   "serialNumber": "449eac718110c40b",
+   "productCode": "E2134",
+   "illuminance": 0,
+   "identifyStarted": "2000-01-01T00:00:00.000Z",
+   "identifyPeriod": 0,
+   "permittingJoin": false
+  },
+  "capabilities": {
+   "canSend": [],
+   "canReceive": [
+    "customName"
+   ]
+  },
+  "deviceSet": [],
+  "remoteLinks": [],
+  "isHidden": false
+ },
+ {
+  "id": "9c802103-b389-d559-7444-98515213d8bd",
+  "type": "controller",
+  "deviceType": "lightController",
+  "createdAt": "2025-04-13T12:00:43.000Z",
+  "isReachable": true,
+  "lastSeen": "2026-09-04T12:45:20.000Z",
+  "attributes": {
+   "customName": "Dimmer A",
+   "model": "RODRET Dimmer",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "1.0.57",
+   "hardwareVersion": "1",
+   "serialNumber": "b95273202cef5766",
+   "productCode": "E2201",
+   "batteryPercentage": 87,
+   "isOn": false,
+   "lightLevel": 1,
+   "permittingJoin": false,
+   "otaStatus": "upToDate",
+   "otaState": "readyToCheck",
+   "otaProgress": 0,
+   "otaPolicy": "autoUpdate",
+   "otaScheduleStart": "00:00",
+   "otaScheduleEnd": "00:00",
+   "circadianPresets": []
+  },
+  "capabilities": {
+   "canSend": [
+    "isOn",
+    "lightLevel"
+   ],
+   "canReceive": [
+    "customName"
+   ]
+  },
+  "room": {
+   "id": "236dc9e2-e15f-cbb0-7ca0-bcfb2ec8a640",
+   "name": "Room B",
+   "color": "ikea_yellow_no_24",
+   "icon": "rooms_bed"
+  },
+  "deviceSet": [],
+  "remoteLinks": [],
+  "isHidden": false
+ },
+ {
+  "id": "cb22ca7e-8e90-4bba-8b74-4f4d8905ae94",
+  "type": "light",
+  "deviceType": "light",
+  "createdAt": "2025-04-14T01:29:02.000Z",
+  "isReachable": true,
+  "lastSeen": "2026-09-04T18:33:05.000Z",
+  "attributes": {
+   "customName": "Cabinet strip",
+   "model": "FLOALT panel WS 30x90",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "2.3.087",
+   "hardwareVersion": "1",
+   "serialNumber": "feef2a4e123d89a7",
+   "productCode": "",
+   "isOn": false,
+   "startupOnOff": "startOn",
+   "lightLevel": 70,
+   "startUpCurrentLevel": -1,
+   "colorTemperature": 1721,
+   "colorTemperatureMin": 4000,
+   "colorTemperatureMax": 2202,
+   "startupTemperature": -1,
+   "colorMode": "temperature",
+   "identifyStarted": "2000-01-01T00:00:00.000Z",
+   "identifyPeriod": 0,
+   "permittingJoin": false,
+   "otaStatus": "upToDate",
+   "otaState": "readyToCheck",
+   "otaProgress": 0,
+   "otaPolicy": "autoUpdate",
+   "otaScheduleStart": "00:00",
+   "otaScheduleEnd": "00:00",
+   "deviceOnBehavior": {
+    "behavior": "adaptiveProfile",
+    "profileId": "0ba2361f-cb30-439e-93ca-d5f00b8b8f8b"
+   }
+  },
+  "capabilities": {
+   "canSend": [],
+   "canReceive": [
+    "customName",
+    "isOn",
+    "lightLevel",
+    "colorTemperature"
+   ]
+  },
+  "room": {
+   "id": "e7251923-68b3-6d95-5fe2-64319aa4cbc5",
+   "name": "Room A",
+   "color": "ikea_beige_1",
+   "icon": "rooms_band_aid"
+  },
+  "deviceSet": [],
+  "remoteLinks": [
+   "ac4db241-dcca-432a-9b17-e526c3989900_1",
+   "1f7d9dee-1893-4058-ae1f-e838e35cbf9b_1",
+   "33c49229-84f5-4661-a950-8b20e5645e08_1"
+  ],
+  "isHidden": false,
+  "adaptiveProfile": {
+   "id": "0ba2361f-cb30-439e-93ca-d5f00b8b8f8b",
+   "active": true
+  }
+ },
+ {
+  "id": "ecc2c8c9-e9dc-2b6e-43f5-7d02e6a30bf8",
+  "type": "light",
+  "deviceType": "light",
+  "createdAt": "2025-04-13T15:18:36.000Z",
+  "isReachable": false,
+  "lastSeen": "2026-09-04T08:23:45.000Z",
+  "attributes": {
+   "customName": "Corner lamp",
+   "model": "JETSTROM 6060",
+   "manufacturer": "IKEA of Sweden",
+   "firmwareVersion": "2.4.8",
+   "hardwareVersion": "1",
+   "serialNumber": "02ed4f1d1f0989e7",
+   "productCode": "L2207",
+   "isOn": true,
+   "startupOnOff": "startOn",
+   "lightLevel": 100,
+   "startUpCurrentLevel": -1,
+   "colorTemperature": 4000,
+   "colorTemperatureMin": 4000,
+   "colorTemperatureMax": 2202,
+   "startupTemperature": -1,
+   "colorMode": "temperature",
+   "identifyStarted": "2000-01-01T00:00:00.000Z",
+   "identifyPeriod": 0,
+   "permittingJoin": false,
+   "otaStatus": "upToDate",
+   "otaState": "readyToCheck",
+   "otaProgress": 0,
+   "otaPolicy": "autoUpdate",
+   "otaScheduleStart": "00:00",
+   "otaScheduleEnd": "00:00",
+   "deviceOnBehavior": {
+    "behavior": "lastValue",
+    "profileId": ""
+   }
+  },
+  "capabilities": {
+   "canSend": [],
+   "canReceive": [
+    "customName",
+    "isOn",
+    "lightLevel",
+    "colorTemperature"
+   ]
+  },
+  "room": {
+   "id": "a6f4e309-c96b-a9ac-17db-2ba15088c606",
+   "name": "Room D",
+   "color": "ikea_green_no_65",
+   "icon": "rooms_sofa"
+  },
+  "deviceSet": [],
+  "remoteLinks": [
+   "514123dd-37b8-43d0-91dd-b47d7242cdec_1",
+   "daa71159-8e7d-4e5b-a57f-07fd852a069c_1",
+   "5b5a496e-6eec-4afd-b5f2-2fe4cda57e7a_1"
+  ],
+  "isHidden": false,
+  "adaptiveProfile": {}
+ }
+]

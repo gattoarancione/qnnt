@@ -46,6 +46,149 @@ pub fn build(b: *Build) void {
 
     b.installArtifact(qnnt_lib);
 
+    // Speaking HTTP over a socket, minus anything device-specific: a connect with a real
+    // deadline, and decoding a chunked response. Shared by the UGV and DIRIGERA examples,
+    // which talk to two different small embedded web servers and need the same three
+    // things.
+    const wire_mod = b.createModule(.{
+        .root_source_file = b.path("examples/net/wire.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true, // socket, connect, fcntl, getsockopt
+    });
+
+    // -- the IKEA DIRIGERA chain ------------------------------------------------------
+    //
+    // No fake here either, and for the same reason as the UGV: the risk in this example is
+    // a command reaching a real light in someone's home, which a simulator cannot
+    // exercise. What IS offline-testable is every parser, and those carry the tests.
+
+    // TLS through OpenSSL, because Zig 0.16's std client cannot talk to this hub: the hub
+    // is TLS 1.2 with an ECDSA certificate, and std offers only ECDHE_RSA suites for 1.2.
+    // See the header of examples/dirigera/tls_openssl.zig. Path-provided, the same way the
+    // Qt examples take -Dqt=.
+    const openssl_path = b.option(
+        []const u8,
+        "dirigera-openssl",
+        "Path to an OpenSSL installation, e.g. /opt/homebrew/opt/openssl@3 (needed for the dirigera step)",
+    );
+
+    const dirigera_tls_mod = b.createModule(.{
+        .root_source_file = b.path("examples/dirigera/tls_openssl.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    dirigera_tls_mod.addImport("wire", wire_mod);
+    if (openssl_path) |prefix| {
+        dirigera_tls_mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "include" }) });
+        dirigera_tls_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
+        dirigera_tls_mod.linkSystemLibrary("ssl", .{});
+        dirigera_tls_mod.linkSystemLibrary("crypto", .{});
+    }
+
+    // HTTPS to the hub, with the chain verified against IKEA's embedded root.
+    const dirigera_https_mod = b.createModule(.{
+        .root_source_file = b.path("examples/dirigera/https.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    dirigera_https_mod.addImport("wire", wire_mod);
+    dirigera_https_mod.addImport("tls_openssl", dirigera_tls_mod);
+
+    // The hub's vocabulary: device types, attributes, and what it will accept.
+    const dirigera_hub_mod = b.createModule(.{
+        .root_source_file = b.path("examples/dirigera/hub.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Enough of RFC 6455 to listen to the hub's push stream.
+    const dirigera_ws_mod = b.createModule(.{
+        .root_source_file = b.path("examples/dirigera/ws.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const dirigera_step = b.step("dirigera", "Build the IKEA DIRIGERA bridge");
+
+    const dirigera_bridge_mod = b.createModule(.{
+        .root_source_file = b.path("examples/dirigera/bridge.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    dirigera_bridge_mod.addImport("https", dirigera_https_mod);
+    dirigera_bridge_mod.addImport("hub", dirigera_hub_mod);
+    dirigera_bridge_mod.addImport("ws", dirigera_ws_mod);
+    dirigera_bridge_mod.addImport("qnnt", qnnt_lib_mod);
+    dirigera_bridge_mod.linkLibrary(qnnt_lib);
+
+    if (openssl_path) |prefix| {
+        dirigera_bridge_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
+        dirigera_bridge_mod.linkSystemLibrary("ssl", .{});
+        dirigera_bridge_mod.linkSystemLibrary("crypto", .{});
+    }
+
+    const dirigera_bridge = b.addExecutable(.{
+        .name = "dirigera-bridge",
+        .root_module = dirigera_bridge_mod,
+    });
+
+    if (openssl_path == null) {
+        // A clear message rather than a wall of linker errors.
+        const explain = b.addFail(
+            "the dirigera example needs OpenSSL: pass -Ddirigera-openssl=/path " ++
+                "(e.g. /opt/homebrew/opt/openssl@3). Zig 0.16's std TLS client cannot " ++
+                "handshake with the hub -- see examples/dirigera/tls_openssl.zig.",
+        );
+        dirigera_step.dependOn(&explain.step);
+    } else {
+        b.installArtifact(dirigera_bridge);
+        dirigera_step.dependOn(&b.addInstallArtifact(dirigera_bridge, .{}).step);
+    }
+
+    // -- the UGV Beast chain ----------------------------------------------------------
+    //
+    // No fake here, unlike the LiDAR and camera chains: the robot is the only thing that
+    // can be driven, and a fake that accepted drive commands and did nothing would be a
+    // worse test than none. The bridge talks to the real robot over HTTP.
+
+    // Socket.IO over its long-polling transport. Separate from the protocol module because
+    // it knows nothing about robots -- it would serve any Socket.IO server.
+    const ugv_sio_mod = b.createModule(.{
+        .root_source_file = b.path("examples/ugv/sio.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    ugv_sio_mod.addImport("wire", wire_mod);
+
+    // The robot's own command and telemetry vocabulary, read from GET /config.
+    const ugv_beast_mod = b.createModule(.{
+        .root_source_file = b.path("examples/ugv/beast.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ugv_beast_mod.addImport("sio", ugv_sio_mod);
+
+    const ugv_step = b.step("ugv", "Build the UGV Beast bridge, and the GUI with -Dqt=...");
+
+    const ugv_bridge_mod = b.createModule(.{
+        .root_source_file = b.path("examples/ugv/bridge.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    ugv_bridge_mod.addImport("sio", ugv_sio_mod);
+    ugv_bridge_mod.addImport("beast", ugv_beast_mod);
+    ugv_bridge_mod.addImport("qnnt", qnnt_lib_mod);
+    ugv_bridge_mod.linkLibrary(qnnt_lib);
+
+    const ugv_bridge = b.addExecutable(.{ .name = "ugv-bridge", .root_module = ugv_bridge_mod });
+    b.installArtifact(ugv_bridge);
+    ugv_step.dependOn(&b.addInstallArtifact(ugv_bridge, .{}).step);
+
     // The camera-to-driver handoff. Its own module because both ends use it and neither
     // owns it: the fake writes, the driver reads.
     const zed_shm_mod = b.createModule(.{
@@ -113,6 +256,54 @@ pub fn build(b: *Build) void {
     const camera_sensor = b.addExecutable(.{ .name = "camera-sensor", .root_module = camera_mod });
     b.installArtifact(camera_sensor);
     zed_step.dependOn(&b.addInstallArtifact(camera_sensor, .{}).step);
+
+    // The REAL camera's producer, in place of the fake: reads a ZED over UVC and fills the
+    // same shared region. Objective-C against AVFoundation, so macOS only and opt-in --
+    // and it produces no depth, because depth is the ZED SDK's and there is no ZED SDK for
+    // macOS. See the header of examples/zed/zed_uvc.m.
+    // The REAL camera's producer, in place of the fake: reads a ZED and fills the same
+    // shared region. One flag, because which API to use is not the caller's business --
+    // AVFoundation on macOS, V4L2 on Linux, and neither produces depth, because depth is the
+    // ZED SDK's and the SDK needs an NVIDIA GPU. See the headers of zed_uvc.m and zed_v4l2.c.
+    if (b.option(bool, "camera", "Build the real-camera producer for this platform (macOS or Linux)") orelse false) {
+        const Producer = struct { name: []const u8, src: []const u8, frameworks: bool };
+        const producer: ?Producer = switch (target.result.os.tag) {
+            .macos => .{ .name = "zed-uvc", .src = "examples/zed/zed_uvc.m", .frameworks = true },
+            .linux => .{ .name = "zed-v4l2", .src = "examples/zed/zed_v4l2.c", .frameworks = false },
+            else => null,
+        };
+
+        if (producer) |prod| {
+            const mod = b.createModule(.{
+                .target = target,
+                .optimize = optimize,
+                .link_libc = true,
+            });
+            mod.addCSourceFile(.{
+                .file = b.path(prod.src),
+                .flags = if (prod.frameworks)
+                    &.{ "-fobjc-arc", "-Wall", "-Wextra" }
+                else
+                    &.{ "-std=c11", "-Wall", "-Wextra" },
+            });
+            if (prod.frameworks) {
+                for ([_][]const u8{ "AVFoundation", "Foundation", "CoreMedia", "CoreVideo" }) |fw| {
+                    mod.linkFramework(fw, .{});
+                }
+            }
+
+            const exe = b.addExecutable(.{ .name = prod.name, .root_module = mod });
+            b.installArtifact(exe);
+            zed_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+        } else {
+            std.debug.print(
+                "-Dcamera: no real-camera producer for {s}. macOS captures with AVFoundation\n" ++
+                    "and Linux with V4L2; on anything else the producer would be the ZED SDK,\n" ++
+                    "which is also where depth comes from.\n",
+                .{@tagName(target.result.os.tag)},
+            );
+        }
+    }
 
 
     // The TLD codec's C ABI, built both ways: static for C/C++ callers that link, shared
@@ -339,6 +530,20 @@ pub fn build(b: *Build) void {
                 .quick = true,
             },
             .{
+                .name = "dirigera-home",
+                .src = "examples/dirigera/home.cpp",
+                .step = "dirigera-home",
+                .help = "Build the Qt/QML DIRIGERA control station (needs -Dqt=...)",
+                .quick = true,
+            },
+            .{
+                .name = "ugv-pilot",
+                .src = "examples/ugv/pilot.cpp",
+                .step = "ugv-pilot",
+                .help = "Build the Qt/QML UGV Beast control station (needs -Dqt=...)",
+                .quick = true,
+            },
+            .{
                 .name = "camera-viewer",
                 .src = "examples/zed/viewer.cpp",
                 .step = "camera-viewer",
@@ -405,6 +610,12 @@ pub fn build(b: *Build) void {
             }
             if (std.mem.eql(u8, ex.name, "lidar-viewer")) {
                 lidar_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+            }
+            if (std.mem.eql(u8, ex.name, "ugv-pilot")) {
+                ugv_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+            }
+            if (std.mem.eql(u8, ex.name, "dirigera-home")) {
+                dirigera_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
             }
         }
     }
@@ -478,7 +689,17 @@ pub fn build(b: *Build) void {
         "examples/zed/shm.zig",
         "src/ls.zig",
         "src/cat.zig",
+        "examples/net/wire.zig",
+        "examples/dirigera/https.zig",
+        "examples/dirigera/hub.zig",
+        "examples/dirigera/ws.zig",
+        "examples/ugv/sio.zig",
+        "examples/ugv/beast.zig",
     }) |src| {
+        // Skipped without -Ddirigera-openssl, since it cannot link. See below.
+        if (std.mem.eql(u8, src, "examples/dirigera/https.zig") and openssl_path == null)
+            continue;
+
         const test_mod = b.createModule(.{
             .root_source_file = b.path(src),
             .target = target,
@@ -501,6 +722,25 @@ pub fn build(b: *Build) void {
         if (std.mem.startsWith(u8, src, "examples/zed/")) {
             test_mod.addImport("frame", zed_frame_mod);
             test_mod.addImport("shm", zed_shm_mod);
+        }
+        // The robot's protocol module parses telemetry with the Socket.IO client's JSON
+        // readers, so its tests need that module.
+        if (std.mem.startsWith(u8, src, "examples/ugv/")) {
+            test_mod.addImport("sio", ugv_sio_mod);
+            test_mod.addImport("wire", wire_mod);
+        }
+        if (std.mem.startsWith(u8, src, "examples/dirigera/")) {
+            test_mod.addImport("wire", wire_mod);
+            test_mod.addImport("tls_openssl", dirigera_tls_mod);
+            // https.zig's tests reach OpenSSL to prove the embedded anchor loads, so they
+            // only run when the library is available. Everything else in the example --
+            // the hub vocabulary, the WebSocket framing, the wire helpers -- is pure Zig
+            // and always tested.
+            if (openssl_path) |prefix| {
+                test_mod.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ prefix, "lib" }) });
+                test_mod.linkSystemLibrary("ssl", .{});
+                test_mod.linkSystemLibrary("crypto", .{});
+            }
         }
 
         const tests = b.addTest(.{ .root_module = test_mod });

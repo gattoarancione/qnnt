@@ -215,6 +215,13 @@ public:
                     Q_EMIT statsChanged();
                 });
 
+        // Every QNNT_* variable, handled by the library so all four languages agree -- and
+        // without this the viewer silently ignores the lot, including the cluster key. It
+        // was missing here while the LiDAR viewer and the Qt mesh node both had it, so this
+        // viewer could not join a federation at all: it reported "federation disabled: no
+        // cluster key" with the key plainly set in its environment.
+        node->configureFromEnvironment();
+
         if (!node->start()) return false;
         if (!node->addSubscriber(m_depth_topic, qnnt::QnntNode::Delivery::Frames)) return false;
         // The intrinsics arrive on their own topic and are republished about once a second,

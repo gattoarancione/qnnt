@@ -1060,5 +1060,357 @@ calibration came from the camera or from the driver's nominal defaults. The fake
 about 6% of every frame's depth, moving between frames -- because a stereo camera does, and
 a consumer written against a gapless depth map falls over on the first real frame.
 
+A real ZED 2i can drive it, on macOS, with one command changed:
+
+    zig build zed -Duvc -Doptimize=ReleaseFast
+    ./zig-out/bin/zed-uvc                    # the camera, instead of fake-zed
+    ./zig-out/bin/camera-sensor --model zed2i --scale 1
+    ./zig-out/bin/camera-viewer '' camera/zed2i
+
+The bridge reads the shared region and never grabbed from a camera, so only the producer
+changes. Measured on real hardware: 15 frames/s, 672x376, 0 missed. Two things it cannot
+give you -- depth and the IMU both come from the ZED SDK, which has no macOS build, so the
+mono plane is the real left image and the depth plane is zero. That also exposed a driver
+bug: the fallback intrinsics came from the spec table's 1920x1080 rather than the 672x376
+actually arriving, and would have put every point out by 2.86x.
+
 See examples/zed/SCHEMA.txt for the wire format, the published schema, the geometry and
 what it would take to point this at real hardware.
+
+--------------------------------------------------------------------------------
+ 14. Driving a real robot: examples/ugv/
+--------------------------------------------------------------------------------
+
+A UGV Beast on one side, qnnt topics on the other, and a Qt/QML control station
+on the end of them:
+
+    sio.zig      Socket.IO over its HTTP long-polling transport
+    beast.zig    the robot's command and telemetry vocabulary, read from the robot
+    bridge.zig   the qnnt node: two topics subscribed, two published
+    pilot.cpp    Qt/QML: drive pad, throttle, telemetry, watchdog indicator
+    main.qml     the interface
+
+    zig build ugv -Dqt=/path/to/Qt/6.10.3/macos
+    ./zig-out/bin/ugv-bridge --host 192.168.50.5:5000   # terminal 1
+    ./zig-out/bin/ugv-pilot                             # terminal 2
+
+    ugv/beast/drive       subscribed   {left, right} in [-1, 1]
+    ugv/beast/gimbal      subscribed   {pan, tilt} degrees, absolute
+    ugv/beast/telemetry   published    battery, angles, CPU -- about 0.2 Hz
+    ugv/beast/status      published    the link, the robot's limits, the watchdog
+
+Unlike the LiDAR and camera chains there is NO FAKE here. A fake that accepted
+drive commands and did nothing would be a worse test than none: the whole risk in
+this example is that a command reaches an actuator when it should not, and a
+simulator cannot exercise that.
+
+Almost nothing about the protocol is guessed. The robot serves its own
+configuration at GET /config, and that file defines the vocabulary:
+
+    fb:                   the telemetry field map -- base_voltage: 112, so
+                          {"112":1201} is 12.01 V
+    cmd_movition_ctrl: 1  (the robot's spelling)
+    cmd_gimbal_ctrl: 133
+    args_config:          max_speed: 0.5 -- the ceiling the vendor's own UI uses
+
+beast.zig parses it, so a firmware that renumbers a field or raises a limit is
+followed rather than fought. examples/ugv/testdata/config.yaml is the real file
+from a real robot, kept as a test fixture, because the SHAPE of that file is part
+of the protocol: the first parser read a flat file, the real one is nested one
+level under section headers, and nothing but the real bytes would have caught it.
+`from_robot` means "the values were found", not "the file downloaded" -- reporting
+the robot's limits while enforcing built-in ones is the failure worth preventing.
+
+WHY SOCKET.IO OVER POLLING. The robot speaks Socket.IO, not raw WebSocket. Its
+default transport is a WebSocket, but the protocol begins every session on long
+polling and a client that never upgrades stays a first-class client -- and that
+lower rung is plain HTTP, which std.http.Client already gives us. No WebSocket
+implementation, no dependency. Measured cost: 11-24 ms per command, which is
+nothing at the rate a teleoperated robot needs.
+
+THREE CLOCKS, and they answer three different questions:
+
+    --rate 10        the MAXIMUM send rate. A controller streaming faster is
+                     coalesced; the newest setpoint wins, because a stale velocity
+                     command is worthless and executing a backlog is dangerous.
+    --heartbeat 500  how often an UNCHANGED setpoint is re-sent. The vendor's UI
+                     re-sends every 2000 ms, which says the firmware stops the
+                     tracks if commands stop arriving.
+    --deadman 500    how long a setpoint may go un-refreshed before it becomes a
+                     stop.
+
+The first version sent every cycle at --rate, which is the textbook shape and was
+wrong here: each command is an HTTP POST, and 10 POST/s is ten times what the
+vendor's own UI sends over a cheaper transport. Send-on-change plus a heartbeat is
+both lighter on the robot and MORE responsive -- a change goes out within one 5 ms
+tick instead of waiting out a period.
+
+TWO INDEPENDENT STOPS, because they cover different failures:
+
+    1. The bridge's watchdog. No drive command for --deadman ms and the setpoint
+       is forced to zero, which the loop then keeps sending.
+    2. The robot's own firmware timeout, if the bridge itself dies.
+
+(1) exists because (2) is slower and outside our control. A controller that
+crashes mid-turn, a Wi-Fi drop, a GUI that freezes -- all leave a robot driving
+until something stops it, and 500 ms of unintended motion is a very different
+event from three seconds of it. Verified with kill -9 on the GUI: the watchdog
+tripped and held 0/0.
+
+The GUI is the other half of that contract. It publishes at 10 Hz whether or not
+anything changed, so the watchdog's silence is meaningful; a controller that
+published only on change would be indistinguishable from a crashed one the moment
+the operator held a steady speed. It also releases every key when the window loses
+focus, because a key-up is never delivered to an unfocused window and a latched key
+would keep the robot driving after the operator switched away.
+
+WHAT A DAY WITH REAL HARDWARE ACTUALLY FOUND. Four defects, none of which a
+simulator would have shown, and two of them were mine misreading the evidence:
+
+  * Commands never arrived at all. The subscription used text delivery, which waits
+    for a newline delimiter that binary TLD never contains -- so the handler was
+    never called and nothing reported why. The bridge now counts and prints
+    undecodable commands rather than swallowing them.
+  * Both loops hung indefinitely. std.http.Client has no read deadline, so when a
+    routing change on the host sent packets out a second interface, every request
+    sat in receiveHead until TCP gave up -- about fifteen minutes. The watchdog
+    lives on one of those loops, so it stopped running too, which is precisely the
+    failure it exists to prevent.
+
+    Fixing it took two attempts. Setting SO_RCVTIMEO on the client's socket does
+    not work: the timeout then surfaces as EAGAIN, and Io.Threaded's read path
+    treats EAGAIN as a programmer bug and panics -- which turned a hang into a
+    crash on shutdown. Io's own receiveTimeout is the supported way to bound a
+    read, and it needs the socket in hand, so sio.zig now speaks HTTP/1.1 directly
+    over an Io.net stream and std.http.Client is gone. That is small because of
+    what the robot does: every response is Transfer-Encoding: chunked with
+    Connection: close, so there is no connection to pool and no length to
+    negotiate, and the body is everything up to EOF once the chunk framing comes
+    off. The deadlines are 1500 ms for a command and 35 s for a long poll that
+    legitimately waits.
+
+  * The connect was the worst of it, and it took a third attempt to see. Passing a
+    connect deadline makes Io.Threaded panic with "TODO implement
+    netConnectIpPosix with timeout" on Zig 0.16, so a connect was bounded only by
+    the OS's SYN retransmission. Measured against a silent host on this subnet:
+    76.6 seconds for ONE attempt, with both loops frozen for all of it -- and
+    since the robot is its own access point and reboots without notice, that was
+    the cost of every reconnect. sio.zig now connects straight through libc, a
+    non-blocking connect followed by poll with a real deadline, then puts the
+    descriptor back into blocking mode before Io ever touches it (Io's read path
+    treats EAGAIN as a programmer bug -- the same trap that made SO_RCVTIMEO
+    unusable). Same test: 76.6 s -> 6.1 s, and the bridge keeps publishing status
+    at its normal 500 ms cadence throughout, reporting link=false instead of
+    going silent.
+  * The watchdog was on the wrong thread. It lived in the output loop, which is
+    the loop that can be inside an HTTP round trip -- so a 500 ms deadman could go
+    up to 76 s without being evaluated, absent exactly when it was needed. It now
+    runs on the supervisor thread, which does nothing but publish and sleep 20 ms.
+    It still cannot make the robot stop by itself, only the output loop sends; what
+    it guarantees is that the setpoint is already zero the instant the deadman
+    expires, so whatever goes out next is a stop, and the status topic tells the
+    truth in the meantime.
+  * A lost session was permanent. Three consecutive poll failures now rebuild it.
+  * This robot's Wi-Fi reboots without notice -- it is its own access point, so the
+    host drops off the network with it. Two consequences, both now handled: a
+    failed first connection is NOT fatal (the topics still come up and the poll
+    loop keeps retrying, so the status topic can report the link down rather than
+    the process just exiting), and GET /config is re-read on every session
+    (re-)establishment. Read once, a bridge started while the robot was rebooting
+    would enforce built-in limits for the rest of its life while the robot sat
+    there able to state the real ones. It reported that honestly, but reporting is
+    not recovering.
+  * Telemetry arrives at about 0.2 Hz. This is the ROBOT's cadence, not congestion:
+    measured on a clean session with nothing else connected, and request_data does
+    not pull one on demand either. Two wrong readings preceded that measurement --
+    first blaming command load, then blaming a wedged server when the truth was the
+    routing change above. The GUI shows the age of the reading for this reason: a
+    five-second-old number looks broken when it is not.
+
+WHAT IS UNVERIFIED. The gimbal. This robot's /config reports module_type 0, so no
+pan-tilt module is configured and the robot ignores T:133 -- pan_angle stays pinned
+at 0 whether the command comes through qnnt or straight from curl. The command path
+is complete and the UI keeps its pan-tilt row, but nothing here has moved a gimbal.
+Setting module_type is a change to the robot's own configuration, not this
+bridge's, so it is left to whoever owns the machine.
+
+Drive commands were confirmed to reach the robot end to end; there is no wheel
+feedback in the telemetry map, and battery sag on a suspended robot proved too
+small to measure, so "the tracks turned" rests on the operator watching them.
+
+--------------------------------------------------------------------------------
+ 15. A home full of sensors: examples/dirigera/
+--------------------------------------------------------------------------------
+
+An IKEA DIRIGERA hub on one side, qnnt topics on the other:
+
+    tls_openssl.zig  TLS, because std's client cannot reach this hub (see below)
+    https.zig        HTTPS with the chain verified against IKEA's embedded root
+    hub.zig          the hub's vocabulary, read off a real hub
+    ws.zig           enough of RFC 6455 to listen to the push stream
+    bridge.zig       the qnnt node: three topics published, one subscribed
+    home.cpp         Qt/QML: rooms, lights, sensors
+    main.qml         the interface
+
+    zig build dirigera -Ddirigera-openssl=/opt/homebrew/opt/openssl@3 \
+                       -Dqt=/path/to/Qt/6.10.3/macos
+    ./zig-out/bin/dirigera-bridge --host 192.168.1.20:8443 --list   # a diagnostic
+    ./zig-out/bin/dirigera-bridge --host 192.168.1.20:8443          # the bridge
+    ./zig-out/bin/dirigera-home                                     # the station
+
+    home/dirigera/state       published   one frame per device, when it changes
+    home/dirigera/inventory   published   every device, on a timer
+    home/dirigera/status      published   the link, the hub, the counters
+    home/dirigera/light       subscribed  {id, on?, level?, kelvin?}
+
+THIS ONE PUSHES, and that is the point of it. The hub holds a WebSocket open and
+sends state the moment a light is switched or a sensor trips, so the bridge is a
+translator rather than a poller. Compare the UGV in section 14, which had to be
+asked and answered about every five seconds. `--list` exists only as a
+diagnostic; the running bridge never polls for state.
+
+The inventory is still refetched on a timer, for a different reason: the push
+stream carries CHANGES, so a device that never changes would never appear and a
+late subscriber would see an empty world. The timer makes the topic complete
+rather than merely current -- the same reason the camera bridge republishes its
+calibration.
+
+Find the hub the way it advertises itself, rather than hardcoding an address that
+moves:
+
+    dns-sd -B _ihsp._tcp local              # -> gw2-<serial>
+    dns-sd -L gw2-<serial> _ihsp._tcp local # TXT: ipv4address, type, sv, pv
+
+Pairing is OAuth2 PKCE plus a press of the hub's physical action button. On
+firmware 2.975.3 the methods are the REVERSE of most published examples:
+`/v1/oauth/authorize` is a GET (POST is a 404) and `/v1/oauth/token` is a POST.
+The hub allows one pairing window at a time, so a stray probe of the authorize
+endpoint blocks the next attempt until it lapses.
+
+WHY OPENSSL, in a repository that otherwise has no dependencies. Zig 0.16's
+`std.crypto.tls.Client` cannot complete a handshake with this hub, and the gap is
+narrow: the hub is TLS 1.2 only (forcing 1.3 returns alert 70), its certificate
+is ECDSA, and it accepts only ECDHE-ECDSA cipher suites -- while std offers only
+ECDHE_RSA for TLS 1.2. The ECDHE_ECDSA constants exist in
+`std.crypto.tls.CipherSuite` and are never offered, and the offer list is a
+private comptime constant. Everything else in std is present; ECDSA signature
+verification is implemented and advertised. So one list is the whole obstacle.
+The alternative was vendoring 1700 lines of the standard library to change three
+enum entries. `-Ddirigera-openssl=` follows the same convention as `-Dqt=` for
+the Qt viewers, and `zig build test` still passes without it -- only the three
+tests that link OpenSSL are skipped.
+
+CERTIFICATE VERIFICATION IS REAL HERE, which is worth stating because every
+published DIRIGERA client disables it. The hub presents its whole chain, four
+deep, ending in a self-signed root; that root is embedded as
+`ikea_root_ca.der` and is the only trust anchor -- not even the system store is
+trusted. What is NOT verified is the hostname, and that is unavoidable: the leaf
+carries no subjectAltName and its CN is a device serial, so there is nothing to
+match an address against. `SSL_set1_host` is therefore deliberately never called,
+which gives chain verification without name verification.
+
+THREE THINGS ABOUT THIS API worth knowing before writing against it, all learned
+from the hub rather than from documentation:
+
+  * `202 Accepted` means QUEUED, not applied. A PATCH to an unreachable device
+    succeeds and nothing happens. A command is never a confirmation.
+  * Only `capabilities.canReceive` is writable. For lights that is isOn,
+    lightLevel and colorTemperature; for remotes and sensors it is customName
+    alone, which makes them read-only in every way that matters. hub.zig reads
+    that list rather than inferring from the device type.
+  * `colorTemperatureMin` is numerically LARGER than `colorTemperatureMax` --
+    4000 against 2202 on the same bulb, names in mired order and values in
+    Kelvin. A clamp written the obvious way yields an empty range and rejects
+    every input, so `clampTemperature` sorts the bounds instead of trusting their
+    names.
+
+THE STATION is the fourth in this repository, after lidar-viewer, camera-viewer
+and ugv-pilot, and the one with the least in common with them: nothing in it is a
+render loop. A LiDAR viewer redraws a million points a second; a home has
+seventeen devices that change when somebody walks past a sensor. So it is a model
+following a push stream.
+
+IT IS ORGANISED BY FUNCTION, not by location, and that was a correction. The
+first version grouped everything by room, which is the obvious reading of a hub
+whose devices each carry a room -- and it put a lamp, an occupancy sensor and a
+light meter in one list. Those answer three unrelated questions: what can I
+switch, is anyone there, how bright is it. Room is still shown; it is a label
+rather than the axis.
+
+    lights     actuators, grouped BY ROOM inside the section -- because that is
+               genuinely how you think about lights -- with the controls the hub
+               says it will accept
+    presence   occupancy. Motion is an EVENT, so the row shows when it last fired,
+               not what the sensor reads at this instant. The hub clears
+               isDetected on its own schedule, so a strict reading flickers; the
+               dot holds for thirty seconds.
+    remotes    inputs. Nothing to operate, and the only actionable fact is battery.
+
+ONE PHYSICAL SENSOR, ONE ROW, which needed a change to the bridge. A VALLHORN is a
+single unit on the wall that the hub reports as TWO devices -- a motion sensor and
+a light sensor -- joined only by a shared `relationId`. The bridge had not been
+publishing that field, so the station could not tell them apart from two separate
+sensors, and the light-sensor halves showed up as nameless roomless rows (they
+carry neither of their own). With `relation` published, the light meter is folded
+into its twin's row as a reading, and the seventeen devices become thirteen rows:
+five lights, three sensor UNITS rather than six devices, five remotes, with the
+gateway and the three folded-in meters not shown at all. A light sensor with no
+motion twin still gets its own row, since then it really is a standalone meter.
+
+Three further things come from the topics rather than from assumption:
+
+  * WHICH CONTROL TO SHOW comes from the hub. A light gets a switch only if the
+    hub accepts isOn, a brightness slider only for lightLevel, a warmth slider
+    only for colorTemperature, over the bulb's own Kelvin range. None of it is
+    inferred from the device type, because the type does not determine it -- a
+    dimmable white bulb and a tunable one are both `light`. This is why the bridge
+    publishes can_set_on / can_set_level / can_set_temperature separately rather
+    than one `controllable` flag: the GUI needed the specifics, and the hub is the
+    only thing that knows them.
+  * A COMMAND IS NOT A CONFIRMATION. The hub answers 202 and applies the change
+    asynchronously, or not at all for an unreachable device. So a switch does not
+    move when clicked -- it moves when the state topic says the light changed. The
+    click marks it pending with a blue edge, and a pending change that never
+    arrives stays visible for four seconds instead of being quietly forgotten.
+  * UNREACHABLE IS NOT OFF. Those rows are dimmed and labelled, because the hub
+    reports last-known state for a device it cannot reach -- for one bulb here, a
+    lightLevel of 100 from eight hours earlier. Showing stale state as current is
+    the whole failure mode of a home dashboard, so every row also carries the age
+    of its last report.
+
+"All on" and "all off" are per ROOM and there is deliberately no whole-house
+version: one button that switches off somebody's entire home is a mis-click
+waiting to happen.
+
+There is no watchdog, and that is a decision rather than an omission. The UGV
+needed one because a robot left driving is dangerous; a light left on is not, and
+a bridge that switched lights off when its controller went quiet would be a worse
+failure than the one it prevented. The bridge sends nothing at startup and
+nothing periodically -- only what arrives on the command topic.
+
+examples/dirigera/testdata/devices.json is a real hub's `/v1/devices`, SANITISED:
+it came out of somebody's home, so the serial numbers, timezone and room names
+are replaced. What the tests need is the shape, and every structural property
+survives -- the five device types, the canReceive lists, the paired sensors
+sharing a relationId, an unreachable device, and the temperature quirk above.
+
+FOUR BUGS THIS COST, three of them mine and all in the same layer -- the seam
+between OpenSSL and Io:
+
+  * `Io.Writer.drain` must write the already-buffered bytes AND the caller's
+    vectors, in one call. Writing only the buffered part silently truncated every
+    request: the trailing "\r\n" of each header block sat in `data`, never went
+    out, and the hub waited for a request that never finished, then closed.
+  * `Io.Reader.readVec` must advance `end` for bytes that land in the reader's
+    own buffer rather than returning them as consumed. `peekGreedy` passes no
+    buffers of its own, so EVERY byte is internal; returning the count made the
+    reader look empty after a successful read, which read as end-of-stream and
+    turned a good 308-byte response into nothing.
+  * `takeDelimiterExclusive` does not consume the delimiter, so every second
+    line read as blank. The WebSocket handshake took the first blank line as the
+    end of the headers and failed for want of a Sec-WebSocket-Accept it had never
+    looked at. `takeDelimiterInclusive` is what a line reader wants.
+  * A read failure must not be treated as a complete body. `catch break` on the
+    response loop turned a transport fault into a silently empty response, which
+    is the same class of mistake as the first two: an error path quietly
+    producing plausible data.

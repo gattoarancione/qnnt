@@ -378,3 +378,28 @@ test "nominal intrinsics describe the field of view they claim, at any size" {
         try testing.expectApproxEqAbs(@as(f32, @floatFromInt(wh[0])) / 2.0 - 0.5, intr.cx, 1e-4);
     }
 }
+
+test "nominal intrinsics follow the geometry in use, not the spec's headline mode" {
+    // What a real ZED 2i exposed: its spec row says 1920x1080, which is the SDK's
+    // capability, while over UVC it offers 672x376 and nothing else. A fallback taken from
+    // the table would be 2.86x too long for the frames actually arriving.
+    const s = spec(.zed_2i);
+    const headline = intrinsicsFor(s, s.width, s.height);
+    const uvc = intrinsicsFor(s, 672, 376);
+
+    try testing.expect(uvc.fx < headline.fx);
+    // The ratio is the width ratio, because fx scales with the pixel grid at a fixed field
+    // of view -- which is exactly why quoting one for the other is wrong by that factor.
+    try testing.expectApproxEqAbs(
+        @as(f32, 1920.0 / 672.0),
+        headline.fx / uvc.fx,
+        0.001,
+    );
+
+    // Both describe the same field of view, which is the invariant that makes the scaling
+    // correct rather than merely proportional.
+    for ([_]frame.Intrinsics{ headline, uvc }) |i| {
+        const half = std.math.atan(@as(f32, @floatFromInt(i.width)) / 2.0 / i.fx);
+        try testing.expectApproxEqAbs(s.fov_deg, half * 2.0 * 180.0 / std.math.pi, 0.01);
+    }
+}

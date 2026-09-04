@@ -361,30 +361,6 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     qnnt.installSignalHandlers();
 
-    // The published frame has to fit the node's own limit, and at scale 1 a 1080p frame is
-    // 6.2 MB. Checked before a single frame is received, because discovering it per frame
-    // means one refusal per frame with nothing published in between.
-    const published_pixels = @as(usize, s.width / scale) * (s.height / scale);
-    const est_frame = published_pixels * 3 + 256; // planes plus TLD keys and headers
-    if (est_frame > qnnt.maxFrameBytes()) {
-        std.debug.print(
-            "camera-sensor: at scale {d} a published frame is about {d} bytes, past this " ++
-                "node's {d} byte limit. Raise QNNT_MAX_FRAME_BYTES on every node on the " ++
-                "topic, or use a larger --scale.\n",
-            .{ scale, est_frame, qnnt.maxFrameBytes() },
-        );
-        return;
-    }
-
-    if (!qnnt.runPublisher(topic_depth, null, null, null) or
-        !qnnt.runPublisher(topic_cloud, null, null, null) or
-        !qnnt.runPublisher(topic_calib, null, null, null) or
-        (s.has_sensors and !qnnt.runPublisher(topic_sensors, null, null, null)))
-    {
-        std.debug.print("camera-sensor: could not register the topics\n", .{});
-        return;
-    }
-
     var path_buf: [256]u8 = undefined;
     const path: [:0]const u8 = if (shm_path_arg) |given|
         try std.fmt.bufPrintZ(&path_buf, "{s}", .{given})
@@ -410,8 +386,50 @@ pub fn main(init: std.process.Init.Minimal) !void {
     } else return;
     defer receiver.deinit(allocator);
 
+    // Everything below asks the REGION, not the spec table. The table describes what the
+    // model can do; the region says what this camera is actually sending, and they differ --
+    // a real ZED 2i over V4L2 offers 672x376 at 15 where the table says 1920x1080 at 30.
+    // Three separate numbers here were taken from the table and all three were wrong
+    // against real hardware: the frame-size estimate, the sensors decision, and the
+    // bandwidth report.
+    const cam_w = receiver.region.width();
+    const cam_h = receiver.region.height();
+    const cam_has_sensors = receiver.region.hasSensors();
+    // A producer that could not determine its own rate writes 0. Falling back to the table
+    // is better than reporting 0 MB/s, but it has to say which number it used.
+    const region_fps = receiver.region.fps();
+    const cam_fps: u16 = if (region_fps != 0) region_fps else s.fps;
 
-    const native = @as(usize, s.width) * s.height;
+    // The published frame has to fit this node's own limit, and at scale 1 a 1080p frame is
+    // 6.2 MB. Checked before a single frame is published, because discovering it per frame
+    // means one refusal per frame with nothing getting through in between.
+    const published_pixels = @as(usize, cam_w / scale) * (cam_h / scale);
+    const est_frame = published_pixels * 3 + 256; // planes plus TLD keys and headers
+    if (est_frame > qnnt.maxFrameBytes()) {
+        std.debug.print(
+            "camera-sensor: at scale {d} a published frame is about {d} bytes, past this " ++
+                "node's {d} byte limit. Raise QNNT_MAX_FRAME_BYTES on every node on the " ++
+                "topic, or use a larger --scale.\n",
+            .{ scale, est_frame, qnnt.maxFrameBytes() },
+        );
+        return;
+    }
+
+    // Registered after the camera is known, and the sensors topic only if the camera says it
+    // has any. Registering it from the spec table put a topic on the bus that nothing would
+    // ever publish to -- a subscriber would attach and wait for ever, which is worse than
+    // the topic not existing.
+    if (!qnnt.runPublisher(topic_depth, null, null, null) or
+        !qnnt.runPublisher(topic_cloud, null, null, null) or
+        !qnnt.runPublisher(topic_calib, null, null, null) or
+        (cam_has_sensors and !qnnt.runPublisher(topic_sensors, null, null, null)))
+    {
+        std.debug.print("camera-sensor: could not register the topics\n", .{});
+        return;
+    }
+
+
+    const native = @as(usize, cam_w) * cam_h;
     small_depth = try allocator.alloc(u16, native);
     defer allocator.free(small_depth);
     small_mono = try allocator.alloc(u8, native);
@@ -425,12 +443,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     point_wire = try allocator.alloc(u8, native * point_stride);
     defer allocator.free(point_wire);
 
-    // From the region, not the spec: the camera stamped its actual geometry there, and a
-    // fake run with --fps or a different mode would not match the table.
-    const ow = receiver.region.width() / scale;
-    const oh = receiver.region.height() / scale;
+    const ow = cam_w / scale;
+    const oh = cam_h / scale;
+    // The camera's rate, not the table's. Against a real ZED 2i at 15 fps this reported
+    // 5.7 MB/s where the truth was 2.84, because it multiplied by the table's 30 -- and the
+    // bandwidth figure is the whole basis on which --scale gets chosen.
     const wire_rate = @as(f64, @floatFromInt(@as(usize, ow) * oh * 3)) *
-        @as(f64, @floatFromInt(s.fps)) / 1.0e6;
+        @as(f64, @floatFromInt(cam_fps)) / 1.0e6;
 
     std.debug.print(
         "camera-sensor: {s} from {s}{s}\n" ++
@@ -440,9 +459,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .{
             s.name,
             path,
-            if (receiver.region.hasSensors()) ", with sensors" else "",
-            receiver.region.width(),
-            receiver.region.height(),
+            if (cam_has_sensors) ", with sensors" else "",
+            cam_w,
+            cam_h,
             ow,
             oh,
             scale,
@@ -458,7 +477,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             topic_depth,
             topic_cloud,
             topic_calib,
-            if (s.has_sensors) " and /sensors" else "",
+            if (cam_has_sensors) " and /sensors" else "",
         },
     );
     std.debug.print("  {d} frame slots of {d:.1} MB each in the mapping\n", .{

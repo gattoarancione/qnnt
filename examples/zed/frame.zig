@@ -350,7 +350,20 @@ pub fn Receiver(comptime Driver: type) type {
             return .{
                 .io = io,
                 .region = region,
-                .intrinsics = Driver.defaultIntrinsics(model),
+                // Nominal intrinsics for the geometry the CAMERA is actually sending, not
+                // for the spec table's headline mode.
+                //
+                // A real ZED 2i found this. Its spec row says 1920x1080, which is what the
+                // SDK can do; over UVC on this machine it offers 672x376 and nothing else.
+                // Taking the fallback from the table gave focal lengths 2.86x too long for
+                // the frames arriving, and every deprojected point with them. The fake never
+                // caught it because a fake built from the spec table always agrees with the
+                // spec table.
+                .intrinsics = Driver.intrinsicsFor(
+                    Driver.spec(model),
+                    region.width(),
+                    region.height(),
+                ),
                 .depth = try allocator.alloc(u16, n),
                 .mono = try allocator.alloc(u8, n),
                 .started_us = @intCast(std.Io.Timestamp.now(io, .real).toMicroseconds()),

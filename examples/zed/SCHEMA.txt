@@ -388,21 +388,70 @@ camera on GMSL2 or USB is not reachable over IP, and pretending otherwise was wh
 version of this chain got wrong.
 
 
-pointing it at a real ZED X
----------------------------
+running it against a REAL camera
+--------------------------------
 
-Not possible as written, and it should not pretend otherwise. A real ZED presents itself
-through the ZED SDK -- GMSL2 for an X, USB 3.0 for a 2i -- and not over any transport this
-chain could open.
+    zig build zed -Duvc -Doptimize=ReleaseFast
 
-The port is smaller than it would have been, though, which is the dividend of getting the
-seam right. `shm.takeFrame` already has the shape of `grab()` followed by
-`retrieveMeasure()`: ask for the newest frame, get it or get nothing, and learn how many you
-missed. Replacing shm.zig's producer with SDK calls that fill the same slots leaves
-frame.zig, the deprojection, camera.zig, the TLD schema and the viewer untouched -- none of
-them know where the bytes came from.
+    ./zig-out/bin/zed-uvc                          # terminal 1: the camera itself
+    ./zig-out/bin/camera-sensor --model zed2i --scale 1
+    ./zig-out/bin/camera-viewer '' camera/zed2i    # terminal 3: from the project root
 
-That is the whole reason the seam sits at the SDK boundary rather than somewhere more
-convenient. It is also why `from_device` exists on the intrinsics: against a real camera
-they come from `getCameraInformation().camera_configuration.calibration_parameters`, and a
-consumer needs to know when it is looking at those rather than at a plausible guess.
+The bridge does not grab from the camera and never did -- it reads the shared region. So
+the only thing that changes is the PRODUCER: `zed-uvc` instead of `fake-zed`. The driver,
+the bridge, the topics and the viewer are untouched, which is the whole point of the seam
+sitting where it does.
+
+`--scale 1` rather than the default 4: over UVC a frame is 672x376 and 22.7 MB/s, so there
+is nothing to decimate. The default of 4 exists for a 1080p camera and would reduce this to
+168x94.
+
+Measured on a real ZED 2i:
+
+    zed-uvc:       15 frames/s, gap 65.1-68.4 ms, 672x376 left eye, depth absent
+    camera-sensor: 15.0 frames/s, 137 published, 0 missed, 0 torn, 758106 B depth + 62 B cloud
+    camera-viewer: 15 frames/s, 672x376, 100% without depth, 0 missed
+
+`-Duvc` is macOS only, because zed-uvc is AVFoundation capture. It is opt-in rather than
+automatic so that the ordinary build needs no Xcode frameworks.
+
+
+what the real camera settled, and what it could not
+---------------------------------------------------
+
+WHAT IT OFFERS IS NOT WHAT THE TABLE SAYS. The spec row for a ZED 2i reads 1920x1080 at 30,
+which is the SDK's capability. Over UVC this camera offers exactly one mode:
+
+    1344 x 376  yuvs  15 fps        = 2 x 672x376 side by side
+
+That is all. No 1080p, no 30 fps, no choice. zed-uvc asks the camera and uses what it finds,
+rather than believing the table -- the same lesson the Helios taught in examples/lidar.
+
+And asking exposed a real bug. The driver's FALLBACK intrinsics were computed from the spec
+table's resolution rather than from the geometry actually arriving, so against this camera it
+produced fx 672.20 -- the focal length for 1920 px -- where 672 px needs 235.27. Every
+deprojected point would have been out by 2.86x. The fake never caught it, because a fake
+built from the spec table always agrees with the spec table.
+
+Three things this cannot check, and they are not small:
+
+  * DEPTH. It is the ZED SDK's proprietary matcher and needs CUDA, and there is no ZED SDK
+    for macOS at all. Over UVC the camera hands over the raw stereo pair and nothing else,
+    so the mono plane here is genuinely the camera's left image at its real rate and real
+    jitter, and the depth plane is zero throughout. The chain treats that as "no depth",
+    which is the normal condition for a stereo camera over much of any frame -- the cloud
+    correctly collapses to 62 bytes with no points -- but no depth VALUE is exercised.
+  * FACTORY INTRINSICS. They live in a per-serial calibration file the SDK fetches. Without
+    it the driver falls back to nominal values and says so, which is exactly what
+    `from_device` is for.
+  * THE IMU, BAROMETER AND MAGNETOMETER. Also SDK-only, so the region declares
+    has_sensors = 0 and the sensors topic stays silent.
+
+So the transport, the driver, the bridge and the viewer are validated against real hardware
+at real rates. Depth and calibration are not, and a Linux or Windows host with the SDK is the
+only way to change that -- on which the port is replacing zed-uvc's capture with
+`sl::Camera` calls that fill the same slots, and touching nothing else.
+
+Real jitter is worth one note, because the fake does not model it: inter-frame gaps measured
+65.1 to 69.2 ms against a 66.7 ms nominal period, and during startup as low as 0.6 ms, so
+frames sometimes arrive in pairs. fake-zed is a metronome by comparison.
