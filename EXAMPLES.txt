@@ -1414,3 +1414,95 @@ between OpenSSL and Io:
     response loop turned a transport fault into a silently empty response, which
     is the same class of mistake as the first two: an error path quietly
     producing plausible data.
+
+--------------------------------------------------------------------------------
+ 16. Federation topologies: examples/federation/
+--------------------------------------------------------------------------------
+
+What a federated registry converges to when the peers are wired four different
+ways:
+
+    node.py          one site, or one app on a site
+    topologies.py    the harness: four checks across four topologies
+
+    python3 examples/federation/topologies.py            # all of it, ~5 min
+    python3 examples/federation/topologies.py converge
+    python3 examples/federation/topologies.py clocks --forget   # adds a 5 min wait
+
+Six sites, each a separate process with its own registry port and its own
+federation port -- several fit on one machine because the registry is host-local
+by design, so here "host" means "registry port". A topology is then nothing but a
+set of QNNT_PEERS lists:
+
+    star    B,C,D,E all dial A. A dials nobody.
+    ring    A->B->C->D->E->A
+    mesh    every site dials every other
+    hybrid  A=B=C meshed, D dials A, E dials D -- a chain hanging off a mesh
+
+SITE Z IS THE CONTROL and it is what makes the rest mean anything: it carries the
+cluster key, has no peers, and nobody dials it. It must see only its own topic and
+nothing may see its topic. Without it, "every site sees every topic" would equally
+be the result of every probe accidentally reading one shared registry -- the
+easiest way for a test like this to pass while proving nothing.
+
+RESULT: all four topologies converge to the same directory, and all four deliver.
+
+                     converged   delivery at 2 hops   survives one death
+    star               0.4s            yes              NO  -- hub is the SPOF
+    ring               2.7s            yes              yes -- becomes a chain
+    mesh               0.4s            yes              yes
+    hybrid             0.4s            yes              partly -- leaf cut off
+
+Four things this established that are not obvious from the source:
+
+A ONE-WAY PEER LIST GIVES TWO-WAY VISIBILITY. In the star the hub dials nobody,
+yet it sees every leaf, and the leaves see each other through it. An exchange
+pushes the local entries and then pulls the peer's over the same connection, so
+expected reachability is the transitive closure over the UNDIRECTED graph. That
+matches what addPeer's doc claims -- "peer lists need not be symmetric or
+complete" -- and it is why the star works at all with the hub unconfigured.
+
+CONVERGENCE IS EAGER, NOT ON THE TIMER. The sync interval is 5s, but a star or a
+mesh converges in 0.4s because a change is pushed when it happens. The ring took
+2.7s: multi-hop relay, one hop per push, and the version check stops it looping.
+
+FEDERATION IS A CONTROL PLANE, NOT A DATA PLANE. Delivery is identical at one hop
+and two -- 77 to 78 messages in an 8s window at 10 Hz either way. In `hybrid`,
+where E reaches A only through D, the subscriber at E connects to port 49788,
+which is A's OWN publisher socket. D carried the address and nothing else, so it
+cannot bottleneck the data and its death cannot interrupt an established
+subscription -- only the ability to learn about new topics.
+
+TOPOLOGY ONLY MATTERS WHEN SOMETHING DIES. On the happy path all four look
+identical, so the difference has to be measured by killing a site and then
+publishing something NEW at a survivor -- which isolates connectivity from expiry:
+
+    star, hub killed        nobody learns it. Every leaf's only peer is gone.
+    ring, one site killed   all four survivors learn it; the loop is now a chain.
+    mesh, one site killed   all four learn it.
+    hybrid, joint killed    the meshed core learns it; the chained leaf does not.
+
+A WRONG TEST, WORTH RECORDING. The first resilience check asserted that a dead
+site's topic disappears from the survivors' listings, and failed all four
+topologies. The implementation was right and the test was wrong: federation has
+TWO clocks, and neither is the 6s registry staleness.
+
+    fed_serve_until_us  = 30s    the entry stops being HANDED OUT to subscribers,
+                                 "because pointing a subscriber at an unreachable
+                                 host just makes it retry", and stops being relayed
+    fed_forget_after_us = 300s   the entry is REMOVED from the directory
+
+So a topic whose publisher died ten seconds ago is still listed, on purpose, and
+judging resilience by the listing measures expiry rather than topology. Both
+clocks were then confirmed against the registry's own answer to `sub`, which
+distinguishes all three states where a listing cannot:
+
+    t+  8s   listed=True    tcp://127.0.0.1:50838                 served
+    t+ 41s   listed=True    error: topic fed/e/beacon expired     withheld
+    t+311s   listed=False   error: topic fed/e/beacon not found   forgotten
+
+The instrument mattered twice over. The first attempt asked whether `qnnt-cat`
+printed "subscribed to ... @ tcp://...", which it prints only on a successful
+ATTACH -- so against a dead publisher it prints nothing whether or not an endpoint
+was handed out, and it reported a mismatch at t+8s that was an artifact of the
+probe. Asking the registry directly is what separated the two.
