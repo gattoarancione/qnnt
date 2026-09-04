@@ -181,6 +181,36 @@ a viewer starting later subscribed, waited for the depth range it needs to scale
 and never received one. Keeping a topic alive for late subscribers is the bridge's job, so
 the bridge now republishes on a timer and announces only on change.
 
+a bug --scale created, and what it says about fixed buffers
+-----------------------------------------------------------
+
+`camera-viewer` crashed at `--scale 2` every time and at `--scale 3` sometimes, on both
+models. The decode wrote into a fixed member array of 640x400 u16 while checking only that
+the INCOMING buffers were long enough -- never that the geometry fitted the destination:
+
+    scale 4    480x270      129,600 px     fits
+    scale 3    640x360      230,400 px     fits, barely
+    scale 2    960x540      518,400 px     twice past the end
+    scale 1   1920x1080   2,073,600 px     eight times past
+
+The array was a member of the object that owned the calibration and the counters, so
+overflowing it corrupted the reader's own state -- which is why scale 3, sitting just inside
+the bound, was unreliable rather than cleanly broken.
+
+640x400 was correct when this chain only ever published 320x200. It stopped being correct
+the moment the bridge grew `--scale`, and nothing connected the two: the constant lived in
+the viewer, the new capability lived in the bridge, and no test crossed the boundary. The
+buffer is now sized from the frame it decodes, the geometry is bounded against the driver's
+own ceiling before anything is allocated, and every scale from 1 to 4 is checked on both
+models.
+
+    zed2i   scale 1  1920x1080    scale 2  960x540    scale 3  640x360    scale 4  480x270
+    zedx    scale 1  1920x1200    scale 2  960x600    scale 3  640x400    scale 4  480x300
+
+The general form is worth keeping: a decode buffer must be sized from the frame in front of
+it, never from what the sender happened to send when the code was written.
+
+
 the sensors topic
 -----------------
 

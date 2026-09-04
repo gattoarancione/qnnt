@@ -31,13 +31,24 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <vector>
 #include <cstdio>
 #include <cstring>
 
 namespace {
 constexpr auto kDefaultTopic = "camera/zedx";
-constexpr int kMaxWidth = 640;
-constexpr int kMaxHeight = 400;
+
+/// The largest geometry this will accept, matching the driver's own ceiling in frame.zig
+/// (a ZED 2i's 2K mode). It is a sanity bound on a number that arrives over the network,
+/// not a buffer size -- the buffers below are sized from the frame.
+///
+/// It was 640x400 and fixed, which was true when the chain only ever published 320x200 and
+/// became wrong the moment the bridge grew --scale. At scale 2 a 960x540 frame wrote twice
+/// past the end of a fixed member array and corrupted the object holding it; at scale 1,
+/// eight times past. The lesson is not the number, it is that a decode buffer must be sized
+/// from the frame it decodes and never from what the sender happened to send last month.
+constexpr int kMaxWidth = 2208;
+constexpr int kMaxHeight = 1242;
 
 /// A blue-to-red ramp over the depth range, built once. Not a perceptually uniform map --
 /// that is a bigger discussion than this example needs -- but monotonic in hue, so nearer
@@ -86,6 +97,9 @@ public:
     void setFrame(int w, int h, const std::uint16_t* depth_mm, const std::uint8_t* mono,
                   std::uint16_t depth_min, std::uint16_t depth_max) {
         if (w <= 0 || h <= 0 || w > kMaxWidth || h > kMaxHeight) return;
+        // The QImages are rebuilt whenever the geometry changes, so nothing here assumes a
+        // size -- but the guard above still matters: it is the only thing standing between a
+        // hostile width and a QImage allocation sized from it.
 
         if (m_mono.width() != w || m_mono.height() != h) {
             m_mono = QImage{w, h, QImage::Format_Grayscale8};
@@ -293,7 +307,17 @@ private:
         }
 
         const std::size_t pixels = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
-        if (w <= 0 || h <= 0 || depth.size() < pixels * 2 || mono.size() < pixels) return;
+
+        // Every one of these is load-bearing. The geometry arrives in the frame, so it is
+        // the sender's number and not this program's: it bounds the allocation below, and
+        // the buffer lengths have to agree with it before a single byte is read.
+        if (w <= 0 || h <= 0 || w > kMaxWidth || h > kMaxHeight) return;
+        if (depth.size() < pixels * 2 || mono.size() < pixels) return;
+
+        // Sized from the frame, not from a constant. This used to be a fixed member array
+        // holding 640x400, and anything larger wrote past it -- which is what made
+        // --scale 2 a certain crash and --scale 3 a marginal one.
+        if (m_depth_scratch.size() < pixels) m_depth_scratch.resize(pixels);
 
         // Little-endian u16 out of the buffer. Copied into a typed scratch array rather
         // than reinterpret_cast over the payload: the buffer's alignment is whatever the
@@ -377,7 +401,9 @@ private:
     QString m_calibration;
     QString m_status;
 
-    std::array<std::uint16_t, static_cast<std::size_t>(kMaxWidth) * kMaxHeight> m_depth_scratch{};
+    /// Grown to fit whatever geometry arrives, and never shrunk: a stream that alternates
+    /// between two sizes should not reallocate every frame.
+    std::vector<std::uint16_t> m_depth_scratch;
     std::uint16_t m_depth_min = 0;
     std::uint16_t m_depth_max = 0;
     bool m_have_calibration = false;
