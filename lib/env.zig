@@ -21,6 +21,7 @@
 //!   QNNT_PEERS             host[:port],... to dial; host may be an address or a name
 //!   QNNT_RT_PRIORITY       SCHED_FIFO priority for worker threads (Linux only)
 //!   QNNT_LOCK_MEMORY       1 to pin pages with mlockall (Linux only)
+//!   QNNT_MAX_FRAME_BYTES   largest TLD frame published or accepted (default 16 MiB)
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -99,6 +100,15 @@ pub fn configureFromEnvironment() void {
             .{},
         );
         return;
+    }
+
+    if (get("QNNT_MAX_FRAME_BYTES")) |text| {
+        if (std.fmt.parseInt(usize, text, 10)) |value| {
+            // Both ends of THIS node. Two nodes on a topic are two settings, so a producer
+            // raising its own does not raise its consumers' -- which is worth knowing before
+            // wondering why a bigger frame still gets refused.
+            if (!qnnt.setMaxFrameBytesFn(value)) reject("QNNT_MAX_FRAME_BYTES", text);
+        } else |_| reject("QNNT_MAX_FRAME_BYTES", text);
     }
 
     if (get("QNNT_REGISTRY_PORT")) |text| {

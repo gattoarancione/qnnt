@@ -46,6 +46,75 @@ pub fn build(b: *Build) void {
 
     b.installArtifact(qnnt_lib);
 
+    // The camera-to-driver handoff. Its own module because both ends use it and neither
+    // owns it: the fake writes, the driver reads.
+    const zed_shm_mod = b.createModule(.{
+        .root_source_file = b.path("examples/zed/shm.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true, // open, ftruncate, mmap
+    });
+
+    // The depth-camera chain's shared vocabulary, the analogue of examples/lidar/scan.zig.
+    const zed_frame_mod = b.createModule(.{
+        .root_source_file = b.path("examples/zed/frame.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const zed_driver_mod = b.createModule(.{
+        .root_source_file = b.path("examples/zed/zed.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zed_driver_mod.addImport("frame", zed_frame_mod);
+    zed_frame_mod.addImport("shm", zed_shm_mod);
+
+    const zed_world_mod = b.createModule(.{
+        .root_source_file = b.path("examples/zed/world.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zed_world_mod.addImport("frame", zed_frame_mod);
+
+    const zed_step = b.step("zed", "Build the fake ZED camera, the bridge, and the viewer with -Dqt=...");
+
+    // The fake camera: no qnnt at all, exactly like the LiDAR fakes. It speaks the framing
+    // in zed.zig and nothing else.
+    const fake_zed_mod = b.createModule(.{
+        .root_source_file = b.path("examples/zed/fake_zed.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    fake_zed_mod.addImport("frame", zed_frame_mod);
+    fake_zed_mod.addImport("zed", zed_driver_mod);
+    fake_zed_mod.addImport("world", zed_world_mod);
+    fake_zed_mod.addImport("shm", zed_shm_mod);
+
+    const fake_zed = b.addExecutable(.{ .name = "fake-zed", .root_module = fake_zed_mod });
+    b.installArtifact(fake_zed);
+    zed_step.dependOn(&b.addInstallArtifact(fake_zed, .{}).step);
+
+    // The bridge: the driver on one side, qnnt topics on the other.
+    const camera_mod = b.createModule(.{
+        .root_source_file = b.path("examples/zed/camera.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    camera_mod.addImport("frame", zed_frame_mod);
+    camera_mod.addImport("zed", zed_driver_mod);
+    camera_mod.addImport("shm", zed_shm_mod);
+    camera_mod.addImport("qnnt", qnnt_lib_mod);
+    camera_mod.linkLibrary(qnnt_lib);
+
+    const camera_sensor = b.addExecutable(.{ .name = "camera-sensor", .root_module = camera_mod });
+    b.installArtifact(camera_sensor);
+    zed_step.dependOn(&b.addInstallArtifact(camera_sensor, .{}).step);
+
+
     // The TLD codec's C ABI, built both ways: static for C/C++ callers that link, shared
     // for anything that loads it at runtime (ctypes/cffi will want the latter). Its root
     // is only the codec, so the shared object pulls in no threads and no sockets.
@@ -269,6 +338,13 @@ pub fn build(b: *Build) void {
                 .help = "Build the Qt/QML LiDAR viewer (needs -Dqt=...)",
                 .quick = true,
             },
+            .{
+                .name = "camera-viewer",
+                .src = "examples/zed/viewer.cpp",
+                .step = "camera-viewer",
+                .help = "Build the Qt/QML depth camera viewer (needs -Dqt=...)",
+                .quick = true,
+            },
         };
 
         for (qt_examples) |ex| {
@@ -323,6 +399,9 @@ pub fn build(b: *Build) void {
             // So that `zig build mesh -Dqt=...` builds all five rather than four.
             if (std.mem.eql(u8, ex.name, "mesh-qt")) {
                 mesh_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
+            }
+            if (std.mem.eql(u8, ex.name, "camera-viewer")) {
+                zed_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
             }
             if (std.mem.eql(u8, ex.name, "lidar-viewer")) {
                 lidar_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
@@ -393,6 +472,10 @@ pub fn build(b: *Build) void {
         "lib/qnnt.zig",
         "examples/lidar/scan.zig",
         "src/topics.zig",
+        "examples/zed/frame.zig",
+        "examples/zed/zed.zig",
+        "examples/zed/world.zig",
+        "examples/zed/shm.zig",
         "src/ls.zig",
         "src/cat.zig",
     }) |src| {
@@ -412,6 +495,12 @@ pub fn build(b: *Build) void {
             test_mod.addImport("qnnt", qnnt_lib_mod);
             test_mod.addImport("topics", topics_mod);
             test_mod.addImport("stdout", stdout_mod);
+        }
+        // The camera driver is written against the shared vocabulary the same way a
+        // consumer would be, so its tests need that module.
+        if (std.mem.startsWith(u8, src, "examples/zed/")) {
+            test_mod.addImport("frame", zed_frame_mod);
+            test_mod.addImport("shm", zed_shm_mod);
         }
 
         const tests = b.addTest(.{ .root_module = test_mod });

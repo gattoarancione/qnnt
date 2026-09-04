@@ -506,3 +506,40 @@ test "listTopics reads back the topics the registry is publishing" {
     var tiny: [1][]const u8 = undefined;
     try testing.expect(try qnnt.listTopics(&tiny, &buf) <= 1);
 }
+
+test "the frame cap applies to publishing as well as subscribing" {
+    try startNode();
+    defer qnnt.deinit();
+
+    // The default is generous enough for a 1080p depth frame, which a megabyte was not.
+    try testing.expect(qnnt.maxFrameBytes() >= 6 * 1024 * 1024);
+
+    try testing.expect(qnnt.runPublisher("test/capped", null, null, null));
+
+    // Small enough: fine.
+    const ok = try testing.allocator.alloc(u8, 1024);
+    defer testing.allocator.free(ok);
+    @memset(ok, 0);
+    try qnnt.publish("test/capped", ok);
+
+    // Tighten the cap, then exceed it. The publish fails HERE rather than at every
+    // subscriber, which is the whole point: an oversized frame makes a subscriber break its
+    // read loop and reconnect into the same frame, while the producer sees nothing wrong.
+    try testing.expect(qnnt.setMaxFrameBytes(4096));
+    try testing.expectEqual(@as(usize, 4096), qnnt.maxFrameBytes());
+
+    const too_big = try testing.allocator.alloc(u8, 8192);
+    defer testing.allocator.free(too_big);
+    @memset(too_big, 0);
+    try testing.expectError(error.FrameTooLarge, qnnt.publish("test/capped", too_big));
+
+    // Still fine at exactly the limit.
+    try qnnt.publish("test/capped", too_big[0..4096]);
+
+    // A nonsense cap is refused rather than accepted and then blocking everything.
+    try testing.expect(!qnnt.setMaxFrameBytes(0));
+    try testing.expect(!qnnt.setMaxFrameBytes(16));
+    try testing.expectEqual(@as(usize, 4096), qnnt.maxFrameBytes());
+
+    try testing.expect(qnnt.setMaxFrameBytes(qnnt.default_max_frame_bytes));
+}

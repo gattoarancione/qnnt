@@ -1,0 +1,378 @@
+depth cameras on qnnt: fake sensor -> driver -> node -> viewer
+==============================================================
+
+The same four layers as examples/lidar, for Stereolabs stereo cameras.
+
+    ZED X    1920x1200 at 30 fps, GMSL2
+    ZED 2i   1920x1080 at 30 fps, USB 3.0, plus an IMU, barometer and magnetometer
+
+ONE driver for both, where the LiDAR needed two. That is what the seam says: an RS-16 and a
+Helios speak genuinely different wire formats, so they get different parsers. Two ZEDs are
+the same two SDK calls returning the same two planes, differing in resolution, baseline,
+field of view and which extra sensors exist -- parameters, so they live in a table.
+
+    fake_zed.zig   a process that produces frames at the camera's NATIVE resolution
+        |           SHARED MEMORY: a ring of frame slots, as the SDK hands over a pointer
+        |           shm.zig -- no qnnt, no sockets, no serialisation
+        v
+    zed.zig        the driver: parses, reassembles, validates, applies calibration
+    frame.zig       the model-independent vocabulary and the deprojection
+        |
+        v
+    camera.zig      the qnnt node: DECIMATES, packs TLD and publishes
+        |           "camera/<model>/depth", "/cloud", "/calibration", "/sensors"
+        v
+    viewer.cpp      Qt/QML: the mono image and depth, colourised
+
+
+read this part first: what is real and what is not
+--------------------------------------------------
+
+The LiDAR chain in examples/lidar fakes a wire that EXISTS. An RS-Helios pushes UDP
+datagrams whose layout is documented in RoboSense's own driver, and this repository's
+version of it was corrected against a real unit at 192.168.3.221 -- where almost every
+guessed constant turned out to be wrong.
+
+A ZED X has no network protocol. It runs GMSL2 coax into a ZED Link capture card and is
+read through the ZED SDK:
+
+    sl::Camera cam;
+    cam.retrieveMeasure(depth, sl::MEASURE::DEPTH);
+    cam.retrieveImage(left, sl::VIEW::LEFT);
+
+There is nothing on a wire to imitate, so the handoff in shm.zig is INVENTED. It stands in
+for that SDK boundary: a depth map and a mono image appearing in a buffer, which is the shape
+of what those two calls hand over. Nothing about it is a ZED protocol -- there is no ZED
+protocol -- and no amount of it passing tests makes it one.
+
+What that means in practice:
+
+  * everything from the driver's OUTPUT onwards -- frame.zig's vocabulary, the deprojection,
+    the TLD schema, the node, the viewer -- is a faithful analogue of the LiDAR chain and
+    would be unchanged against a real camera.
+  * the fake and the driver's parser are two halves of one invention. A round trip between
+    them proves they agree with each other, which is worth having (it catches offsets that
+    drift) and is not evidence about hardware.
+  * porting this to a real ZED means replacing shm.zig's producer with SDK calls and keeping
+    everything else. That is the point of the seam being where it is -- and shared memory
+    makes the port smaller than a transport would, because `takeFrame` already has the shape
+    of `grab()` followed by `retrieveMeasure()`.
+
+The LiDAR example earned a lesson worth repeating here: a fake built from the same
+understanding as the parser can only confirm that understanding. Two bugs there survived
+every test and fell out within minutes of real hardware.
+
+
+native resolution, and where the size decision lives
+----------------------------------------------------
+
+The fake transmits at the camera's NATIVE resolution, because that is what a camera does. A
+sensor does not downscale to suit its consumer. What varies is how much of a frame the
+BRIDGE puts on qnnt, and that decision is `--scale`:
+
+    --scale 1    1920x1080   186.6 MB/s    loopback only
+    --scale 2     960x540      46.7 MB/s   fine on gigabit
+    --scale 4     480x270      11.7 MB/s   comfortable anywhere      <- default
+    --scale 8     240x135       2.9 MB/s   about what the LiDAR example moves
+
+Those ceilings are measured, not assumed -- see BENCHMARK.txt:
+
+    loopback, 64 KiB frames     1426 MB/s
+    gigabit wired                117.6 MB/s
+    an aarch64 board's link        9.3 MB/s
+
+So 1080p whole is 13% of loopback and 1.6x past gigabit. The bridge says which side of that
+line it is on when it starts, because it is the one thing `--scale` exists to choose:
+
+    native 1920x1080, publishing 1920x1080 at scale 1: about 186.6 MB/s
+      past gigabit's measured 117.6 MB/s -- loopback only
+
+Downscaling in the bridge rather than the driver keeps the driver honest about what the
+sensor sent, and rather than the fake because a sensor has no idea what its consumer can
+carry.
+
+Decimation SAMPLES, it does not average. Averaging depth across an edge invents a surface at
+a distance nothing was measured at, halfway between foreground and background, and a stereo
+frame is full of those edges. Sampling can miss a thin object; averaging reports objects
+that are not there. It also makes the intrinsics exact: output pixel u maps to input pixel
+u*scale, so fx' = fx/scale and cx' = cx/scale with no half-pixel correction.
+
+The published intrinsics are for the PUBLISHED geometry, never the native one. Quoting
+1920x1080 focal lengths for a 480x270 frame would put every point out by exactly four.
+
+
+the frame size cap, which had to be raised and fixed
+----------------------------------------------------
+
+A 1080p depth-plus-mono frame is 6,220,800 bytes. The library's TLD subscriber capped a
+frame at 1 MiB, so every native resolution above about 786x444 was refused outright --
+regardless of frame rate, since the cap is per frame.
+
+Worse, the cap applied to ONE END. There was no limit on publishing at all, so a producer
+could emit frames every subscriber refused, and refusing is not graceful: the read loop
+breaks and reconnects, straight back into the same oversized frame. One oversized publisher
+produced an endless reconnect storm while looking, from the producer's side, entirely
+healthy. Reproducible today:
+
+    QNNT_MAX_FRAME_BYTES=1048576 qnnt-cat camera/zed2i/depth
+    # subscribes, then receives nothing, forever
+
+The default is now 16 MiB, which covers every native mode either camera has (2K is 8.2 MB),
+and it applies when publishing as well as when subscribing -- a publish over the limit fails
+at the producer, where the size was decided. `QNNT_MAX_FRAME_BYTES` sets it per node; two
+nodes on a topic are two settings, so a producer raising its own does not raise its
+consumers'.
+
+
+the handoff, and why it is shared memory
+----------------------------------------
+
+The camera-to-driver seam went through three designs, and the last one is the only one that
+models the SDK. Recorded because the wrong choices cost real work and the reasons are the
+useful part.
+
+  UDP chunking, first attempt. A 6.2 MB frame became 760 datagrams that could be lost
+    individually, so the driver grew a chunk bitmap, a byte-offset scatter able to reassemble
+    a depth value split across two datagrams, a `rows_missing` count, a socket receive buffer
+    tuned to 8 MB, and a fix for losing 83% of every frame. Every line of it modelled a
+    problem a real ZED driver does not have.
+
+  A named pipe, considered and rejected. Ordered and reliable, so all the reassembly would
+    have gone -- but macOS pipe buffers are 64 KB and cannot be enlarged (F_SETPIPE_SZ is
+    Linux only). A 6.2 MB frame is 95x that, so the writer blocks about 94 times per frame
+    and the two processes lock-step. A slow consumer would THROTTLE THE CAMERA, and that is
+    the one thing real hardware cannot do.
+
+  Shared memory, which is what the SDK actually is. `retrieveMeasure()` hands you a pointer
+    into a buffer. A ring of slots in a shared mapping reproduces that exactly.
+
+    header    one page: geometry, calibration behind a seqlock, sensor ring cursor
+    sensors   512 slots of 64 B, drained by the consumer from its own cursor
+    frames    4 slots of 6.2 MB, page-aligned, 24.9 MB mapped in total
+
+The producer writes the next slot and stores the sequence number with a release fence. The
+consumer loads it with acquire, copies the slot out, then re-checks: if the producer advanced
+by a whole ring during the copy the frame is discarded as torn rather than handed over
+half-overwritten. Nothing blocks in either direction.
+
+What that buys, and all of it is the real behaviour rather than a model of it:
+
+  * the producer never waits for the consumer. A slow driver misses whole frames and sees
+    the gap in the sequence number -- reported as `missed`. That is what happens when an
+    application is late to `grab()`.
+  * a frame is whole or absent. There is no partial frame to represent, which is why
+    `rows_missing` is gone from the schema entirely.
+  * no serialisation. Depth is a native u16 array, because shared memory between two
+    processes on one machine may assume a byte order and a wire may not.
+  * no MTU, no fragmentation, no receive buffer, no reassembly.
+
+Measured through it: 120 frames a second of 6.2 MB frames, which is 746 MB/s, with zero
+missed and zero torn. The UDP version lost 83% at 187 MB/s.
+
+What it gives up is that it is local only. There is no `--from` and the fake cannot run on
+another machine the way fake-helios32 can. That is not a limitation of the model, it IS the
+model: a camera on GMSL2 or USB is not on the network either.
+
+One consequence caught the viewer out, and it is worth knowing about any value-shaped
+handoff. The calibration is written ONCE, because it is a value the consumer can read at any
+time rather than an event that repeats. Over UDP the fake resent the packet every second and
+the bridge republished it as a side effect; with shared memory that accident disappeared, and
+a viewer starting later subscribed, waited for the depth range it needs to scale anything,
+and never received one. Keeping a topic alive for late subscribers is the bridge's job, so
+the bridge now republishes on a timer and announces only on change.
+
+the sensors topic
+-----------------
+
+A ZED 2i carries an IMU, a barometer and a magnetometer; a ZED X does not expose them here.
+`has_sensors` on the calibration topic says which, reported by the camera rather than
+assumed from the model name, so a consumer follows what the device claims.
+
+    camera/<model>/sensors      400 Hz, about 23 KB/s -- a ZED 2i only
+        t_us            u64
+        model           string
+        accel           [f32 x3]  m/s^2, camera frame
+        gyro            [f32 x3]  degrees/s, camera frame
+        mag             [f32 x3]  microtesla
+        pressure_hpa    f32
+        temperature_c   f32
+
+Its own topic, because 400 Hz of 100-byte samples has nothing in common with 30 Hz of
+megabytes: different rate, different size, different consumers. At 23 KB/s it is 0.2% of the
+depth topic even at scale 4, which is why adding it costs nothing worth discussing.
+
+Two honest caveats. The fake sends all three sensors together at the IMU's 400 Hz, where real
+hardware runs the magnetometer at roughly 50 and the barometer at 25 -- so those two fields
+are the most recent reading, not a fresh one. And the samples go out in a burst once per
+frame rather than evenly spaced: the rate is modelled, the jitter is not.
+
+
+the published frames
+--------------------
+
+    camera/<model>/depth        every frame, ~389 KB at scale 4
+        seq           u32
+        t_us          u64     the camera's clock for the whole frame
+        model         string  "ZED X"
+        width,height  u16
+        rows_missing  u16     rows that never arrived
+        depth         bytes   width*height little-endian u16 millimetres
+        mono          bytes   width*height luminance
+
+    camera/<model>/cloud        every frame, ~396 KB at scale 4, step 2
+        seq, t_us, model
+        points        u32     how many follow
+        step          u16     every step-th pixel in each axis was taken
+        xyzi          bytes   points x (f32 x, f32 y, f32 z little-endian, u8 intensity)
+
+    camera/<model>/calibration  about 1 Hz
+        model, width, height
+        fx, fy, cx, cy  f32   pinhole intrinsics AT THIS width and height
+        baseline_mm     f32
+        depth_min_mm    u16
+        depth_max_mm    u16
+        from_device     bool  false means the driver's nominal defaults are in use
+
+Depth and cloud are both published because deprojection belongs in the driver -- doing it
+once beats every consumer doing it again -- but a consumer that wants the image still needs
+the image. The cloud is subsampled: every pixel would be 64,000 points, 832 KB a frame,
+12 MB/s. `--step` is the honest knob for that, and the `points` field reports what was
+actually sent rather than the pixel count.
+
+The intrinsics travel at the frame's resolution, not the sensor's native one. A downscaled
+frame has downscaled intrinsics, and quoting 1920x1080 focal lengths for a 480x270 image
+would put every point out by exactly four.
+
+`calibration` is republished on every packet from the camera, roughly 1 Hz, and NOT only
+when it changes. A consumer that attaches after the bridge would otherwise never receive it
+and would wait forever -- which is what the first version did: `qnnt-cat --max 1
+camera/zedx/calibration` hung, and so did the viewer. What is gated on change is the log
+line, not the publish.
+
+
+the geometry
+------------
+
+Depth is Z, not range. A depth map holds the perpendicular distance to the image plane, so
+deprojection is the pinhole model:
+
+    z = depth_mm / 1000
+    x = (u - cx) * z / fx
+    y = (v - cy) * z / fy
+
+The fake renders with the same model inverted, which is why its ray direction is left
+unnormalised with z at 1: the intersection parameter is then the depth directly, and there
+is nowhere to accidentally store a radial distance that would bow the whole scene outward.
+
+Camera axes are x right, y DOWN, z forward. The published cloud is in the same frame the
+LiDAR examples use -- x right, y forward, z up -- so one world frame holds a camera and a
+LiDAR together:
+
+    world = (cam_x, cam_z, -cam_y)
+
+The baseline is published but not used to deproject. Depth is already metric by the time it
+arrives; the baseline is what bounded its precision, several steps earlier.
+
+
+what the fake does that a tidy fake would not
+---------------------------------------------
+
+It drops depth. Roughly 6% of every frame has none, heavier on the dim floor, and the
+pattern moves between frames rather than staying put.
+
+That is deliberate, and it is the LiDAR lesson applied on purpose. A stereo camera has no
+depth wherever it cannot match texture -- occlusions, blank walls, glare -- and a consumer
+written against a gapless depth map falls over on the first real frame. A static dropout
+pattern would be worse than none, because it would let a consumer that caches "where there
+is no depth" appear to work.
+
+The fake is otherwise deterministic: the same sequence number and phase render identically,
+so a capture can be compared against itself.
+
+It also reports intrinsics slightly off the driver's nominal ones -- fx 113.70 against the
+default 112.x. A real calibration is never the nominal one, so a consumer that silently used
+the fallback should be visibly wrong rather than accidentally right.
+
+
+running it
+----------
+
+    zig build zed -Doptimize=ReleaseFast            # fake camera + bridge
+    zig build zed -Doptimize=ReleaseFast -Dqt=/path/to/Qt/6.10.3/macos   # and the viewer
+
+    ./zig-out/bin/fake-zed --model zed2i          # terminal 1: native 1080p
+    ./zig-out/bin/camera-sensor --model zed2i --scale 4
+    ./zig-out/bin/camera-viewer '' camera/zed2i    # terminal 3: from the project root
+
+The mapping is /tmp/qnnt-zed2i.shm by default, created by the fake and removed when it
+exits. The bridge waits for it rather than failing, so the two can start in either order.
+
+ReleaseFast is not optional if you want native frame rate: a 1080p frame is 2.07 million ray
+casts and a Debug build manages about 14 of 30. It says so rather than pretending.
+
+What each reports:
+
+    fake-zed: ZED 2i -> /tmp/qnnt-zed2i.shm
+      1920x1080 native at 30 Hz, 4 slots of 6.2 MB, 24.9 MB mapped
+      depth 200..20000 mm, fx 681.6 baseline 119.6 mm, plus a 400 Hz sensor ring
+    fake-zed: 30.0 frames/s of 30 target, 9.1 ms/frame rendering, 6.4% without depth
+
+    camera-sensor: ZED 2i from /tmp/qnnt-zed2i.shm, with sensors
+      native 1920x1080, publishing 480x270 at scale 4: about 11.7 MB/s
+      carryable on gigabit
+      4 frame slots of 6.2 MB each in the mapping
+    camera-sensor: calibration from the camera: native 1920x1080 fx 681.61,
+      published 480x270 fx 170.40, baseline 119.6 mm, sensors yes
+    camera-sensor: 30.0 frames/s, 60 published, 0 missed, 0 torn, 0 idle,
+      388896 B depth + 395944 B cloud (+sensors)
+
+    camera-viewer: depth range 200..20000 mm, calibration from the camera
+    camera-viewer: 30 frames/s, 480x270, 6% without depth, 0 missed
+
+The console tools read these topics like any others:
+
+    qnnt-ls --tree
+    camera/
+    └── zedx/
+        ├── calibration
+        ├── cloud
+        └── depth
+
+    qnnt-cat --max 1 'camera/*/calibration'
+    qnnt-cat --dump camera/zedx/depth > cap.tld     # and --restore replays it
+
+Options:
+
+    camera-sensor --model <name>   zedx or zed2i (default zedx)
+                  --shm <path>     the camera's mapping (default /tmp/qnnt-<model>.shm)
+                  --scale <n>      publish every n-th pixel in each axis (default 4)
+                  --step <n>       and every n-th pixel of THAT in the cloud (default 2)
+
+    fake-zed     --model <name>   zedx (1920x1200) or zed2i (1920x1080, with sensors)
+                  --shm <path>     where to create the mapping
+                  --slots <n>      frame slots in the ring (default 4)
+                  --fps <n>        override the native frame rate
+
+There is no `--from` and no port, because there is no network here. That is the point: a
+camera on GMSL2 or USB is not reachable over IP, and pretending otherwise was what the first
+version of this chain got wrong.
+
+
+pointing it at a real ZED X
+---------------------------
+
+Not possible as written, and it should not pretend otherwise. A real ZED presents itself
+through the ZED SDK -- GMSL2 for an X, USB 3.0 for a 2i -- and not over any transport this
+chain could open.
+
+The port is smaller than it would have been, though, which is the dividend of getting the
+seam right. `shm.takeFrame` already has the shape of `grab()` followed by
+`retrieveMeasure()`: ask for the newest frame, get it or get nothing, and learn how many you
+missed. Replacing shm.zig's producer with SDK calls that fill the same slots leaves
+frame.zig, the deprojection, camera.zig, the TLD schema and the viewer untouched -- none of
+them know where the bytes came from.
+
+That is the whole reason the seam sits at the SDK boundary rather than somewhere more
+convenient. It is also why `from_device` exists on the intrinsics: against a real camera
+they come from `getCameraInformation().camera_configuration.calibration_parameters`, and a
+consumer needs to know when it is looking at those rather than at a plausible guess.

@@ -981,3 +981,84 @@ second sends any command and hands the reply back verbatim. Both live in the lib
 the code that writes those replies, so a column added or reordered is a local change rather
 than a silent break out here. Glob matching and the tree live in one shared module for the
 same reason: what `qnnt-ls` shows must be exactly what `qnnt-cat` subscribes to.
+
+--------------------------------------------------------------------------------
+ 13. A depth camera on the same four layers: examples/zed/
+--------------------------------------------------------------------------------
+
+The LiDAR chain again, for a ZED X stereo camera, so the structure can be compared
+side by side:
+
+    fake_zed.zig   produces frames at native resolution (no qnnt)
+    shm.zig         the handoff: a ring of frame slots in shared memory
+    zed.zig        the driver: read, validate, calibrate
+    frame.zig       the model-independent vocabulary and the deprojection
+    camera.zig      the qnnt node: TLD, three topics
+    viewer.cpp      Qt/QML: the mono image and depth, colourised
+
+    zig build zed -Dqt=/path/to/Qt/6.10.3/macos
+    ./zig-out/bin/fake-zed        # terminal 1
+    ./zig-out/bin/camera-sensor    # terminal 2
+    ./zig-out/bin/camera-viewer    # terminal 3, from the project root
+
+    camera/
+    └── zed2i/
+        ├── calibration     intrinsics AT THE PUBLISHED SIZE, ~1 Hz
+        ├── cloud           the frame deprojected, subsampled
+        ├── depth           u16 millimetres + a mono image
+        └── sensors         IMU, barometer, magnetometer at 400 Hz (ZED 2i only)
+
+Two cameras, one driver: a ZED X at 1920x1200 and a ZED 2i at 1920x1080 with an IMU,
+barometer and magnetometer. The LiDAR needed two drivers because an RS-16 and a Helios speak
+different wire formats; two ZEDs are the same two SDK calls with different parameters.
+
+    ./zig-out/bin/fake-zed --model zed2i            # native 1080p, 187 MB/s of UDP
+    ./zig-out/bin/camera-sensor --model zed2i --scale 4
+    ./zig-out/bin/camera-viewer '' camera/zed2i
+
+The fake transmits at NATIVE resolution and the bridge decides how much to publish, which is
+what makes the bandwidth decision visible:
+
+    --scale 1    1920x1080   186.6 MB/s    loopback only
+    --scale 4     480x270      11.7 MB/s   comfortable anywhere      <- default
+
+Both ceilings are measured in BENCHMARK.txt: loopback carries 1426 MB/s, gigabit 117.6. The
+bridge prints which side of that line the chosen scale falls on.
+
+The camera-to-driver handoff is SHARED MEMORY, not a transport, because that is what the ZED
+SDK is: `retrieveMeasure()` hands you a pointer into a buffer. A ring of frame slots in a
+shared mapping reproduces it -- the producer never blocks, and a slow driver misses whole
+frames rather than receiving damaged ones, which is what happens when an application is late
+to `grab()`.
+
+It took three attempts to get there and the discarded ones are documented in
+examples/zed/SCHEMA.txt, because the reasons are the useful part: UDP chunking made the
+driver reassemble 760 datagrams and model packet loss that does not exist, and a named pipe
+would have lock-stepped the camera to the reader through a 64 KB buffer -- throttling the
+sensor, which real hardware cannot do. Measured through shared memory: 120 frames a second
+of 6.2 MB frames, 746 MB/s, zero loss.
+
+Supporting 1080p meant fixing a library bug worth knowing about independently. The TLD
+subscriber capped a frame at 1 MiB while the publisher had no limit at all, so a producer
+could emit frames every subscriber refused -- and refusal is not graceful: the read loop
+breaks and reconnects into the same frame forever, while the producer sees nothing wrong.
+The cap is now 16 MiB, applies to both ends, and is settable per node with
+QNNT_MAX_FRAME_BYTES.
+
+One thing is NOT like the LiDAR chain, and examples/zed/SCHEMA.txt says so at the top. The
+LiDAR fake reproduces a wire that exists -- and this repository's version of it was
+corrected against real hardware. A ZED X has no network protocol: it runs GMSL2 into a
+capture card and is read through the ZED SDK, so the framing in zed.zig is INVENTED and
+stands in for that SDK boundary. Everything from the driver's output onwards is a faithful
+analogue; that one seam is not, and porting to a real camera means replacing it with
+sl::Camera calls and keeping the rest.
+
+What the chain does exercise, and what a real camera would exercise identically: reassembling
+a 200-datagram frame, counting the rows that never arrive, refusing intrinsics that would
+produce a plausible-looking cloud out of nonsense, and telling a consumer whether the
+calibration came from the camera or from the driver's nominal defaults. The fake also drops
+about 6% of every frame's depth, moving between frames -- because a stereo camera does, and
+a consumer written against a gapless depth map falls over on the first real frame.
+
+See examples/zed/SCHEMA.txt for the wire format, the published schema, the geometry and
+what it would take to point this at real hardware.

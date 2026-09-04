@@ -851,6 +851,12 @@ pub const Qnnt = struct {
     pub const queueDropped = &queueDroppedCount;
     pub const deinit = &nodeDeinit;
     pub const sleepMs = &sleepMsFn;
+
+    /// The frame size cap, honoured when publishing and when subscribing. See
+    /// `default_max_frame_bytes`.
+    pub const maxFrameBytes = &@import("qnnt.zig").maxFrameBytes;
+    pub const setMaxFrameBytes = &setMaxFrameBytesFn;
+    pub const default_max_frame_bytes = @import("qnnt.zig").default_max_frame_bytes;
     /// Microsecond sleep, for anything pacing itself against the scheduler's own unit --
     /// a capture replayed at its recorded rate, for instance.
     pub const sleepUs = &sleepUsFn;
@@ -1820,6 +1826,20 @@ fn registryRun() void {
 }
 
 pub fn publishAll(topic: []const u8, data: []const u8) !void {
+    // Checked here, at the producer, because the alternative is discovering it at every
+    // consumer: a subscriber that meets an oversized frame breaks its read loop and
+    // reconnects into the same frame forever, while this end sees nothing wrong at all.
+    // Failing the publish puts the error where the size was decided.
+    if (data.len > maxFrameBytes()) {
+        std.debug.print(
+            "publish to {s}: {d} bytes exceeds the {d} byte frame limit -- subscribers " ++
+                "would refuse it and reconnect in a loop. Publish less per message, or " ++
+                "raise QNNT_MAX_FRAME_BYTES on every node on the topic.\n",
+            .{ topic, data.len, maxFrameBytes() },
+        );
+        return error.FrameTooLarge;
+    }
+
     // Peers whose write failed, reported after the lock is released.
     var lost: [8][64]u8 = undefined;
     var lost_len: [8]usize = @splat(0);
@@ -2224,9 +2244,34 @@ pub fn subscribeRun(topic: []const u8, handler: Qnnt.MessageHandler, context: ?*
     return true;
 }
 
-// A declared TLD length is 8 attacker-controlled bytes, so cap what one frame may ask
-// this process to buffer.
-const max_frame_bytes = 1 << 20;
+/// The largest frame this node will accept, and the largest it will publish.
+///
+/// A declared TLD length is 8 attacker-controlled bytes, so a receiver has to cap what one
+/// frame may ask it to buffer. The cap stays; what changed is that it applies to BOTH ends.
+/// A 1 MiB limit on the subscriber with no limit at all on the publisher meant a producer
+/// could emit frames that every subscriber refused -- and refusing is not graceful here: the
+/// read loop breaks and reconnects, straight back into the same oversized frame. One
+/// oversized publisher produced an endless reconnect storm and looked, from the producer's
+/// side, like everything was fine.
+///
+/// 16 MiB rather than 1: a 1080p depth-plus-mono frame is 6.2 MB and a 2K one is 8.2 MB, so
+/// a megabyte ruled out every sensor resolution above about 786x444 regardless of frame
+/// rate. Deployments that want a tighter bound can set QNNT_MAX_FRAME_BYTES.
+pub const default_max_frame_bytes = 16 << 20;
+
+var max_frame_bytes_value = std.atomic.Value(usize).init(default_max_frame_bytes);
+
+pub fn maxFrameBytes() usize {
+    return max_frame_bytes_value.load(.monotonic);
+}
+
+/// Set the cap. Both ends of this node honour it; the two ends of a LINK are two nodes, so
+/// a publisher raising its own does not raise its subscribers'.
+pub fn setMaxFrameBytesFn(bytes: usize) bool {
+    if (bytes < 1024) return false; // below any useful frame; almost certainly a typo
+    max_frame_bytes_value.store(bytes, .monotonic);
+    return true;
+}
 
 // As `subscribeLoop`, but the stream carries TLD frames instead of newline-delimited
 // text. TLD frames are self-delimiting, so this needs no delimiter and imposes no
@@ -2266,7 +2311,7 @@ fn subscribeFramesLoop(topic: []const u8, handler: Qnnt.FrameHandler, context: ?
         var rbuf: [4096]u8 = undefined;
         var reader = stream.reader(io, &rbuf);
         while (true) {
-            const frame = Tld.readFrame(&reader.interface, allocator, &frame_buf, max_frame_bytes) catch |err| {
+            const frame = Tld.readFrame(&reader.interface, allocator, &frame_buf, maxFrameBytes()) catch |err| {
                 // EndOfStream is the publisher going away, which is routine. Anything
                 // else means the stream is not what we think it is, and silence there
                 // would leave a mismatched producer looking like a dead one.
