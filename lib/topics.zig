@@ -1,9 +1,12 @@
-//! Topic-name logic shared by the qnnt console tools: glob matching, and the '/'-segment
-//! tree that `qnnt-ls --tree` draws.
+//! Topic-name logic: glob matching, and the '/'-segment tree that `qnnt-ls --tree` draws.
 //!
-//! Here rather than in either tool because both need the glob, and a matcher that behaves
-//! differently in `qnnt-ls` than in `qnnt-cat` would be worse than no glob at all -- what
-//! `qnnt-ls` shows you must be exactly what `qnnt-cat` subscribes to.
+//! In the library rather than in a tool because three things now depend on matching the
+//! same way, and a matcher that behaved differently in any of them would be worse than no
+//! glob at all: what `qnnt-ls` shows you must be exactly what `qnnt-cat` subscribes to, and
+//! both must be exactly what `Qnnt.subscribePattern` joins.
+//!
+//! It began in src/ when only the tools had globs. Moving it down is what stops every
+//! consumer of the C, C++ and Python bindings writing a fourth one.
 //!
 //! Nothing in here touches the network, which is why its tests need no node.
 

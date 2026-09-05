@@ -306,6 +306,20 @@ typedef void (*qnnt_message_fn)(const char *topic, size_t topic_len,
 qnnt_status qnnt_subscribe(const char *topic, size_t topic_len,
                            qnnt_message_fn callback, void *user);
 
+/*
+ * Every topic matching a glob, including ones that do not exist yet: '*' spans any run of
+ * characters, '?' exactly one. Each match is joined as its own subscription, and the
+ * callback's `topic` says which one a message came from.
+ *
+ * `rescan_ms` is how often to look for topics that have appeared since; 0 joins what
+ * exists now and stops looking, for a one-shot capture. Discovery is polled, and fan-out
+ * is one connection per matching publisher -- so this is a separate call rather than
+ * qnnt_subscribe noticing a '*', and nobody who does not ask for it pays for it.
+ */
+qnnt_status qnnt_subscribe_pattern(const char *pattern, size_t pattern_len,
+                                   qnnt_message_fn callback, void *user,
+                                   uint64_t rescan_ms);
+
 /* Invoked with a decoded TLD frame, valid only for this call. */
 typedef void (*qnnt_frame_fn)(const char *topic, size_t topic_len,
                               const qnnt_tld_frame *frame, void *user);
@@ -314,6 +328,11 @@ typedef void (*qnnt_frame_fn)(const char *topic, size_t topic_len,
  * be read with this, and one publishing text lines with qnnt_subscribe. */
 qnnt_status qnnt_subscribe_frames(const char *topic, size_t topic_len,
                                   qnnt_frame_fn callback, void *user);
+
+/* qnnt_subscribe_frames over a glob. See qnnt_subscribe_pattern. */
+qnnt_status qnnt_subscribe_pattern_frames(const char *pattern, size_t pattern_len,
+                                          qnnt_frame_fn callback, void *user,
+                                          uint64_t rescan_ms);
 
 /* --- subscriptions: queue ---------------------------------------------------- */
 
@@ -354,6 +373,18 @@ typedef enum {
 } qnnt_queue_mode;
 
 qnnt_status qnnt_subscribe_queue(const char *topic, size_t topic_len, qnnt_queue_mode mode);
+
+/* qnnt_subscribe_queue over a glob. Each queued message carries its own topic, so one
+ * queue serves the whole pattern. See qnnt_subscribe_pattern for what it costs. */
+qnnt_status qnnt_subscribe_pattern_queue(const char *pattern, size_t pattern_len,
+                                         qnnt_queue_mode mode, uint64_t rescan_ms);
+
+/* Does `topic` match `pattern`? The same matcher the subscription used, and the same one
+ * qnnt-ls and qnnt-cat use -- so a caller deciding what a message is can never disagree
+ * with the library about what it subscribed to. Note that '*' crosses '/' here, unlike a
+ * shell glob, so a pattern ending in a star also matches topics deeper in the tree. */
+bool qnnt_topic_matches(const char *pattern, size_t pattern_len,
+                        const char *topic, size_t topic_len);
 
 /* Drain up to `max` messages into `out`, writing how many to *count.
  *

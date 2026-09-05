@@ -15,8 +15,8 @@
 //! command outright when nothing matches on disk.
 
 const std = @import("std");
-const qnnt = @import("qnnt").Qnnt;
-const topics = @import("topics");
+const qnnt_mod = @import("qnnt");
+const qnnt = qnnt_mod.Qnnt;
 const stdout = @import("stdout");
 
 const allocator = std.heap.page_allocator;
@@ -96,7 +96,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Sorted before anything else: --subs by number and the tree both depend on the order
     // being the same one the user saw.
-    std.mem.sort([]const u8, names[0..total], {}, topics.lessThan);
+    std.mem.sort([]const u8, names[0..total], {}, qnnt_mod.topics.lessThan);
 
     // Keep only what matches, in place.
     var kept: usize = 0;
@@ -141,7 +141,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         var tree: std.ArrayList(u8) = .empty;
         defer tree.deinit(allocator);
 
-        topics.renderTree(&tree, shown, 0, &prefix);
+        qnnt_mod.topics.renderTree(&tree, shown, 0, &prefix);
         print("{s}# {d} topic(s)\n", .{ tree.items, kept });
         return;
     }
@@ -157,8 +157,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
 fn matchesAny(patterns: [][]const u8, name: []const u8) bool {
     for (patterns) |p| {
-        if (topics.hasWildcard(p)) {
-            if (topics.globMatch(p, name)) return true;
+        if (qnnt_mod.topics.hasWildcard(p)) {
+            if (qnnt_mod.topics.globMatch(p, name)) return true;
         } else if (std.mem.eql(u8, p, name)) {
             return true;
         }

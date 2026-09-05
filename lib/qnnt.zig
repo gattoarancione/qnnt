@@ -1,4 +1,8 @@
 const std = @import("std");
+/// Topic-name matching, exported so every consumer reaches the SAME matcher: what
+/// `qnnt-ls` shows, what `qnnt-cat` subscribes to, and what `subscribePattern` joins must
+/// agree, and they cannot if each carries its own copy.
+pub const topics = @import("topics.zig");
 const Io = std.Io;
 const net = std.Io.net;
 const Stream = net.Stream;
@@ -859,7 +863,12 @@ pub const Qnnt = struct {
     pub const runPublisher = &publisherRun;
     pub const publish = &publishAll;
     pub const subscribe = &subscribeRun;
+    /// Opt-in: subscribe to every topic matching a glob, now and as they appear. See
+    /// `subscribePatternRun` for what it costs -- a poll, and one connection per match.
+    pub const subscribePattern = &subscribePatternRun;
     pub const subscribeFrames = &subscribeFramesRun;
+    /// `subscribePattern` for TLD frames.
+    pub const subscribePatternFrames = &subscribePatternFramesRun;
 
     /// The topics the registry knows, for discovery: see `listTopics`.
     pub const listTopics = &@import("qnnt.zig").listTopics;
@@ -870,6 +879,8 @@ pub const Qnnt = struct {
     /// Buffered subscription: messages land in a queue the caller drains with `poll`,
     /// rather than arriving on a library thread. See the notes above `QueuedMessage`.
     pub const subscribeQueue = &subscribeQueueRun;
+    /// `subscribeQueue` over a glob.
+    pub const subscribePatternQueue = &subscribePatternQueueRun;
     pub const poll = &queuePoll;
     pub const reserveQueue = &queueReserve;
     pub const queueDropped = &queueDroppedCount;
@@ -1100,6 +1111,18 @@ fn clientCommand(command: []const u8) !Reply {
             try buffer.print(allocator, "mirror-state {s} {d}\n", .{ mine, epoch });
             try federation.writeFedEntries(&buffer);
         }
+    } else if (eqlAny(verb, &.{"epoch"})) {
+        // Deliberately tiny, because it is polled. A pattern subscriber asks this a few
+        // times a second and only pays for `list` when the answer has moved.
+        //
+        // The holder's id travels with it for the same reason the mirror carries it: the
+        // counter is per-process, so a new holder after a failover starts its own count
+        // and a client holding an old number must not read that as "nothing changed".
+        var id_buf: [32]u8 = undefined;
+        try buffer.print(allocator, "{s} {d}\n", .{
+            formatNodeId(&id_buf, node_id),
+            directory_epoch.load(.monotonic),
+        });
     } else if (eqlAny(verb, &.{ "status", "stat" })) {
         try writeStatus(&buffer);
     } else if (eqlAny(verb, &.{"ping"})) {
@@ -1123,6 +1146,7 @@ fn writeHelp(buffer: *std.ArrayList(u8)) !void {
         \\#   subs <topic>         who is subscribed to a topic: address, connected, messages
         \\#   sub <topic>          resolve a topic to its publisher URI
         \\#   pub <topic> <uri>    register or refresh a topic's publisher endpoint
+        \\#   epoch                who holds the directory, and its version
         \\#   mirror [id epoch]    the directory, or 'unchanged' if you are current
         \\#   unpub <topic>        drop a registration
         \\#   peers                other REGISTRIES federated with this one, not subscribers
@@ -1362,7 +1386,7 @@ fn writeSubscriberList(buffer: *std.ArrayList(u8), topic: []const u8) !void {
 fn writeStatus(buffer: *std.ArrayList(u8)) !void {
     const now_us: u64 = @intCast(nowMicrosFn());
 
-    const topics = blk: {
+    const topic_count = blk: {
         directory_mutex.lockUncancelable(io);
         defer directory_mutex.unlock(io);
         break :blk directory.count();
@@ -1373,7 +1397,7 @@ fn writeStatus(buffer: *std.ArrayList(u8)) !void {
     const uptime = if (since_us == 0) "?" else formatAge(&uptime_buf, now_us -| since_us);
 
     try buffer.print(allocator, "uptime {s}\n", .{uptime});
-    try buffer.print(allocator, "topics {d}\n", .{topics});
+    try buffer.print(allocator, "topic_count {d}\n", .{topic_count});
     var id_buf: [32]u8 = undefined;
     try buffer.print(allocator, "node {s}\n", .{formatNodeId(&id_buf, node_id)});
     try buffer.print(allocator, "advertise {s}\n", .{advertiseText()});
@@ -2455,6 +2479,195 @@ fn subscribeLoop(topic: []const u8, handler: Qnnt.MessageHandler, context: ?*any
     }
 }
 
+/// How many topics one pattern will join before it stops joining more. A bound rather than
+/// unbounded growth: a pattern like `*` against a large federated directory would otherwise
+/// open a connection per topic on the whole cluster, and discovering that as memory
+/// pressure is worse than being told.
+pub const max_pattern_topics = 256;
+
+/// A reasonable gap between checks for topics that have appeared since, for a caller with
+/// no opinion. Cheap to poll at, because the check is the `epoch` verb -- a couple of dozen
+/// bytes -- and the directory is only listed when that has moved.
+pub const default_pattern_rescan_ms = 500;
+
+/// What a pattern subscription delivers. The two flavours differ only in the handler they
+/// hand each joined topic to, so they share the discovery loop rather than duplicating it.
+const PatternSink = union(enum) {
+    messages: Qnnt.MessageHandler,
+    frames: Qnnt.FrameHandler,
+};
+
+/// Ask the registry who holds the directory and what version it is at. False if it could
+/// not be reached, which a caller should treat as "no news", not as "nothing there".
+fn readDirectoryEpoch(holder: *[32]u8, holder_len: *usize, epoch: *u64) bool {
+    var buf: [128]u8 = undefined;
+    const text = registryCommand("epoch", &buf) catch return false;
+    var it = std.mem.tokenizeAny(u8, text, " \t\r\n");
+    const id = it.next() orelse return false;
+    const version = it.next() orelse return false;
+    if (id.len > holder.len) return false;
+    @memcpy(holder[0..id.len], id);
+    holder_len.* = id.len;
+    epoch.* = std.fmt.parseInt(u64, version, 10) catch return false;
+    return true;
+}
+
+/// Subscribe to every topic matching a glob, including ones that do not exist yet.
+///
+/// `subscribe` takes one name and waits for it. This takes a pattern -- `*` spans any run
+/// of characters, `?` exactly one -- and joins each topic that matches, now and as they
+/// appear. The handler is the ordinary one and already receives the topic name as its first
+/// argument, so a pattern subscriber can tell the streams apart without any new API.
+///
+/// It is a SEPARATE call rather than `subscribe` noticing a `*`, and deliberately so. A
+/// pattern costs a poll of the registry and one connection per matching publisher, and
+/// neither should be something a caller gets by accident because a topic name happened to
+/// contain a star. Everyone who does not ask for this pays nothing.
+///
+/// Three things worth knowing before reaching for it:
+///
+/// **Fan-out is per publisher, not per pattern.** Matching ten topics opens ten
+/// connections. A symmetric arrangement where N nodes each subscribe to the others' topics
+/// is N(N-1) connections -- 6 for three nodes, 2450 for fifty. This gives the ROUTING of a
+/// bus, not its economics, and `max_pattern_topics` is the backstop.
+///
+/// **Discovery is polled, not pushed.** A topic that appears is joined within
+/// `rescan_ms`; one that already exists is joined at once. Contrast `subscribe`, which
+/// retries a named topic until it shows up. A `rescan_ms` of zero joins what exists now and
+/// then stops looking, which is the right shape for a one-shot capture;
+/// `default_pattern_rescan_ms` is a sensible value for a caller with no opinion.
+///
+/// **Matching means matching.** A node's own topics match its own pattern, and it will
+/// subscribe to itself. That is left alone rather than special-cased: the handler is given
+/// the topic name, so a caller that wants its own traffic excluded says so in one line,
+/// while a caller that wants everything -- a logger, a recorder -- would have had to fight
+/// a built-in exclusion.
+///
+/// `pattern` must outlive the subscription, exactly as `subscribe`'s topic must.
+pub fn subscribePatternRun(
+    pattern: []const u8,
+    handler: Qnnt.MessageHandler,
+    context: ?*anyopaque,
+    rescan_ms: u64,
+) bool {
+    return startPattern(pattern, .{ .messages = handler }, context, rescan_ms);
+}
+
+/// `subscribePattern` for TLD frames: the same discovery, delivering to a `FrameHandler`
+/// rather than to raw bytes. Everything said about the plain one applies here too.
+pub fn subscribePatternFramesRun(
+    pattern: []const u8,
+    handler: Qnnt.FrameHandler,
+    context: ?*anyopaque,
+    rescan_ms: u64,
+) bool {
+    return startPattern(pattern, .{ .frames = handler }, context, rescan_ms);
+}
+
+fn startPattern(pattern: []const u8, sink: PatternSink, context: ?*anyopaque, rescan_ms: u64) bool {
+    if (pattern.len == 0) return false;
+    if (!spawnWorker(patternLoop, .{ pattern, sink, context, rescan_ms })) {
+        std.debug.print("error spawning pattern subscriber for {s}\n", .{pattern});
+        return false;
+    }
+    return true;
+}
+
+fn patternLoop(
+    pattern: []const u8,
+    sink: PatternSink,
+    context: ?*anyopaque,
+    rescan_ms: u64,
+) void {
+    // Joined names are duped and kept: `subscribeLoop` borrows the topic slice for its
+    // lifetime, and the listing buffer is reused on every rescan, so handing it a slice
+    // into that buffer would leave a subscriber reading a name that has been overwritten.
+    var joined: std.ArrayList([]const u8) = .empty;
+    // The list goes; the names do NOT. Each one was handed to a subscription that borrows
+    // it for its whole life, and this loop can return long before those do -- immediately,
+    // with a zero rescan. Freeing them here left every subscriber reading a topic name out
+    // of freed memory. They belong to the subscriptions now, and are released with them.
+    defer joined.deinit(allocator);
+    // Reserved up front, all of it, so appending can never fail mid-scan. It matters more
+    // than the 4KiB costs: the list is the ONLY record of what we already joined, so a
+    // failed append would re-subscribe the same topic on every rescan, for ever.
+    joined.ensureTotalCapacity(allocator, max_pattern_topics) catch {
+        std.debug.print("pattern {s}: out of memory, not subscribing\n", .{pattern});
+        return;
+    };
+
+    var names: [max_pattern_topics][]const u8 = undefined;
+    var name_buf: [64 * 1024]u8 = undefined;
+
+    var known_holder: [32]u8 = undefined;
+    var known_holder_len: usize = 0;
+    var known_epoch: u64 = 0;
+    var have_listed = false;
+    var announced_full = false;
+
+    while (!isShuttingDown()) {
+        var holder: [32]u8 = undefined;
+        var holder_len: usize = 0;
+        var epoch: u64 = 0;
+
+        // Only list when something actually changed. A new holder counts as changed: the
+        // epoch is per-process, so after a failover an unchanged number means nothing.
+        const readable = readDirectoryEpoch(&holder, &holder_len, &epoch);
+        const moved = !have_listed or !readable or epoch != known_epoch or
+            !std.mem.eql(u8, holder[0..holder_len], known_holder[0..known_holder_len]);
+
+        if (moved) {
+            const count = listTopics(&names, &name_buf) catch 0;
+            for (names[0..count]) |name| {
+                if (!topics.globMatch(pattern, name)) continue;
+                if (alreadyJoined(joined.items, name)) continue;
+
+                if (joined.items.len >= max_pattern_topics) {
+                    if (!announced_full) {
+                        std.debug.print(
+                            "pattern {s}: at the {d}-topic limit, not joining more. " ++
+                                "Narrow the pattern, or raise max_pattern_topics.\n",
+                            .{ pattern, max_pattern_topics },
+                        );
+                        announced_full = true;
+                    }
+                    break;
+                }
+
+                const owned = allocator.dupe(u8, name) catch continue;
+                const ok = switch (sink) {
+                    .messages => |h| subscribeRun(owned, h, context),
+                    .frames => |h| subscribeFramesRun(owned, h, context),
+                };
+                if (!ok) {
+                    allocator.free(owned);
+                    continue;
+                }
+                joined.appendAssumeCapacity(owned);
+            }
+
+            if (readable) {
+                @memcpy(known_holder[0..holder_len], holder[0..holder_len]);
+                known_holder_len = holder_len;
+                known_epoch = epoch;
+                have_listed = true;
+            }
+        }
+
+        // Zero means look once and stop, for a caller that wants what exists now and no
+        // background polling at all -- not "poll as fast as you can".
+        if (rescan_ms == 0) return;
+        if (!sleepMsInterruptible(rescan_ms)) return;
+    }
+}
+
+fn alreadyJoined(items: []const []const u8, name: []const u8) bool {
+    for (items) |held| {
+        if (std.mem.eql(u8, held, name)) return true;
+    }
+    return false;
+}
+
 pub fn subscribeRun(topic: []const u8, handler: Qnnt.MessageHandler, context: ?*anyopaque) bool {
     if (!spawnWorker(subscribeLoop, .{ topic, handler, context })) {
         std.debug.print("error spawning subscriber thread for {s}\n", .{topic});
@@ -2670,6 +2883,17 @@ pub fn subscribeQueueRun(topic: []const u8, mode: QueueMode) bool {
     return switch (mode) {
         .text => subscribeRun(topic, queuePush, null),
         .frames => subscribeFramesRun(topic, queuePushFrame, null),
+    };
+}
+
+/// `subscribeQueue` over a glob. The queued message already carries its topic, so a
+/// consumer draining one queue can tell the streams apart with no extra bookkeeping --
+/// which is what makes this the natural shape for the managed-runtime bindings.
+pub fn subscribePatternQueueRun(pattern: []const u8, mode: QueueMode, rescan_ms: u64) bool {
+    if (!queueReserveDefault()) return false;
+    return switch (mode) {
+        .text => subscribePatternRun(pattern, queuePush, null, rescan_ms),
+        .frames => subscribePatternFramesRun(pattern, queuePushFrame, null, rescan_ms),
     };
 }
 
@@ -2967,6 +3191,7 @@ pub fn nodeDeinit() void {
 
 test {
     _ = @import("./qnnt.test.zig");
+    _ = @import("./topics.zig");
     // Pulled in here rather than given its own build entry: federation.zig imports this
     // file, so testing it as a root would recompile and re-run the whole suite in a second
     // binary -- and both copies would race for the same test registry port.

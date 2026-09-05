@@ -296,6 +296,24 @@ export fn qnnt_subscribe(
     return if (qnnt.subscribeRun(name, messageTrampoline, box)) .ok else .failed;
 }
 
+/// `qnnt_subscribe` over a glob: every topic matching `pattern` now, and every one that
+/// appears later, each joined as its own subscription. `rescan_ms` is how often to look;
+/// 0 looks once and stops. The callback's `topic` says which stream a message came from.
+export fn qnnt_subscribe_pattern(
+    pattern: ?[*]const u8,
+    pattern_len: usize,
+    callback: ?MessageFn,
+    user: ?*anyopaque,
+    rescan_ms: u64,
+) callconv(.c) Status {
+    const name = retainTopic(pattern, pattern_len) orelse return .invalid_argument;
+    const cb = callback orelse return .invalid_argument;
+
+    const box = allocator.create(MessageBox) catch return .failed;
+    box.* = .{ .callback = cb, .user = user };
+    return if (qnnt.subscribePatternRun(name, messageTrampoline, box, rescan_ms)) .ok else .failed;
+}
+
 /// Invoked with a decoded TLD frame. The frame borrows the subscriber's buffer and is
 /// valid only for the call.
 const FrameFn = *const fn (
@@ -349,6 +367,22 @@ export fn qnnt_subscribe_frames(
     return if (qnnt.subscribeFramesRun(name, frameTrampoline, box)) .ok else .failed;
 }
 
+/// `qnnt_subscribe_frames` over a glob. See `qnnt_subscribe_pattern`.
+export fn qnnt_subscribe_pattern_frames(
+    pattern: ?[*]const u8,
+    pattern_len: usize,
+    callback: ?FrameFn,
+    user: ?*anyopaque,
+    rescan_ms: u64,
+) callconv(.c) Status {
+    const name = retainTopic(pattern, pattern_len) orelse return .invalid_argument;
+    const cb = callback orelse return .invalid_argument;
+
+    const box = allocator.create(FrameBox) catch return .failed;
+    box.* = .{ .callback = cb, .user = user };
+    return if (qnnt.subscribePatternFramesRun(name, frameTrampoline, box, rescan_ms)) .ok else .failed;
+}
+
 // ---------------------------------------------------------------- queued subscriptions
 
 /// Mirrors qnnt_message. `topic` and `data` point into library storage that stays valid
@@ -385,6 +419,36 @@ export fn qnnt_subscribe_queue(
         .frames => .frames,
     };
     return if (qnnt.Qnnt.subscribeQueue(name, zig_mode)) .ok else .failed;
+}
+
+/// Does `topic` match `pattern`? Exposed because a caller that subscribes to a glob often
+/// has to make the same decision the library made -- which stream is this, does it belong to
+/// this pattern -- and the answer has to agree exactly. There is one matcher, and this is it.
+export fn qnnt_topic_matches(
+    pattern: ?[*]const u8,
+    pattern_len: usize,
+    topic: ?[*]const u8,
+    topic_len: usize,
+) callconv(.c) bool {
+    const pat = topicSlice(pattern, pattern_len) orelse return false;
+    const name = topicSlice(topic, topic_len) orelse return false;
+    return qnnt.topics.globMatch(pat, name);
+}
+
+/// `qnnt_subscribe_queue` over a glob. Each queued message carries its own topic, so one
+/// queue serves the whole pattern.
+export fn qnnt_subscribe_pattern_queue(
+    pattern: ?[*]const u8,
+    pattern_len: usize,
+    mode: QueueMode,
+    rescan_ms: u64,
+) callconv(.c) Status {
+    const name = retainTopic(pattern, pattern_len) orelse return .invalid_argument;
+    const zig_mode: qnnt.QueueMode = switch (mode) {
+        .text => .text,
+        .frames => .frames,
+    };
+    return if (qnnt.Qnnt.subscribePatternQueue(name, zig_mode, rescan_ms)) .ok else .failed;
 }
 
 // Scratch for translating a batch into C form. Poll is single-consumer by contract, so

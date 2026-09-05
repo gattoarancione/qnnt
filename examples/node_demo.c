@@ -16,6 +16,23 @@
 
 static const char TOPIC[] = "test/c-node";
 
+/* Counters for the glob section below. The pattern callback fires on the subscriber's own
+ * thread, one thread per joined topic, so these are atomic. */
+static atomic_ullong g_bus_one, g_bus_two, g_bus_miss;
+
+static void on_bus(const char *topic, size_t topic_len, const uint8_t *data, size_t data_len,
+                   void *user) {
+    (void)data; (void)data_len; (void)user;
+    /* The callback is told which topic it came from, which is what makes one handler
+     * enough for a whole pattern. */
+    if (topic_len == strlen("test/c-bus/one") && memcmp(topic, "test/c-bus/one", topic_len) == 0)
+        atomic_fetch_add(&g_bus_one, 1);
+    else if (topic_len == strlen("test/c-bus/two") && memcmp(topic, "test/c-bus/two", topic_len) == 0)
+        atomic_fetch_add(&g_bus_two, 1);
+    else
+        atomic_fetch_add(&g_bus_miss, 1);
+}
+
 /* The source encodes into a long-lived encoder, so its bytes outlive the call. */
 static qnnt_tld_encoder *g_enc;
 static uint64_t g_seq;
@@ -134,6 +151,48 @@ int main(void) {
     int64_t elapsed = qnnt_now_micros() - t0;
     printf("non-blocking poll returned %zu in %lldus\n", count, (long long)elapsed);
     if (elapsed > 50000) { printf("FAIL: zero timeout blocked\n"); return 1; }
+
+    /* --- a glob subscription ------------------------------------------------------
+     *
+     * One handler for every topic matching a pattern, including topics created after the
+     * subscription started -- 'test/c-busy' is next to them and must be left alone. */
+    CHECK(qnnt_publisher_start("test/c-bus/one", strlen("test/c-bus/one"), NULL, 0, NULL));
+    CHECK(qnnt_publisher_start("test/c-busy", strlen("test/c-busy"), NULL, 0, NULL));
+    CHECK(qnnt_subscribe_pattern("test/c-bus/*", strlen("test/c-bus/*"), on_bus, NULL, 200));
+
+    /* Created after the pattern is running: reaching us proves the rescan found it. */
+    CHECK(qnnt_publisher_start("test/c-bus/two", strlen("test/c-bus/two"), NULL, 0, NULL));
+
+    for (int i = 0; i < 100 &&
+                    (atomic_load(&g_bus_one) == 0 || atomic_load(&g_bus_two) == 0); i++) {
+        CHECK(qnnt_publish("test/c-bus/one", strlen("test/c-bus/one"), (const uint8_t *)"tick\n", 5));
+        CHECK(qnnt_publish("test/c-bus/two", strlen("test/c-bus/two"), (const uint8_t *)"tick\n", 5));
+        CHECK(qnnt_publish("test/c-busy", strlen("test/c-busy"), (const uint8_t *)"tick\n", 5));
+        qnnt_sleep_ms(100);
+    }
+
+    printf("glob got     one=%llu two=%llu near-miss=%llu\n",
+           (unsigned long long)atomic_load(&g_bus_one),
+           (unsigned long long)atomic_load(&g_bus_two),
+           (unsigned long long)atomic_load(&g_bus_miss));
+    if (atomic_load(&g_bus_one) == 0) { printf("FAIL: glob missed a topic present at the start\n"); return 1; }
+    if (atomic_load(&g_bus_two) == 0) { printf("FAIL: glob missed a topic that appeared later\n"); return 1; }
+    if (atomic_load(&g_bus_miss) != 0) { printf("FAIL: glob took a topic it should not match\n"); return 1; }
+
+    /* The same matcher the subscription used, exposed so a consumer can ask the question
+     * itself -- routing a message, or filtering out its own traffic. */
+    #define MATCHES(pat, top) qnnt_topic_matches(pat, strlen(pat), top, strlen(top))
+    if (!MATCHES("test/c-bus/*", "test/c-bus/one") ||
+        !MATCHES("test/c-bus/*", "test/c-bus/deep/er") ||  /* '*' crosses '/' */
+        !MATCHES("test/?-bus/one", "test/c-bus/one") ||
+        !MATCHES("*", "anything") ||
+        MATCHES("test/c-bus/*", "test/c-busy") ||
+        MATCHES("test/c-bus/*", "other/c-bus/one") ||
+        MATCHES("test/?-bus/one", "test/cc-bus/one")) {
+        printf("FAIL: qnnt_topic_matches disagrees with the subscription\n");
+        return 1;
+    }
+    #undef MATCHES
 
     qnnt_deinit();
     qnnt_tld_encoder_destroy(g_enc);

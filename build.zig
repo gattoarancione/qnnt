@@ -24,11 +24,6 @@ pub fn build(b: *Build) void {
     // Glob matching and the '/'-segment tree, shared by the console tools so qnnt-ls and
     // qnnt-cat cannot disagree about what a pattern means -- what one lists must be what
     // the other subscribes to.
-    const topics_mod = b.createModule(.{
-        .root_source_file = b.path("src/topics.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
 
     // Buffered stdout for the tools: their output is data for a pipe, and std.debug.print
     // goes to stderr.
@@ -691,7 +686,6 @@ pub fn build(b: *Build) void {
         "lib/env.zig",
         "lib/qnnt.zig",
         "examples/lidar/scan.zig",
-        "src/topics.zig",
         "examples/zed/frame.zig",
         "examples/zed/zed.zig",
         "examples/zed/world.zig",
@@ -719,12 +713,11 @@ pub fn build(b: *Build) void {
 
         // The tools under src/ reach the library through the `qnnt` module the way any
         // consumer does, so their tests need it wired up; the lib/ files are the library.
-        // src/topics.zig deliberately needs neither -- it touches no network, which is why
+        // lib/topics.zig deliberately needs neither -- it touches no network, which is why
         // its tests are the cheap ones.
-        if (std.mem.startsWith(u8, src, "src/") and !std.mem.eql(u8, src, "src/topics.zig")) {
+        if (std.mem.startsWith(u8, src, "src/") and true) {
             test_mod.linkLibrary(qnnt_lib);
             test_mod.addImport("qnnt", qnnt_lib_mod);
-            test_mod.addImport("topics", topics_mod);
             test_mod.addImport("stdout", stdout_mod);
         }
         // The camera driver is written against the shared vocabulary the same way a
@@ -1060,7 +1053,6 @@ pub fn build(b: *Build) void {
 
         exe.root_module.linkLibrary(qnnt_lib);
         exe.root_module.addImport("qnnt", qnnt_lib_mod);
-        exe.root_module.addImport("topics", topics_mod);
         exe.root_module.addImport("stdout", stdout_mod);
 
         b.installArtifact(exe);

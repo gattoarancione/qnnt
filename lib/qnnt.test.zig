@@ -543,3 +543,118 @@ test "the frame cap applies to publishing as well as subscribing" {
 
     try testing.expect(qnnt.setMaxFrameBytes(qnnt.default_max_frame_bytes));
 }
+
+// A pattern subscriber's sink. Records which topics it heard from, which is the only thing
+// the pattern tests care about — the payload path is `subscribe`'s and tested above.
+const PatternSink = struct {
+    // Same shape as EventLog: one pattern subscriber runs a worker per joined topic, so the
+    // slot is claimed atomically and the length is published last, with release, so a
+    // reader never sees a name that is only half written.
+    var names: [32][64]u8 = undefined;
+    var lens: [32]std.atomic.Value(usize) = @splat(std.atomic.Value(usize).init(0));
+    var claimed = std.atomic.Value(usize).init(0);
+
+    fn reset() void {
+        for (&lens) |*l| l.store(0, .monotonic);
+        claimed.store(0, .monotonic);
+    }
+
+    fn record(topic: []const u8, _: []const u8, _: ?*anyopaque) void {
+        const slot = claimed.fetchAdd(1, .monotonic);
+        if (slot >= names.len or topic.len > names[slot].len) return;
+        @memcpy(names[slot][0..topic.len], topic);
+        lens[slot].store(topic.len, .release);
+    }
+
+    fn seen(topic: []const u8) bool {
+        for (0..names.len) |i| {
+            const n = lens[i].load(.acquire);
+            if (n != 0 and std.mem.eql(u8, names[i][0..n], topic)) return true;
+        }
+        return false;
+    }
+
+    fn waitFor(topic: []const u8, ms: usize) bool {
+        var waited: usize = 0;
+        while (waited < ms) : (waited += 25) {
+            if (seen(topic)) return true;
+            qnnt.sleepMs(25);
+        }
+        return seen(topic);
+    }
+};
+
+test "subscribePattern joins matching topics and ignores the rest" {
+    PatternSink.reset();
+    try startNode();
+    defer qnnt.deinit();
+
+    // Two that match and one that does not. The near-miss matters: `bus/*` must not be
+    // read as "anything containing bus", which is how a substring check would behave.
+    try testing.expect(qnnt.runPublisher("test/bus/left", source, 50_000, null));
+    try testing.expect(qnnt.runPublisher("test/bus/right", source, 50_000, null));
+    try testing.expect(qnnt.runPublisher("test/busy-elsewhere", source, 50_000, null));
+
+    try testing.expect(qnnt.subscribePattern("test/bus/*", PatternSink.record, null, 100));
+
+    try testing.expect(PatternSink.waitFor("test/bus/left", 5000));
+    try testing.expect(PatternSink.waitFor("test/bus/right", 5000));
+
+    // Given both matches arrived, a rescan has certainly run, so the near-miss having
+    // stayed away is a result and not just a race we won.
+    try testing.expect(!PatternSink.seen("test/busy-elsewhere"));
+}
+
+test "subscribePattern joins a topic that appears after it started" {
+    PatternSink.reset();
+    try startNode();
+    defer qnnt.deinit();
+
+    // Subscribing to nothing at all: the pattern has no match when it starts, which is the
+    // arrangement `subscribe` cannot express and the reason this call polls.
+    try testing.expect(qnnt.subscribePattern("test/late/*", PatternSink.record, null, 100));
+    qnnt.sleepMs(300);
+    try testing.expect(!PatternSink.seen("test/late/arrival"));
+
+    try testing.expect(qnnt.runPublisher("test/late/arrival", source, 50_000, null));
+    try testing.expect(PatternSink.waitFor("test/late/arrival", 5000));
+}
+
+test "subscribePattern refuses an empty pattern" {
+    try startNode();
+    defer qnnt.deinit();
+
+    // Empty matches nothing in the matcher, so this would be a worker polling for ever
+    // over a pattern that can never join anything.
+    try testing.expect(!qnnt.subscribePattern("", PatternSink.record, null, 100));
+}
+
+test "a zero rescan joins what exists now and then stops looking" {
+    PatternSink.reset();
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.runPublisher("test/once/early", source, 50_000, null));
+    // Registered before the pattern starts, so the single pass is certain to see it.
+    var waited: usize = 0;
+    var names: [32][]const u8 = undefined;
+    var buf: [1024]u8 = undefined;
+    while (waited < 2000) : (waited += 25) {
+        const n = qnnt.listTopics(&names, &buf) catch 0;
+        var there = false;
+        for (names[0..n]) |name| {
+            if (std.mem.eql(u8, name, "test/once/early")) there = true;
+        }
+        if (there) break;
+        qnnt.sleepMs(25);
+    }
+
+    try testing.expect(qnnt.subscribePattern("test/once/*", PatternSink.record, null, 0));
+    try testing.expect(PatternSink.waitFor("test/once/early", 5000));
+
+    // Anything appearing afterwards is not picked up: this is the one-shot capture shape,
+    // where polling for ever would keep a process alive that meant to take a snapshot.
+    try testing.expect(qnnt.runPublisher("test/once/later", source, 50_000, null));
+    qnnt.sleepMs(1500);
+    try testing.expect(!PatternSink.seen("test/once/later"));
+}

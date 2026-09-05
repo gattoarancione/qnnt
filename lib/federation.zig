@@ -420,6 +420,24 @@ fn fedCommand(session: *FedSession, command: []const u8) !Reply {
         // had been applied while the directory was visibly full of that peer's entries.
         if (applyRemoteEntry(entry, session.observed()) catch false) {
             _ = inbound_applied.fetchAdd(1, .monotonic);
+            // And wake our own connectors, so what a peer pushed to us is relayed onward
+            // at once instead of waiting for the anti-entropy deadline.
+            //
+            // Without this the only notifications came from a node's OWN outbound
+            // exchanges and its own publishers, so a host that learned an entry by being
+            // pushed to sat on it until its 5s timer. One hop hid that -- in a star or a
+            // mesh every host hears the publisher directly and nothing needs relaying --
+            // but a chain paid it per hop.
+            //
+            // Traced in containers on a five-host ring, publisher to third host:
+            //
+            //   without   5119ms   1252ms   5597ms     <- the 5s deadline, not a wake
+            //   with       767ms   1050ms   1162ms
+            //
+            // It also explains the topology harness's own numbers: a ring converged in
+            // 2.7s where a star and a mesh took 0.4s, which was read at the time as the
+            // cost of relaying rather than as a missing notification.
+            notifyChange();
         }
         try buffer.print(allocator, "ok\n", .{});
     } else if (qnnt.eqlAny(verb, &.{"ping"})) {

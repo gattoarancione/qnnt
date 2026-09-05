@@ -47,6 +47,7 @@
 #include <QList>
 #include <QMap>
 #include <QObject>
+#include <QPair>
 #include <QString>
 #include <QThread>
 
@@ -293,6 +294,18 @@ public:
     /// frameAvailable() (Frames), on this object's thread.
     bool addSubscriber(const QString& topic, Delivery delivery = Delivery::Text);
 
+    /// Subscribe to every topic matching a glob, now and as they appear. '*' spans any run
+    /// of characters, '?' exactly one, and both cross '/' -- so "room/*" also matches
+    /// "room/kitchen/light". Messages arrive through the same two signals, and the topic
+    /// each carries says which stream it came from.
+    ///
+    /// `rescanMs` is how often to look for topics that have appeared since; 0 joins what
+    /// exists now and then stops looking. A pattern costs a poll of the registry and one
+    /// connection per matching publisher, which is why it is a separate call from
+    /// addSubscriber() rather than that one noticing a '*'.
+    bool addSubscriberPattern(const QString& pattern, Delivery delivery = Delivery::Text,
+                              int rescanMs = 500);
+
     /// Decode a frame from frameAvailable() into a TLD-mapped type -- the replacement for
     /// the old getUnpacked<T>(). Throws qnnt::tld::Error on a malformed frame.
     template <class T>
@@ -374,10 +387,18 @@ private:
 
     bool check(qnnt_status status, const QString& context);
 
+    /// Which framing a delivered topic was subscribed with -- a literal subscription, or
+    /// failing that whichever pattern matches it.
+    Delivery deliveryFor(const QString& topic) const;
+
     QThread* m_thread = nullptr;
     QnntPoller* m_poller = nullptr;
     bool m_running = false;
     QMap<QString, Delivery> m_subscriptions;
+    // Patterns cannot go in the map above: their topics are discovered later, so there is
+    // nothing to key on when the subscription is made. Kept in order and consulted only
+    // when a topic is not a literal subscription.
+    QList<QPair<QString, Delivery>> m_patterns;
     /// Kept alive for the lifetime of the publisher: the C ABI holds the raw pointer.
     QMap<QString, std::function<QByteArray()>> m_sources;
 
@@ -633,6 +654,7 @@ inline void QnntNode::stop() {
     qnnt_deinit();
     m_running = false;
     m_subscriptions.clear();
+    m_patterns.clear();
     m_sources.clear();
     Q_EMIT stopped();
 }
@@ -703,8 +725,42 @@ inline bool QnntNode::addSubscriber(const QString& topic, Delivery delivery) {
     return true;
 }
 
+inline bool QnntNode::addSubscriberPattern(const QString& pattern, Delivery delivery,
+                                           int rescanMs) {
+    const QByteArray glob = pattern.toUtf8();
+    const qnnt_queue_mode mode =
+        delivery == Delivery::Frames ? QNNT_QUEUE_FRAMES : QNNT_QUEUE_TEXT;
+    if (!check(qnnt_subscribe_pattern_queue(glob.constData(),
+                                            static_cast<std::size_t>(glob.size()), mode,
+                                            static_cast<quint64>(rescanMs)),
+               QStringLiteral("addSubscriberPattern(%1)").arg(pattern))) {
+        return false;
+    }
+    m_patterns.append(qMakePair(pattern, delivery));
+    return true;
+}
+
+/// Which framing a delivered topic was subscribed with. A literal subscription answers
+/// directly; otherwise the patterns are asked, through the LIBRARY's matcher rather than a
+/// second implementation here -- a header that disagreed with the library about what
+/// "room/*" means would route frames to the text signal and hand the reader garbage.
+inline QnntNode::Delivery QnntNode::deliveryFor(const QString& topic) const {
+    const auto it = m_subscriptions.constFind(topic);
+    if (it != m_subscriptions.constEnd()) return it.value();
+
+    const QByteArray name = topic.toUtf8();
+    for (const auto& entry : m_patterns) {
+        const QByteArray glob = entry.first.toUtf8();
+        if (qnnt_topic_matches(glob.constData(), static_cast<std::size_t>(glob.size()),
+                               name.constData(), static_cast<std::size_t>(name.size()))) {
+            return entry.second;
+        }
+    }
+    return Delivery::Text;
+}
+
 inline void QnntNode::messageDelivered(const QString& topic, const QByteArray& data) {
-    if (m_subscriptions.value(topic, Delivery::Text) == Delivery::Frames) {
+    if (deliveryFor(topic) == Delivery::Frames) {
         Q_EMIT frameAvailable(topic, data);
     } else {
         Q_EMIT messageAvailable(topic, data);

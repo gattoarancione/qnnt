@@ -960,9 +960,9 @@ Four things about it are decisions rather than accidents:
     because the alternative is silent loss: a publisher with nobody attached has nowhere to
     put its first messages, and a replay missing its opening frames reads as a corrupt
     capture rather than a race. `--wait 0` skips it.
-  * `--max` is enforced in the delivery callback, not in the main loop. The main loop sleeps
-    between glob rescans and a 1 kHz topic delivers thousands of messages inside one of
-    those sleeps.
+  * `--max` is enforced in the delivery callback, not in the main loop. The main loop only
+    sleeps in short slices waiting to be told to stop, and a 1 kHz topic delivers thousands
+    of messages inside one of those slices.
 
 They compose, which was the point of splitting them:
 
@@ -979,11 +979,81 @@ Underneath, discovery is `Qnnt.listTopics` and `Qnnt.registryCommand`: the first
 registry for the same table its `list` command prints and reads back the first column, the
 second sends any command and hands the reply back verbatim. Both live in the library next to
 the code that writes those replies, so a column added or reordered is a local change rather
-than a silent break out here. Glob matching and the tree live in one shared module for the
-same reason: what `qnnt-ls` shows must be exactly what `qnnt-cat` subscribes to.
+than a silent break out here.
+
+Glob matching and the tree live in the library for the same reason, and `qnnt-cat` no longer
+does its own rescanning: a glob argument is handed to `Qnnt.subscribePattern` (section 13),
+which is the same code path a program written against the library gets. What `qnnt-ls` shows,
+what `qnnt-cat` reads and what a program joins are one implementation, not three that agree
+by inspection.
 
 --------------------------------------------------------------------------------
- 13. A depth camera on the same four layers: examples/zed/
+ 13. Subscribing to a glob: bus-style topics
+--------------------------------------------------------------------------------
+
+`subscribe` takes one topic name and waits for it. `subscribePattern` takes a glob and joins
+every topic that matches -- the ones that exist now, and the ones that appear later.
+
+    Zig     Qnnt.subscribePattern("bus/*", handler, ctx, 500)
+            Qnnt.subscribePatternFrames("bus/*", frame_handler, ctx, 500)
+            Qnnt.subscribePatternQueue("bus/*", .text, 500)
+    C       qnnt_subscribe_pattern("bus/*", 5, cb, user, 500)
+            qnnt_subscribe_pattern_frames("bus/*", 5, cb, user, 500)
+            qnnt_subscribe_pattern_queue("bus/*", 5, QNNT_QUEUE_TEXT, 500)
+    Python  node.subscribe_pattern("bus/*", rescan=0.5)
+
+The matcher itself is reachable, for a program that routes on the topic it was handed or
+filters its own traffic back out:
+
+    Zig     Qnnt.topics.globMatch(pattern, topic)
+    C       qnnt_topic_matches(pattern, plen, topic, tlen)
+    C++/Qt  node->addSubscriberPattern("room/*", QnntNode::Delivery::Frames)
+    Python  node.topic_matches(pattern, topic)
+
+Asking the library rather than re-implementing the rules is the point: a program that
+disagreed with the library about what "room/*" means would route messages to the wrong
+handler while looking correct.
+
+`*` spans any run of characters and `?` exactly one, matched by the same code `qnnt-ls` and
+`qnnt-cat` use, so `*` crosses '/' here too: `bus/*` matches `bus/a/b`. The last argument is
+how often to look for topics that have appeared since -- milliseconds in C and Zig, seconds
+in Python. Zero joins what exists now and then stops looking, which is the right shape for a
+one-shot capture and for a process that should not keep polling for ever.
+
+What this buys is the routing of a bus without changing the pub/sub model. If A publishes on
+bus/a, B on bus/b and C on bus/c, and each subscribes to `bus/*`, then everything any of them
+publishes reaches the other two -- with no broker, no new wire protocol, and no change to how
+publishing works. Each node is still a set of publishers and a set of subscriptions; the
+pattern only saves it from having to be told the names in advance.
+
+Four things are worth knowing before reaching for it.
+
+  * It is a SEPARATE call, not `subscribe` noticing a '*'. A pattern costs a poll of the
+    registry and a connection per match, and neither should be something a caller gets by
+    accident because a topic name happened to contain a star. Programs that do not ask for
+    it pay nothing -- no extra thread, no extra traffic.
+  * Fan-out is per publisher, not per pattern. Matching ten topics opens ten connections. A
+    symmetric arrangement where N nodes each read the others is N(N-1) connections: 6 for
+    three nodes, 2450 for fifty. This gives the ROUTING of a bus, not its economics. The cap
+    is 256 topics per pattern, and hitting it says so on stderr rather than silently
+    stopping.
+  * Discovery is polled, not pushed. The poll is cheap -- it asks the registry for its
+    directory version and lists the topics only when that has moved -- but a new topic is
+    joined within the rescan interval, not instantly.
+  * Matching means matching. A node's own topics match its own pattern, and it will subscribe
+    to itself. That is deliberate rather than special-cased: every handler is already given
+    the topic name, so a node that wants to skip its own traffic says so in one line, while a
+    logger or recorder that wants everything would have had to fight a built-in exclusion.
+
+The handler is the ordinary one. Its first argument is the topic the message came from, which
+is what makes a single handler enough for a whole pattern -- and, on the queue path, what lets
+one queue carry every matching topic with no extra bookkeeping.
+
+Running examples: `python/demo.py` and `examples/node_demo.c` each end with a glob section
+that joins a topic present at the start, a topic created afterwards, and refuses a near miss.
+
+--------------------------------------------------------------------------------
+ 14. A depth camera on the same four layers: examples/zed/
 --------------------------------------------------------------------------------
 
 The LiDAR chain again, for a ZED X stereo camera, so the structure can be compared
@@ -1078,7 +1148,7 @@ See examples/zed/SCHEMA.txt for the wire format, the published schema, the geome
 what it would take to point this at real hardware.
 
 --------------------------------------------------------------------------------
- 14. Driving a real robot: examples/ugv/
+ 15. Driving a real robot: examples/ugv/
 --------------------------------------------------------------------------------
 
 A UGV Beast on one side, qnnt topics on the other, and a Qt/QML control station
@@ -1239,7 +1309,7 @@ feedback in the telemetry map, and battery sag on a suspended robot proved too
 small to measure, so "the tracks turned" rests on the operator watching them.
 
 --------------------------------------------------------------------------------
- 15. A home full of sensors: examples/dirigera/
+ 16. A home full of sensors: examples/dirigera/
 --------------------------------------------------------------------------------
 
 An IKEA DIRIGERA hub on one side, qnnt topics on the other:
@@ -1265,7 +1335,7 @@ An IKEA DIRIGERA hub on one side, qnnt topics on the other:
 
 THIS ONE PUSHES, and that is the point of it. The hub holds a WebSocket open and
 sends state the moment a light is switched or a sensor trips, so the bridge is a
-translator rather than a poller. Compare the UGV in section 14, which had to be
+translator rather than a poller. Compare the UGV in section 15, which had to be
 asked and answered about every five seconds. `--list` exists only as a
 diagnostic; the running bridge never polls for state.
 
@@ -1416,7 +1486,7 @@ between OpenSSL and Io:
     producing plausible data.
 
 --------------------------------------------------------------------------------
- 16. Federation topologies: examples/federation/
+ 17. Federation topologies: examples/federation/
 --------------------------------------------------------------------------------
 
 What a federated registry converges to when the peers are wired four different
@@ -1450,7 +1520,7 @@ RESULT: all four topologies converge to the same directory, and all four deliver
 
                      converged   delivery at 2 hops   survives one death
     star               0.4s            yes              NO  -- hub is the SPOF
-    ring               2.7s            yes              yes -- becomes a chain
+    ring               0.7s            yes              yes -- becomes a chain
     mesh               0.4s            yes              yes
     hybrid             0.4s            yes              partly -- leaf cut off
 
@@ -1463,9 +1533,11 @@ expected reachability is the transitive closure over the UNDIRECTED graph. That
 matches what addPeer's doc claims -- "peer lists need not be symmetric or
 complete" -- and it is why the star works at all with the hub unconfigured.
 
-CONVERGENCE IS EAGER, NOT ON THE TIMER. The sync interval is 5s, but a star or a
-mesh converges in 0.4s because a change is pushed when it happens. The ring took
-2.7s: multi-hop relay, one hop per push, and the version check stops it looping.
+CONVERGENCE IS EAGER, NOT ON THE TIMER. The sync interval is 5s, but every
+topology converges in well under a second because a change is pushed when it
+happens. The ring took 2.7s when this was written, which looked like the honest
+cost of relaying one hop at a time; it was a missing notification on the inbound
+path, and section 20 records the chase. It is 0.7s now.
 
 FEDERATION IS A CONTROL PLANE, NOT A DATA PLANE. Delivery is identical at one hop
 and two -- 77 to 78 messages in an 8s window at 10 Hz either way. In `hybrid`,
@@ -1509,7 +1581,7 @@ was handed out, and it reported a mismatch at t+8s that was an artifact of the
 probe. Asking the registry directly is what separated the two.
 
 --------------------------------------------------------------------------------
- 17. When the registry holder dies: examples/registry/
+ 18. When the registry holder dies: examples/registry/
 --------------------------------------------------------------------------------
 
     python3 examples/registry/failover.py --runs 5
@@ -1630,7 +1702,7 @@ the declining node says so once, at startup.
 
 Two things follow.
 
-THE REGISTRY IS A CONTROL PLANE, exactly as federation is (section 16). An
+THE REGISTRY IS A CONTROL PLANE, exactly as federation is (section 17). An
 established subscription is direct TCP between publisher and subscriber; the
 registry is how the two were introduced, not how they talk. Killing it did not
 drop a single message in any run.
@@ -1657,10 +1729,10 @@ of the same shape -- an error path producing plausible data instead of an error:
   * "who holds the role" read by grepping a log for "role acquired", which reports
     EVER held, not currently. Read after teardown it showed two holders at once,
     because terminating one frees the port and the survivor grabs it on its way out.
-  * (section 16) `qnnt-cat` used to detect whether an endpoint was handed out. It
+  * (section 17) `qnnt-cat` used to detect whether an endpoint was handed out. It
     prints its line only on a successful ATTACH, so against a dead publisher it
     prints nothing either way.
-  * (section 16) judging expiry by a topic listing, when listing and serving are
+  * (section 17) judging expiry by a topic listing, when listing and serving are
     two different clocks.
 
 The registry answers all of these directly if asked properly. `sub <topic>`
@@ -1668,7 +1740,7 @@ distinguishes served / expired / not-found, and `list` shows refreshed age and
 origin per entry.
 
 --------------------------------------------------------------------------------
- 18. Testing the C++ side: examples/cpp_logic_test.cpp
+ 19. Testing the C++ side: examples/cpp_logic_test.cpp
 --------------------------------------------------------------------------------
 
     zig build cpp-logic          # 80 checks, no Qt needed
@@ -1744,14 +1816,14 @@ particular has had two bugs (a degenerate first-person eye, and a fov taken from
 the wrong axis) and remains covered only by looking at it.
 
 --------------------------------------------------------------------------------
- 19. Federation on real hosts: docker/
+ 20. Federation on real hosts: docker/
 --------------------------------------------------------------------------------
 
     zig build -Dtarget=aarch64-linux-gnu     # or x86_64-linux-gnu
     bash docker/federation.sh
 
 Six containers on one bridge network, each a host with its own address, running the
-same four topologies as section 16 and then cutting a host off the network on
+same four topologies as section 17 and then cutting a host off the network on
 each. See docker/README.md for the operator's version of this; what follows is
 what it added over the loopback harness.
 
@@ -1808,40 +1880,37 @@ Latency and loss turn out to be unremarkable. The exchange is TCP, so 10% loss
 becomes retransmission rather than lost entries, and 100ms on every link changes
 nothing measurable.
 
-A SLOW PEER IS WORSE THAN A DEAD ONE, AND IT COSTS WHOEVER DIALS IT. In a full
-mesh of five, making one host slow cost the other four 4-7x their convergence
-(14s, 13s, 14s against a 2s baseline), while STOPPING that same host cost them
-nothing (1-2s).
+A SLOW PEER COSTS NOTHING MEASURABLE, and the claim that it did -- which stood
+here for a day -- was an artefact of the instrument. Retracted.
 
-Bisecting the topology until one ingredient was left:
+The probe was `docker exec <host> qnnt-ls`, and qnnt-ls is itself a qnnt node: it
+starts, contends for the registry port, becomes a standby and pulls a directory
+mirror. That startup slows down when the host is busy, and a slow peer makes every
+host busier. The probe was timing itself.
 
-    who dials the slow host             healthy   slow
-    only the RECEIVER of the news       0-1s      4s, 4s, 4s
-    only the SENDER of the news         0-1s      0-1s
-    the slow host dials out, none in    0-1s      0-2s
+Timing the events INSIDE the system -- registration to applied -- shows no
+difference at all:
 
-So a host that dials a slow peer is delayed in learning from its OTHER, healthy
-peers. Being dialled by a slow peer costs nothing, and a slow outbound connector
-does not delay the dialler's own sending -- only its receiving.
+    MESH, registration -> applied
+      healthy      bravo=419ms charlie=419ms echo=418ms
+      healthy      bravo=83ms  charlie=83ms  echo=83ms
+      delta SLOW   bravo=329ms charlie=328ms echo=330ms
+      delta SLOW   bravo=145ms charlie=308ms echo=310ms
 
-The mechanism is not established. Ruled out, by measurement or by reading:
+WHAT THE CHASE DID FIND is a real defect, in relaying. Only two places called
+notifyChange: a node's own outbound exchanges, and its own publishers. A host that
+learned an entry by being PUSHED to updated its directory and told nobody, so it
+did not relay onward until its 5s anti-entropy deadline. One hop hid it entirely --
+in a star or a mesh every host hears the publisher directly -- but a chain paid it
+per hop:
 
-  * not a sequential peer loop -- one worker per peer (peerConnectorRun)
-  * not worker starvation -- spawnWorker spawns a thread, there is no pool
-  * not a serial listener -- a worker per connection
-  * not the directory lock held across a slow socket write -- fedCommand and
-    writeFedEntries build a buffer under the lock and the caller writes it after
+    RING, publisher -> third host
+      before   5119ms   1252ms   5597ms      <- the 5s deadline, not a wake
+      after     767ms   1050ms   1162ms
 
-The clue worth following: the delay is consistently ~4s and fed_sync_interval_ms
-is 5000, which is what falling back to the anti-entropy timer looks like -- as
-though the push that normally delivers news within a second is missed while a
-sibling connector is inside a long exchange. waitForChangeOrDeadline and
-fed_change_seq, a single global counter shared by every connector on a host, is
-where to look.
-
-It is reported rather than asserted: only "did everyone converge at all" is
-pass/fail, because a red FAIL for behaviour nobody has shown to be a defect
-teaches people to ignore the output.
+End to end the ring went from 2.7s to 0.7s, in line with the star and the mesh.
+That 2.7s had been recorded in section 17 as the cost of multi-hop relay. It was
+this, and it was fixable.
 
 WHAT IT STILL DOES NOT COVER. Sustained behaviour -- these runs last minutes, so a
 slow leak or an entry ageing out wrongly over hours would not show. And one bridge

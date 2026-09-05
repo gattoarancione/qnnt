@@ -247,28 +247,21 @@ netem_run() {
     "$([ "$laggard" = "-1" ] && echo "did not converge" || echo "${laggard}s")" >&2
   netem_clear_all
 
-  # NOT a pass/fail. It is a measured characteristic, and asserting on it would print a
-  # red FAIL for behaviour nobody has shown to be a defect. What is asserted is only that
-  # everyone converged at all; the ratio is reported for you to look at.
+  # NOT a pass/fail, and read the numbers with care.
   #
-  # What was measured here, repeatably (14s, 13s, 14s against a 2s baseline): in a FULL
-  # MESH of five, making one host slow costs the other four about seven times their
-  # convergence, while stopping that same host outright costs them nothing (1-2s). A slow
-  # peer is worse than an absent one.
+  # An earlier version of this script reported that a slow peer cost the others 4-7x their
+  # convergence. That was the INSTRUMENT: `qnnt-ls` is itself a qnnt node, so `docker exec
+  # <host> qnnt-ls` starts a node that contends for the registry, becomes a standby and
+  # pulls a mirror -- and that startup slows down when the host is busy, which a slow peer
+  # makes every host. Timing the events inside the system instead (registration to applied)
+  # showed no difference at all between healthy and slow.
   #
-  # The mechanism is NOT established. Connectors are one worker per peer waiting on a
-  # futex, so structurally a slow peer should not block the others, and a targeted relay
-  # topology (charlie -> alpha -> delta with alpha also dialling a slow bravo) did not
-  # reproduce it -- 1s, 1s, 6s healthy against 6s, 6s, 1s slow, which is noise. So it is
-  # real and repeatable in a mesh and unexplained, which is worth knowing before trusting
-  # convergence times on a network with one bad link.
+  # So these numbers include the probe's own cost and are useful for spotting something
+  # gross, not for comparing conditions a few hundred milliseconds apart.
   check "everyone still converges with a slow peer present" \
         "$([ "$others" != "-1" ] && [ "$laggard" != "-1" ] && echo 1 || echo 0)"
-  if [ "$others" != "-1" ] && [ "$base" != "-1" ] && [ "$base" -gt 0 ]; then
-    printf "  note: a slow peer cost the others %sx their baseline (%ss vs %ss).\n" \
-      "$(( others / base ))" "$others" "$base"
-    printf "        stopping that host instead costs them nothing -- see the comment here.\n"
-  fi
+  printf "  note: these include the probe's own startup, which is not constant across\n"
+  printf "        conditions. See the comment here before reading a ratio into them.\n"
 
   $COMPOSE down --remove-orphans >/dev/null 2>&1
 }

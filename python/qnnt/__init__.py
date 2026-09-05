@@ -286,6 +286,42 @@ class Node:
             f"subscribe({topic})",
         )
 
+    def subscribe_pattern(
+        self, pattern: str, *, frames: bool = False, rescan: float = 0.5
+    ) -> None:
+        """Subscribe to every topic matching a glob, now and as they appear.
+
+        `*` spans any run of characters, `?` exactly one. Each match becomes its own
+        subscription, all feeding the one queue `poll` drains -- and every `Message`
+        carries its own `topic`, so telling the streams apart costs nothing extra.
+
+        `rescan` is how often, in seconds, to look for topics that have appeared since;
+        0 joins what exists now and then stops looking, for a one-shot capture.
+
+        This is a separate call from `subscribe`, not `subscribe` noticing a `*`, because
+        it costs a poll of the registry and one connection per matching publisher. A node's
+        own topics match its own pattern and it will subscribe to itself; filter on
+        `message.topic` if that is not what you want.
+        """
+        raw = self._topic_bytes(pattern)
+        mode = _QUEUE_FRAMES if frames else _QUEUE_TEXT
+        _check(
+            self._lib,
+            self._lib.qnnt_subscribe_pattern_queue(raw, len(raw), mode, int(rescan * 1000)),
+            f"subscribe_pattern({pattern})",
+        )
+
+    def topic_matches(self, pattern: str, topic: str) -> bool:
+        """Does `topic` match `pattern`, by the same rules `subscribe_pattern` used?
+
+        The library's own matcher, not a re-implementation, so a program deciding what a
+        message is cannot disagree with what it subscribed to. Note `*` crosses `/` here,
+        unlike a shell glob.
+        """
+        pat = self._topic_bytes(pattern)
+        name = self._topic_bytes(topic)
+        return bool(self._lib.qnnt_topic_matches(pat, len(pat), name, len(name)))
+
     # --- receiving ---------------------------------------------------------------
 
     def poll(self, *, timeout: float | None = 0.0, max_messages: int = 1024) -> list[Message]:

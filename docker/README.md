@@ -191,37 +191,44 @@ test.
 and 10% loss costs a few seconds: the exchange is TCP, so loss becomes retransmission
 rather than lost entries.
 
-**A slow peer is worse than a dead one, and the cost falls on whoever dials it.** In a
-full mesh of five, making one host slow cost the other four 4–7× their convergence
-(14s, 13s, 14s against a 2s baseline), while *stopping* that same host cost them nothing
-(1–2s).
+**A slow peer costs nothing measurable — the earlier claim here was wrong.** An earlier
+version of this document reported that one slow host cost the others 4–7× their
+convergence. That was an artefact of the instrument, not behaviour of the library, and it
+is retracted.
 
-Narrowed by bisecting the topology until only one ingredient was left:
+The instrument was `docker exec <host> qnnt-ls`, and `qnnt-ls` is itself a qnnt node: it
+starts up, contends for the registry port, becomes a standby and pulls a directory mirror.
+That startup gets slower when the host is busier, and a slow peer makes every host busier
+(connectors re-exchange immediately when the change counter has already moved on). So the
+probe timed itself.
 
-| who dials the slow host | healthy | slow |
-|---|---|---|
-| only the **receiver** of the news | 0–1s | **4s, 4s, 4s** |
-| only the **sender** of the news | 0–1s | 0–1s |
-| the slow host dials others, nobody dials it | 0–1s | 0–2s |
+Timing the events *inside* the system instead — from the publisher's registration to each
+host applying the entry — shows no difference:
 
-So: **a host that dials a slow peer is delayed in learning from its other, healthy
-peers.** Being *dialed by* a slow peer costs nothing, and a slow outbound connector does
-not delay the dialer's own sending — only its receiving.
+```
+MESH, registration -> applied
+  healthy      bravo=419ms charlie=419ms echo=418ms
+  healthy      bravo=83ms  charlie=83ms  echo=83ms
+  delta SLOW   bravo=329ms charlie=328ms echo=330ms
+  delta SLOW   bravo=145ms charlie=308ms echo=310ms
+```
 
-The mechanism is **not** established, and these are ruled out by measurement or by
-reading the code:
+**What the chase did find is a real defect, in relaying.** Only two places called
+`notifyChange`: a node's own outbound exchanges, and its own publishers. A host that
+learned an entry by being *pushed* to updated its directory and told nobody, so it did not
+relay onward until its 5s anti-entropy deadline. One hop hid this completely — in a star or
+a mesh every host hears the publisher directly and nothing needs relaying — but a chain
+paid it per hop:
 
-* not a sequential peer loop — connectors are one worker per peer (`peerConnectorRun`)
-* not worker starvation — `spawnWorker` spawns a thread, there is no bounded pool
-* not a serial listener — `handleFederationClient` gets a worker per connection
-* not the directory lock held across a slow socket write — `fedCommand` and
-  `writeFedEntries` build a buffer under the lock and the caller writes it afterwards
+```
+RING, publisher -> third host
+  before   5119ms   1252ms   5597ms     <- the 5s deadline, not a wake
+  after     767ms   1050ms   1162ms
+```
 
-The one clue worth following: the delay is consistently ~4s, and `fed_sync_interval_ms`
-is 5000. That is what falling back to the anti-entropy timer looks like, as though the
-push that normally delivers news within a second is being missed while a sibling
-connector is inside a long exchange. `waitForChangeOrDeadline` and `fed_change_seq` — a
-single global counter shared by every connector on the host — is where to look.
+End to end, the ring in `examples/federation/topologies.py` went from 2.7s to 0.7s, which
+is now in line with the star and the mesh. That 2.7s had been sitting in the docs as "the
+cost of multi-hop relay" since the topology harness was written; it was this.
 
 That measurement is reported, not asserted. Only "did everyone converge at all" is a
 pass/fail, because printing a red FAIL for behaviour nobody has shown to be a defect

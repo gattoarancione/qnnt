@@ -25,7 +25,6 @@ const std = @import("std");
 const root = @import("qnnt");
 const qnnt = root.Qnnt;
 const tld = root.Tld;
-const topics = @import("topics");
 const stdout = @import("stdout");
 
 const allocator = std.heap.page_allocator;
@@ -211,21 +210,15 @@ fn appendText(out: *std.ArrayList(u8), msg: []const u8) void {
 
 // -- reading -----------------------------------------------------------------------------
 
-var joined: [max_topics][]const u8 = undefined;
+// Only the literal names on the command line come through here now; globs are joined
+// inside the library, which keeps its own list and its own cap.
 var joined_count: usize = 0;
-
-fn alreadyJoined(topic: []const u8) bool {
-    for (joined[0..joined_count]) |t| {
-        if (std.mem.eql(u8, t, topic)) return true;
-    }
-    return false;
-}
 
 fn join(topic: []const u8) void {
     if (joined_count == max_topics) return;
 
-    // Copied because the library retains the topic string for the life of the
-    // subscription, and the caller's slice points into a buffer the next listing reuses.
+    // Copied because the library retains the topic string for the life of the subscription,
+    // and the caller's slice points into the argument buffer.
     const owned = allocator.dupe(u8, topic) catch return;
     const ok = if (opt_text)
         qnnt.subscribe(owned, onText, null)
@@ -237,10 +230,39 @@ fn join(topic: []const u8) void {
         allocator.free(owned);
         return;
     }
-
-    joined[joined_count] = owned;
     joined_count += 1;
-    if (!opt_quiet) std.debug.print("qnnt-cat: + {s}\n", .{owned});
+}
+
+/// "+ topic", printed when a subscription actually attaches to a publisher rather than when
+/// one is merely started. Glob topics are joined inside the library now, so there is no
+/// longer a place in this file where every join passes -- and attach is the better moment to
+/// report anyway: it says the stream is live, not that we asked for it.
+///
+/// The handler fires on library threads, so the slot is claimed atomically. Two threads
+/// attaching at the same instant can both miss the other's entry and print the line twice;
+/// that is a cosmetic duplicate on a progress message, and not worth a lock in its way.
+var announced: [max_topics][64]u8 = undefined;
+var announced_len: [max_topics]std.atomic.Value(usize) = @splat(std.atomic.Value(usize).init(0));
+var announced_count = std.atomic.Value(usize).init(0);
+
+fn onEvent(event: qnnt.Event, topic: []const u8, _: []const u8, _: usize, _: ?*anyopaque) void {
+    if (event != .publisher_connected or opt_quiet) return;
+
+    const n = announced_count.load(.acquire);
+    for (0..@min(n, announced.len)) |i| {
+        const len = announced_len[i].load(.acquire);
+        if (len != 0 and std.mem.eql(u8, announced[i][0..len], topic)) return;
+    }
+
+    // Checked before claiming, so a name too long to record does not burn a slot every
+    // time its publisher reconnects.
+    if (topic.len > announced[0].len) return;
+    const slot = announced_count.fetchAdd(1, .acq_rel);
+    if (slot >= announced.len) return;
+    @memcpy(announced[slot][0..topic.len], topic);
+    announced_len[slot].store(topic.len, .release);
+
+    std.debug.print("qnnt-cat: + {s}\n", .{topic});
 }
 
 // -- writing -----------------------------------------------------------------------------
@@ -570,7 +592,8 @@ fn usage() void {
         \\  --text          newline-delimited instead of TLD-framed, for line topics
         \\  --time          prefix each line with the time (not with --raw)
         \\  --max <n>       stop after n messages
-        \\  --rescan <ms>   how often to re-match globs while reading (default 1000)
+        \\  --rescan <ms>   how often to re-match globs while reading (default 1000;
+        \\                  0 matches once at startup and never looks again)
         \\  --wait <ms>     with --publish, wait this long for a subscriber (default 2000)
         \\  --quiet         no notices on stderr
         \\
@@ -700,7 +723,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // there could only ever match nothing -- refused rather than silently doing so.
     if (publish) {
         for (patterns[0..pattern_count]) |p| {
-            if (topics.hasWildcard(p)) {
+            if (root.topics.hasWildcard(p)) {
                 std.debug.print(
                     "qnnt-cat: '{s}' is a glob, and --publish needs literal topic names " ++
                         "(a glob can only match topics that already exist)\n",
@@ -721,6 +744,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer qnnt.deinit();
 
     qnnt.installSignalHandlers();
+    qnnt.setEventHandler(onEvent, null);
 
     defer stdout.flush();
 
@@ -732,37 +756,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return;
     }
 
-    var names: [max_topics][]const u8 = undefined;
-    var name_buf: [max_topics * 96]u8 = undefined;
-
-    var globs = false;
+    // A glob goes to the library, which does the matching, the rescanning and the joining;
+    // a literal name is subscribed to directly. This used to be a rescan loop here, and the
+    // point of moving it is that `qnnt-ls`, `qnnt-cat` and `Qnnt.subscribePattern` now match
+    // through the same code -- what one shows you is what the others join.
     for (patterns[0..pattern_count]) |p| {
-        if (topics.hasWildcard(p)) globs = true else join(p);
+        if (!root.topics.hasWildcard(p)) {
+            join(p);
+            continue;
+        }
+        const ok = if (opt_text)
+            qnnt.subscribePattern(p, onText, null, opt_rescan_ms)
+        else
+            qnnt.subscribePatternFrames(p, onFrame, null, opt_rescan_ms);
+        if (!ok) std.debug.print("qnnt-cat: could not subscribe to {s}\n", .{p});
     }
 
-    // Short slices rather than one long sleep, so --max ends the run promptly instead of
-    // whenever the next rescan comes round.
-    const slice_ms = 50;
-    var since_rescan: u64 = opt_rescan_ms;
-
+    // Short slices rather than one long sleep, so --max ends the run promptly.
     while (!qnnt.stopRequested() and !limit_reached.load(.acquire)) {
-        if (globs and since_rescan >= opt_rescan_ms) {
-            since_rescan = 0;
-            const n = qnnt.listTopics(&names, &name_buf) catch 0;
-            for (names[0..n]) |name| {
-                if (alreadyJoined(name)) continue;
-                for (patterns[0..pattern_count]) |p| {
-                    if (topics.hasWildcard(p) and topics.globMatch(p, name)) {
-                        join(name);
-                        break;
-                    }
-                }
-            }
-            if (opt_rescan_ms == 0) globs = false;
-        }
-
-        qnnt.sleepMs(slice_ms);
-        since_rescan += slice_ms;
+        qnnt.sleepMs(50);
     }
 
     if (!opt_quiet) std.debug.print("qnnt-cat: {d} message(s)\n", .{seen.load(.monotonic)});
