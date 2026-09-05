@@ -1056,3 +1056,290 @@ test "a standby will not mirror an entry that claims to be its own" {
     try testing.expectEqual(@as(u64, 0), applyMirrorEntries(block.items, "127.0.0.1"));
     try testing.expect(qnnt.directory.getPtr("mirror/mine") == null);
 }
+
+/// The fields a merge test needs to assert on, read under the lock in one go.
+const Held = struct {
+    port: u16,
+    origin: NodeId,
+    version: u64,
+    learned_us: u64,
+    conflict_us: u64,
+    subs: usize,
+};
+
+fn heldEntry(topic: []const u8) ?Held {
+    qnnt.directory_mutex.lockUncancelable(qnnt.io);
+    defer qnnt.directory_mutex.unlock(qnnt.io);
+    const entry = qnnt.directory.getPtr(topic) orelse return null;
+    return .{
+        .port = entry.endpoint.getPort(),
+        .origin = entry.origin,
+        .version = entry.version,
+        .learned_us = entry.learned_us,
+        .conflict_us = entry.conflict_us,
+        .subs = entry.peers.items.len,
+    };
+}
+
+test "same origin: a newer version is taken, an older or equal one is not" {
+    // The rule that stops an update circulating a mesh for ever. Section 16's ring
+    // topology relies on it: A's change reaches E both ways round the loop, and whichever
+    // copy arrives second must be recognised as one already held and relayed no further.
+    // Comparing versions from ONE origin is safe whatever the clock skew between hosts,
+    // which is why the comparison is never made across origins.
+    const Q = @import("qnnt.zig").Qnnt;
+    try testing.expect(Q.setRegistryPort(22310));
+    try testing.expect(Q.run());
+    defer Q.deinit();
+
+    const origin: NodeId = @splat(0x11);
+    const topic = "merge/version/order";
+
+    try testing.expect(try applyRemoteEntry(.{
+        .origin = origin, .version = 100, .topic = topic,
+        .host = "10.0.0.1", .port = 7001, .subs = 0,
+    }, "10.0.0.1"));
+    try testing.expectEqual(@as(u16, 7001), heldEntry(topic).?.port);
+
+    // Older: refused, and the endpoint must not move.
+    try testing.expect(!try applyRemoteEntry(.{
+        .origin = origin, .version = 99, .topic = topic,
+        .host = "10.0.0.2", .port = 7002, .subs = 0,
+    }, "10.0.0.2"));
+    try testing.expectEqual(@as(u16, 7001), heldEntry(topic).?.port);
+
+    // Equal: also refused. This is the case that actually fires in a ring, where the same
+    // version arrives twice; accepting it would report a change and relay it onward again.
+    try testing.expect(!try applyRemoteEntry(.{
+        .origin = origin, .version = 100, .topic = topic,
+        .host = "10.0.0.2", .port = 7002, .subs = 0,
+    }, "10.0.0.2"));
+    try testing.expectEqual(@as(u16, 7001), heldEntry(topic).?.port);
+
+    // Newer: taken, and the endpoint follows.
+    try testing.expect(try applyRemoteEntry(.{
+        .origin = origin, .version = 101, .topic = topic,
+        .host = "10.0.0.2", .port = 7002, .subs = 0,
+    }, "10.0.0.2"));
+    try testing.expectEqual(@as(u16, 7002), heldEntry(topic).?.port);
+    try testing.expectEqual(@as(u64, 101), heldEntry(topic).?.version);
+}
+
+test "accepting an update refreshes the lease, so a live entry cannot expire" {
+    // `entryIsServable` measures from `learned_us`, so an accepted update has to move it.
+    // If it did not, an entry being refreshed perfectly well by its origin would stop
+    // being served thirty seconds in, and the topic would go dark while its publisher was
+    // still announcing it -- with nothing in the logs to say why.
+    const Q = @import("qnnt.zig").Qnnt;
+    try testing.expect(Q.setRegistryPort(22311));
+    try testing.expect(Q.run());
+    defer Q.deinit();
+
+    const origin: NodeId = @splat(0x22);
+    const topic = "merge/lease/refresh";
+
+    try testing.expect(try applyRemoteEntry(.{
+        .origin = origin, .version = 1, .topic = topic,
+        .host = "10.0.0.3", .port = 7003, .subs = 0,
+    }, "10.0.0.3"));
+
+    // Age it to the edge of the serve window, as a quiet origin would look.
+    {
+        qnnt.directory_mutex.lockUncancelable(qnnt.io);
+        defer qnnt.directory_mutex.unlock(qnnt.io);
+        qnnt.directory.getPtr(topic).?.learned_us -= fed_serve_until_us - 1;
+    }
+    const aged = heldEntry(topic).?.learned_us;
+
+    try testing.expect(try applyRemoteEntry(.{
+        .origin = origin, .version = 2, .topic = topic,
+        .host = "10.0.0.3", .port = 7003, .subs = 0,
+    }, "10.0.0.3"));
+
+    try testing.expect(heldEntry(topic).?.learned_us > aged);
+    {
+        qnnt.directory_mutex.lockUncancelable(qnnt.io);
+        defer qnnt.directory_mutex.unlock(qnnt.io);
+        const now_us: u64 = @intCast(qnnt.nowMicrosFn());
+        try testing.expect(entryIsServable(qnnt.directory.getPtr(topic).?, now_us));
+    }
+}
+
+test "a live rival is recorded as a conflict and changes nothing" {
+    // First registration wins, but the loser is not discarded silently: `conflict_us` is
+    // what makes `list` show CONFLICT instead of hiding a second publisher that believes
+    // it owns the topic. Two hosts each publishing the same name is a configuration
+    // mistake, and one that is invisible until something says so.
+    const Q = @import("qnnt.zig").Qnnt;
+    try testing.expect(Q.setRegistryPort(22312));
+    try testing.expect(Q.run());
+    defer Q.deinit();
+
+    const first: NodeId = @splat(0x33);
+    const rival: NodeId = @splat(0x44);
+    const topic = "merge/conflict/live";
+
+    try testing.expect(try applyRemoteEntry(.{
+        .origin = first, .version = 5, .topic = topic,
+        .host = "10.0.0.4", .port = 7004, .subs = 0,
+    }, "10.0.0.4"));
+    try testing.expectEqual(@as(u64, 0), heldEntry(topic).?.conflict_us);
+
+    // A rival with a HIGHER version still loses: versions order updates from one origin,
+    // they do not arbitrate between two.
+    try testing.expect(!try applyRemoteEntry(.{
+        .origin = rival, .version = 9999, .topic = topic,
+        .host = "10.0.0.5", .port = 7005, .subs = 0,
+    }, "10.0.0.5"));
+
+    const after = heldEntry(topic).?;
+    try testing.expectEqual(@as(u16, 7004), after.port);
+    try testing.expectEqualSlices(u8, &first, &after.origin);
+    try testing.expectEqual(@as(u64, 5), after.version);
+    try testing.expect(after.conflict_us > 0);
+}
+
+test "an empty host means the receiver decides; the port always comes from the entry" {
+    // The NAT story. A node that binds 0.0.0.0, or sits behind a gateway that picks its
+    // public address, cannot name an address that works for anyone else -- so it names
+    // none, and the receiver substitutes the address it was reached on. The port never
+    // travels in the host field, so a host text carrying one must not override it.
+    const Q = @import("qnnt.zig").Qnnt;
+    try testing.expect(Q.setRegistryPort(22313));
+    try testing.expect(Q.run());
+    defer Q.deinit();
+
+    const origin: NodeId = @splat(0x55);
+
+    try testing.expect(try applyRemoteEntry(.{
+        .origin = origin, .version = 1, .topic = "merge/host/observed",
+        .host = "", .port = 7006, .subs = 0,
+    }, "203.0.113.7"));
+
+    // A named host is taken as given: a third party's address says nothing about the
+    // connection we learned it over.
+    try testing.expect(try applyRemoteEntry(.{
+        .origin = origin, .version = 1, .topic = "merge/host/explicit",
+        .host = "198.51.100.9", .port = 7007, .subs = 0,
+    }, "203.0.113.7"));
+
+    var buf: [resolve.max_host_text]u8 = undefined;
+    qnnt.directory_mutex.lockUncancelable(qnnt.io);
+    defer qnnt.directory_mutex.unlock(qnnt.io);
+    const observed = qnnt.directory.getPtr("merge/host/observed").?;
+    const explicit = qnnt.directory.getPtr("merge/host/explicit").?;
+    try testing.expectEqualStrings("203.0.113.7", resolve.hostText(observed.endpoint, &buf));
+    try testing.expectEqual(@as(u16, 7006), observed.endpoint.getPort());
+    try testing.expectEqualStrings("198.51.100.9", resolve.hostText(explicit.endpoint, &buf));
+    try testing.expectEqual(@as(u16, 7007), explicit.endpoint.getPort());
+}
+
+test "an entry whose host cannot be parsed is refused, not stored half-formed" {
+    // A peer sending nonsense must not leave a directory entry pointing nowhere, because
+    // an unparseable address stored anyway would be handed to subscribers as if it worked.
+    const Q = @import("qnnt.zig").Qnnt;
+    try testing.expect(Q.setRegistryPort(22314));
+    try testing.expect(Q.run());
+    defer Q.deinit();
+
+    try testing.expect(!try applyRemoteEntry(.{
+        .origin = @splat(0x66), .version = 1, .topic = "merge/host/garbage",
+        .host = "not-an-address", .port = 7008, .subs = 0,
+    }, "10.0.0.6"));
+    try testing.expect(heldEntry("merge/host/garbage") == null);
+}
+
+test "subscriber counts federate as counts, and replace rather than accumulate" {
+    // Only the count crosses a federation link; the detail stays with the host that owns
+    // it and is proxied on demand. The count is carried as placeholder peers, so an update
+    // has to REPLACE the list -- appending would make a topic's subscriber count climb
+    // every sync until it was meaningless.
+    const Q = @import("qnnt.zig").Qnnt;
+    try testing.expect(Q.setRegistryPort(22315));
+    try testing.expect(Q.run());
+    defer Q.deinit();
+
+    const origin: NodeId = @splat(0x77);
+    const topic = "merge/subs/count";
+
+    try testing.expect(try applyRemoteEntry(.{
+        .origin = origin, .version = 1, .topic = topic,
+        .host = "10.0.0.7", .port = 7009, .subs = 3,
+    }, "10.0.0.7"));
+    try testing.expectEqual(@as(usize, 3), heldEntry(topic).?.subs);
+
+    try testing.expect(try applyRemoteEntry(.{
+        .origin = origin, .version = 2, .topic = topic,
+        .host = "10.0.0.7", .port = 7009, .subs = 1,
+    }, "10.0.0.7"));
+    try testing.expectEqual(@as(usize, 1), heldEntry(topic).?.subs);
+
+    try testing.expect(try applyRemoteEntry(.{
+        .origin = origin, .version = 3, .topic = topic,
+        .host = "10.0.0.7", .port = 7009, .subs = 0,
+    }, "10.0.0.7"));
+    try testing.expectEqual(@as(usize, 0), heldEntry(topic).?.subs);
+}
+
+test "parseFedEntry rejects a malformed line instead of inventing fields" {
+    // Every one of these arrives from the network. A parser that filled in a default for a
+    // missing field would put an entry in the directory that nobody sent.
+    const good = "aa" ** 16 ++ " 42 some/topic 10.0.0.8 7010 2";
+    var it = std.mem.tokenizeAny(u8, good, " \t\r\n");
+    const parsed = parseFedEntry(&it).?;
+    try testing.expectEqual(@as(u64, 42), parsed.version);
+    try testing.expectEqualStrings("some/topic", parsed.topic);
+    try testing.expectEqual(@as(u16, 7010), parsed.port);
+    try testing.expectEqual(@as(u32, 2), parsed.subs);
+
+    const bad = [_][]const u8{
+        "notahexnodeid 42 some/topic 10.0.0.8 7010 2", // origin is not 32 hex characters
+        "aa" ** 16 ++ " notanumber some/topic 10.0.0.8 7010 2", // version
+        "aa" ** 16 ++ " 42 some/topic 10.0.0.8 notaport 2", // port
+        "aa" ** 16 ++ " 42 some/topic 10.0.0.8", // truncated
+        "aa" ** 15 ++ " 42 some/topic 10.0.0.8 7010 2", // origin one byte short
+        "", // nothing at all
+    };
+    for (bad) |line| {
+        var bad_it = std.mem.tokenizeAny(u8, line, " \t\r\n");
+        try testing.expect(parseFedEntry(&bad_it) == null);
+    }
+}
+
+test "what writeFedEntries emits is what parseFedEntry reads back" {
+    // The two halves of the wire format live in different functions and are edited at
+    // different times. A column added to one and not the other would not fail to compile;
+    // it would silently stop entries propagating, which is exactly the failure that is
+    // hard to see from either end.
+    const Q = @import("qnnt.zig").Qnnt;
+    try testing.expect(Q.setRegistryPort(22316));
+    try testing.expect(Q.run());
+    defer Q.deinit();
+
+    const origin: NodeId = @splat(0x88);
+    try testing.expect(try applyRemoteEntry(.{
+        .origin = origin, .version = 4242, .topic = "merge/roundtrip/topic",
+        .host = "10.0.0.9", .port = 7011, .subs = 5,
+    }, "10.0.0.9"));
+
+    var buffer: std.ArrayList(u8) = .empty;
+    defer buffer.deinit(allocator);
+    try writeFedEntries(&buffer);
+
+    var found = false;
+    var lines = std.mem.splitScalar(u8, buffer.items, '\n');
+    while (lines.next()) |line| {
+        if (std.mem.indexOf(u8, line, "merge/roundtrip/topic") == null) continue;
+        var it = std.mem.tokenizeAny(u8, line, " \t\r\n");
+        try testing.expect(qnnt.eqlAny(it.next().?, &.{"fed-entry"}));
+        const back = parseFedEntry(&it).?;
+        try testing.expectEqualSlices(u8, &origin, &back.origin);
+        try testing.expectEqual(@as(u64, 4242), back.version);
+        try testing.expectEqualStrings("merge/roundtrip/topic", back.topic);
+        try testing.expectEqualStrings("10.0.0.9", back.host);
+        try testing.expectEqual(@as(u16, 7011), back.port);
+        try testing.expectEqual(@as(u32, 5), back.subs);
+        found = true;
+    }
+    try testing.expect(found);
+}
