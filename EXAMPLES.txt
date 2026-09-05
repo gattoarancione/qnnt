@@ -1993,6 +1993,36 @@ Windows box running Docker Desktop. Check in one line:
     docker run --rm --privileged --entrypoint bash debian:bookworm-slim \
       -c 'ip link add dev p type vcan && echo yes || echo no'
 
+This is an upstream gap, not a setting. linuxkit/linuxkit#3486 has been proposing exactly
+these options since March 2020 and is still open -- it stalled because the kernel build
+checks that the config file does not change during the build, so the options could not
+simply be appended. The workaround in that thread builds a CUSTOM LinuxKit image and boots
+it with `linuxkit run qemu`, which is a VM of your own next to Docker Desktop rather than a
+change to it: Docker Desktop ships its own signed VM and offers no way to substitute a
+kernel. If the PR ever merges, this example needs no change -- the harness probes for vcan
+and would simply stop skipping.
+
+The way to run it on a Mac today is a VM with an ordinary distribution kernel instead of
+LinuxKit's. colima boots Ubuntu, where CAN is a loadable module. This is the whole recipe,
+and it works:
+
+    brew install colima
+    colima start --cpu 4 --memory 6
+    colima ssh -- sh -c 'sudo apt-get update && \
+      sudo apt-get install -y linux-modules-extra-$(uname -r)'
+    colima ssh -- sudo modprobe vcan can can_raw
+    docker context use colima
+    docker/can.sh
+
+Two things about it are not obvious. The Ubuntu CLOUD image ships a trimmed module set, so
+vcan is missing until `linux-modules-extra` is installed -- `modprobe vcan` fails with
+"Module vcan not found" on a fresh VM, which reads exactly like a kernel without CAN and is
+not. And the module is loaded in the VM, not in the container: a container has no
+/lib/modules and cannot modprobe anything, it can only `ip link add` against a subsystem
+the kernel already has.
+
+`docker context use desktop-linux` puts things back.
+
 docker/can.sh detects this and says so rather than failing obscurely, then runs the half
 that does not need a kernel:
 
@@ -2017,11 +2047,28 @@ traffic. It was invisible until now because nothing before this subscribed to a 
 across a federation boundary: a named subscription resolves the topic directly and never
 consults the epoch at all.
 
-WHAT IS NOT COVERED. The SocketCAN calls themselves -- open, bind, read, write -- have no
-automated coverage, because this repository is developed on a mac and Docker Desktop cannot
-provide a CAN interface. The struct layouts they depend on ARE checked: examples/can/
-socketcan.zig asserts every size and offset at compile time, and those numbers were taken
-from <linux/can.h> on both aarch64 and x86_64. Everything above the socket is covered by
-`zig build test` and by `docker/can.sh wire`. Classic CAN only: CAN FD carries up to 64
-bytes and needs CAN_RAW_FD_FRAMES, which this gateway does not set, and it says so rather
-than truncating.
+WHAT IS COVERED, and by what. Three layers, because they fail in different ways and only
+the first runs without a Linux kernel:
+
+  * `zig build test` -- the wire format, the topic layout, the flag decoding, and the rules
+    about what may be written to a bus. Runs anywhere, mac included.
+  * `docker/can.sh wire` -- the topics, the glob subscription, the federated directory and
+    the frame format across five hosts. Needs Docker, not CAN.
+  * `docker/can.sh` -- the SocketCAN calls themselves and the gateways end to end. Needs a
+    kernel with vcan.
+
+The middle layer is not a substitute for the third, and the difference is not academic: the
+first version of this example passed every check above the socket while relaying eight bytes
+of garbage in every frame. `read` returned a frame whose payload borrowed its own stack, so
+it dangled the moment it returned. The identifier was right, the length was right, and the
+payload was a leftover pointer -- the same eight bytes on every frame, on every host. Only
+running it against a real interface showed it. examples/can/socketcan.zig now carries tests
+for the round trip, for 29-bit identifiers, and for the loopback rule the loop prevention
+depends on; they are built by `zig build can` and run by the harness, since they need a bus
+to talk to.
+
+The struct layouts are checked separately, at compile time: every size and offset is
+asserted against the numbers <linux/can.h> produces, verified on both aarch64 and x86_64.
+
+CLASSIC CAN ONLY. CAN FD carries up to 64 bytes and needs CAN_RAW_FD_FRAMES, which this
+gateway does not set. It refuses an over-long frame rather than truncating it.

@@ -12,7 +12,7 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
-const frame = @import("frame.zig");
+const frame = @import("frame");
 
 pub const Error = error{
     /// The kernel has no CAN subsystem. Almost always a kernel without CONFIG_CAN, which
@@ -159,7 +159,15 @@ pub const Bus = struct {
 
     /// One frame, or null when the read timed out -- which is the reader's chance to check
     /// whether it has been asked to stop.
-    pub fn read(self: *const Bus) Error!?frame.Frame {
+    ///
+    /// The payload is copied into the CALLER'S buffer, and the returned frame borrows it.
+    /// That is what the out-parameter is for, and it is not decoration: the first version
+    /// read into a local `can_frame` and returned a frame pointing into it, which dangled
+    /// the instant this returned. It did not crash. It published whatever the next call
+    /// left on the stack -- every frame on the bus arrived at every other host carrying the
+    /// same eight bytes of a leftover pointer, with a correct identifier and a correct
+    /// length in front of it.
+    pub fn read(self: *const Bus, payload: *[frame.max_data]u8) Error!?frame.Frame {
         var raw: can_frame = .{ .can_id = 0, .len = 0 };
         const n = std.c.read(self.fd, @ptrCast(&raw), @sizeOf(can_frame));
         if (n < 0) {
@@ -171,7 +179,9 @@ pub const Bus = struct {
         // A short read is not a frame. CAN_RAW delivers whole frames or nothing, so this
         // means the socket is not what we think it is.
         if (n != @sizeOf(can_frame)) return Error.ReadFailed;
-        return frame.fromRaw(raw.can_id, raw.len, &raw.data);
+
+        payload.* = raw.data;
+        return frame.fromRaw(raw.can_id, raw.len, payload);
     }
 
     /// Write one frame. The caller must have checked `frame.writable` first: this is the
@@ -210,4 +220,104 @@ pub fn explain(err: Error, iface: []const u8) void {
         ),
         else => std.debug.print("{s}: {s}\n", .{ iface, @errorName(err) }),
     }
+}
+
+// ---------------------------------------------------------------- tests
+//
+// These need a real CAN interface, so they do not run in `zig build test` on a developer's
+// machine -- they are built by `zig build can-test -Dtarget=*-linux-gnu` and run inside the
+// container by docker/can.sh, which creates the interface first.
+//
+// They exist because this file had no coverage at all and immediately proved it: `read`
+// returned a frame borrowing its own stack, so every relayed frame carried eight bytes of a
+// leftover pointer. Nothing above the socket could have caught it -- the identifier and the
+// length were right, and the payload was plausible bytes.
+
+const testing = std.testing;
+
+/// Created by docker/can.sh before running this.
+const test_iface = "vcantest";
+
+fn openOrSkip() !Bus {
+    return Bus.open(test_iface, 500) catch |err| {
+        std.debug.print("skipping: no {s} ({t}). docker/can.sh creates it.\n",
+            .{ test_iface, err });
+        return error.SkipZigTest;
+    };
+}
+
+test "a frame written on one socket arrives intact on another" {
+    var tx = try openOrSkip();
+    defer tx.close();
+    var rx = try openOrSkip();
+    defer rx.close();
+
+    const sent = frame.Frame{
+        .id = 0x123,
+        .ext = false,
+        .rtr = false,
+        .err = false,
+        .dlc = 8,
+        // Every byte different, and not a run of zeros: a payload that is mostly zeros
+        // matches a dangling read into fresh stack often enough to pass by luck.
+        .data = .{ .data = &.{ 0xA1, 0x01, 0x02, 0xDE, 0xAD, 0xBE, 0xEF, 0x5A } },
+        .us = 0,
+    };
+    try tx.write(sent);
+
+    var payload: [frame.max_data]u8 = undefined;
+    const got = (try rx.read(&payload)) orelse return error.TestUnexpectedResult;
+
+    try testing.expectEqual(sent.id, got.id);
+    try testing.expectEqual(sent.ext, got.ext);
+    try testing.expectEqual(sent.dlc, got.dlc);
+    // The assertion the whole gateway rests on, and the one that was silently false.
+    try testing.expectEqualSlices(u8, sent.data.data, got.data.data);
+}
+
+test "a 29-bit identifier survives the kernel round trip" {
+    var tx = try openOrSkip();
+    defer tx.close();
+    var rx = try openOrSkip();
+    defer rx.close();
+
+    try tx.write(.{
+        .id = 0x1ABCDEF, .ext = true, .rtr = false, .err = false,
+        .dlc = 3, .data = .{ .data = &.{ 0x11, 0x22, 0x33 } }, .us = 0,
+    });
+
+    var payload: [frame.max_data]u8 = undefined;
+    const got = (try rx.read(&payload)) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 0x1ABCDEF), got.id);
+    try testing.expect(got.ext);
+    try testing.expectEqual(@as(u8, 3), got.dlc);
+    try testing.expectEqualSlices(u8, &.{ 0x11, 0x22, 0x33 }, got.data.data);
+}
+
+test "a socket does not read back what it just sent" {
+    // The property the gateway's loop prevention rests on: one socket per bus does both the
+    // reading and the writing, and SocketCAN loops a transmitted frame to the OTHER sockets
+    // on the interface, not to the sender. If this ever became false, a relayed frame would
+    // be read back and republished, and the mesh would saturate.
+    var bus = try openOrSkip();
+    defer bus.close();
+
+    try bus.write(.{
+        .id = 0x300, .ext = false, .rtr = false, .err = false,
+        .dlc = 1, .data = .{ .data = &.{0x99} }, .us = 0,
+    });
+
+    // One read timeout is enough: the loopback would already have been queued.
+    var payload: [frame.max_data]u8 = undefined;
+    try testing.expect((try bus.read(&payload)) == null);
+}
+
+test "the read timeout returns rather than blocking for ever" {
+    var bus = try openOrSkip();
+    defer bus.close();
+
+    // Nothing is on the bus, so this must come back empty -- that return is the gateway's
+    // only chance to notice it has been asked to shut down.
+    var payload: [frame.max_data]u8 = undefined;
+    try testing.expect((try bus.read(&payload)) == null);
 }

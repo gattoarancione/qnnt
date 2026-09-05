@@ -112,7 +112,26 @@ run_wire() {
 
 # ---------------------------------------------------------------- the whole thing
 
+# The SocketCAN calls themselves: open, bind, read, write, and the loopback rule the
+# gateway's loop prevention depends on. Run against an interface of its own so it cannot be
+# confused by gateway traffic.
+run_socket_tests() {
+  echo "== the SocketCAN layer =="
+  local out
+  out=$(docker run --rm --cap-add NET_ADMIN --entrypoint bash qnnt-fed -c '
+      ip link add dev vcantest type vcan && ip link set up vcantest &&
+      /qnnt/bin/qnnt-can-test' 2>&1)
+  if echo "$out" | grep -q "All .* tests passed"; then
+    check "socket round trip, 29-bit ids, and no read-back of our own writes" 1
+  else
+    check "socket round trip, 29-bit ids, and no read-back of our own writes" 0
+    echo "$out" | tail -12 | sed 's/^/      /'
+  fi
+}
+
 run_full() {
+  run_socket_tests
+  echo
   echo "== gateways on vcan interfaces =="
   $CAN down -v --remove-orphans >/dev/null 2>&1
   $CAN up -d >/dev/null 2>&1 || { echo "  could not start the gateways"; return; }

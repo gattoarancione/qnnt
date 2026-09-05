@@ -290,6 +290,33 @@ docker run --rm --privileged --entrypoint bash debian:bookworm-slim \
   -c 'ip link add dev p type vcan && echo yes || echo no'
 ```
 
+This is upstream, not a setting: [linuxkit/linuxkit#3486](https://github.com/linuxkit/linuxkit/pull/3486)
+has proposed exactly these options since March 2020 and is still open. The workaround in
+that thread builds a custom LinuxKit image and boots it under `linuxkit run qemu` — a VM of
+your own beside Docker Desktop, not a change to it, since Docker Desktop ships its own
+signed VM with no way to swap the kernel. If the PR merges, nothing here needs changing:
+the harness probes for vcan and stops skipping.
+
+To run the real thing on a Mac today, use a VM with a distribution kernel rather than
+LinuxKit's. This works:
+
+```sh
+brew install colima
+colima start --cpu 4 --memory 6
+colima ssh -- sh -c 'sudo apt-get update &&
+  sudo apt-get install -y linux-modules-extra-$(uname -r)'
+colima ssh -- sudo modprobe vcan can can_raw
+docker context use colima
+docker/can.sh                      # 15 checks, all green
+docker context use desktop-linux   # to put it back
+```
+
+The Ubuntu cloud image ships a trimmed module set, so `modprobe vcan` fails on a fresh VM
+with "Module vcan not found" — which reads exactly like a kernel without CAN, and is not.
+`linux-modules-extra` is what supplies it. Load it in the VM, not in a container: a
+container has no `/lib/modules` and can only `ip link add` against a subsystem the kernel
+already has.
+
 `docker/can.sh` asks this first and says so plainly rather than failing obscurely, then runs
 `wire` instead — which exercises the topics, the glob subscriptions, the federated directory
 and the frame format, everything except the socket. Run the full harness on a Linux host, or
@@ -297,7 +324,14 @@ in a VM with a stock distribution kernel.
 
 ## What it found
 
-Federation merged a peer's directory entries without moving `directory_epoch`. A
+**A dangling read.** `Bus.read` returned a frame whose payload borrowed its own stack, so it
+dangled the instant it returned. The gateway then published whatever was left there: every
+frame arrived at every host with a correct identifier, a correct length, and eight bytes of
+a leftover pointer. Every check above the socket passed. Only a real vcan interface showed
+it, which is why `examples/can/socketcan.zig` now has round-trip tests that the harness runs.
+
+**A missing epoch bump.** Federation merged a peer's directory entries without moving
+`directory_epoch`. A
 `subscribePattern` re-lists only when that number moves, so every topic reached through
 federation was invisible to every glob subscription on the receiving host: the gateways each
 saw only their own traffic. Nothing before this had subscribed to a *pattern* across a

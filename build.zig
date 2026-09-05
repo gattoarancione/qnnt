@@ -686,6 +686,24 @@ pub fn build(b: *Build) void {
     // which is the only reason this example has any coverage on a mac at all.
     const can_step = b.step("can", "Build the CAN gateway (examples/can/, Linux only)");
     if (target.result.os.tag == .linux) {
+        // Named modules, created once and shared by the gateway and the test binary. A
+        // second anonymous module over the same file would be a different module holding
+        // the same source, which Zig rejects outright.
+        const can_frame_mod = b.createModule(.{
+            .root_source_file = b.path("examples/can/frame.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        can_frame_mod.addImport("qnnt", qnnt_lib_mod);
+
+        const can_socketcan_mod = b.createModule(.{
+            .root_source_file = b.path("examples/can/socketcan.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        can_socketcan_mod.addImport("frame", can_frame_mod);
+
         const can_mod = b.createModule(.{
             .root_source_file = b.path("examples/can/gateway.zig"),
             .target = target,
@@ -693,19 +711,25 @@ pub fn build(b: *Build) void {
             .link_libc = true,
         });
         can_mod.addImport("qnnt", qnnt_lib_mod);
-        can_mod.addAnonymousImport("frame", .{
-            .root_source_file = b.path("examples/can/frame.zig"),
-            .imports = &.{.{ .name = "qnnt", .module = qnnt_lib_mod }},
-        });
-        can_mod.addAnonymousImport("socketcan", .{
-            .root_source_file = b.path("examples/can/socketcan.zig"),
-            .imports = &.{.{ .name = "qnnt", .module = qnnt_lib_mod }},
-        });
+        can_mod.addImport("frame", can_frame_mod);
+        can_mod.addImport("socketcan", can_socketcan_mod);
 
         const can_gw = b.addExecutable(.{ .name = "qnnt-can-gw", .root_module = can_mod });
         can_gw.root_module.linkLibrary(qnnt_lib);
         b.installArtifact(can_gw);
         can_step.dependOn(&b.addInstallArtifact(can_gw, .{}).step);
+
+        // The SocketCAN tests need a real CAN interface, so they are INSTALLED rather than
+        // run: `zig build test` on a developer's machine has no bus to talk to, and
+        // docker/can.sh runs this binary in a container after creating one. Without it this
+        // file has no coverage at all, which is how it shipped a read that returned a frame
+        // borrowing its own stack.
+        const can_test = b.addTest(.{
+            .name = "qnnt-can-test",
+            .root_module = can_socketcan_mod,
+        });
+        can_test.root_module.linkLibrary(qnnt_lib);
+        can_step.dependOn(&b.addInstallArtifact(can_test, .{}).step);
     } else {
         const explain = b.addSystemCommand(&.{
             "echo",

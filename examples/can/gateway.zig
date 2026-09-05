@@ -25,8 +25,8 @@ const std = @import("std");
 const root = @import("qnnt");
 const qnnt = root.Qnnt;
 const tld = root.Tld;
-const frame = @import("frame.zig");
-const socketcan = @import("socketcan.zig");
+const frame = @import("frame");
+const socketcan = @import("socketcan");
 
 const allocator = std.heap.page_allocator;
 
@@ -79,8 +79,13 @@ fn readerLoop(bus: *Bus) void {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
+    // The payload the frame returned by `read` borrows. It lives as long as this loop, and
+    // is finished with by the time the next read overwrites it: the frame is packed and
+    // published before the loop comes round.
+    var payload: [frame.max_data]u8 = undefined;
+
     while (!qnnt.stopRequested()) {
-        const got = bus.sock.read() catch |err| {
+        const got = bus.sock.read(&payload) catch |err| {
             if (!opt_quiet) std.debug.print(
                 "qnnt-can-gw: {s}: read failed ({t}), stopping this bus\n",
                 .{ bus.iface, err },
