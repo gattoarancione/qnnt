@@ -1506,3 +1506,162 @@ printed "subscribed to ... @ tcp://...", which it prints only on a successful
 ATTACH -- so against a dead publisher it prints nothing whether or not an endpoint
 was handed out, and it reported a mismatch at t+8s that was an artifact of the
 probe. Asking the registry directly is what separated the two.
+
+--------------------------------------------------------------------------------
+ 17. When the registry holder dies: examples/registry/
+--------------------------------------------------------------------------------
+
+    python3 examples/registry/failover.py --runs 5
+
+The directory is host-local and lives in ONE elected process. Every node loops on
+binding the registry port; whoever gets it serves, and the rest stand by and
+re-probe every registry_probe_interval_ms (2s). So the holder is a single point of
+failure for a host -- the mechanism is there in registryRun(), but nothing measured
+what it costs.
+
+Three processes keep the roles apart so the answers are not confounded: A holds
+the registry and publishes nothing, B publishes at 10 Hz, C subscribes before the
+kill and counts across it. Then A is killed.
+
+RESULT: the directory is unavailable for 0.2s, and delivery never pauses.
+
+Getting there took two changes and one retracted conclusion.
+
+    measured                          role taken   gap    outage
+    as found                          1.8-2.0s     0.0s   2.0s
+    + bind retry 2000ms -> 250ms      0.2s         1.8s   2.0s   (no better!)
+    + warm standby directories        0.2s         0.0s   0.2s
+
+The middle row is the interesting one. Shortening the bind retry made the role
+change hands ten times faster and did NOT improve the outage at all, because both
+paths are gated by the same thing: a new holder starts with an EMPTY directory and
+can serve nothing until publishers re-register on their 2s refresh. Taking the
+role sooner only moves the wait.
+
+So the fix is the warm copy, and the two changes only pay off together -- fast
+takeover is worth nothing without something to serve, and a warm copy is worth
+little if taking the role is what costs the time.
+
+HOW THE WARM COPY WORKS. A standby already wakes to re-contend for the port, so it
+pulls the directory from the holder in the same loop and merges it. Pulled, not
+pushed: no registration with the holder, no fan-out, no tracking which standbys
+are alive, and no failure mode where a slow standby stalls the holder's publish
+path. A missed pull corrects itself on the next one, and the copy being up to one
+interval stale does not matter, because a standby's copy is only ever read at the
+moment it takes the role.
+
+It reuses federation's machinery rather than repeating it: `mirror` returns the
+same `fed-entry` lines federation exchanges, and `applyMirrorEntries` merges them
+through the same `applyRemoteEntry`. So a standby inherits the whole merge policy
+for free -- version ordering, first-registration-wins, and the refusal to accept
+an entry bearing its own NodeId, which is what stops a stale copy of a node's own
+registration overwriting the live one it is still refreshing.
+
+The two intervals are now separate constants, because they answer different
+questions and cost different amounts:
+
+    registry_bind_retry_ms   250   a socket, a failed bind, a close: nothing on
+                                   the wire, so it can be fast
+    registry_probe_interval_ms 2000  a round trip per publisher, and the unit
+                                   stale_after_us is expressed in
+
+A CONDITIONAL PULL, so a quiet host costs almost nothing. A standby quotes the
+epoch it last mirrored and the holder answers in one line if nothing has changed:
+
+    mirror                    -> mirror-state <holder-id> <epoch>, then the entries
+    mirror <holder-id> <epoch> -> mirror-unchanged <holder-id> <epoch>   (51 bytes)
+                              -> or the whole thing, if either differs
+
+The epoch is a counter, not a digest, and that is deliberate: `version` on an entry
+is set to `now_us` on EVERY refresh, so anything derived from entry contents
+changes every probe interval per publisher and a "has it changed?" check built on
+it would never once say no. The registry already computed the right signal --
+`registerTopic` sets `changed` only when a topic appears, its endpoint moves, or it
+goes away, precisely so federation is not woken by heartbeats -- so the epoch is
+that existing signal, counted. No hashing, no collisions, and one line where the
+notification already fired.
+
+The holder's NodeId travels with it because the counter is per-process: a standby
+holding epoch 42 from one holder is not current against a different holder that
+reached 42 by another route, and answering "unchanged" there would leave it
+mirroring a directory it never saw.
+
+ONE SUBTLETY, and it is the kind that would have gone unnoticed for a long time.
+Merging is what refreshes a mirrored entry's lease -- `entryIsServable` stops
+serving anything this node has not heard about for 30s. A standby that only ever
+received "unchanged" would therefore watch its warm copy quietly go cold, and then
+on takeover refuse to serve topics that had been alive the whole time. So a full
+pull is forced every `serve_until_us / 2`, and the cheap path covers the rest.
+Verified by settling for 45s -- long past the lease -- before killing the holder:
+resolvable again in 0.11s.
+
+WHAT IT COSTS, derived from 94 bytes per entry measured on the wire, a 2s poll and
+a forced full pull every 15s:
+
+     4 nodes,  50 topics      6.9 -> 1.0 KiB/s per host
+    10 nodes, 100 topics     41.3 -> 5.7 KiB/s per host
+    50 nodes, 500 topics   1124.5 -> 151.0 KiB/s per host
+
+about 7x less than pulling the whole directory every time. It remains
+O(nodes x topics) on the full pulls, so a very large host still pays; sending only
+the entries above the standby's epoch would remove that too, and needs a
+per-entry "changed at" stamp to do it.
+
+TWO OPT-OUTS, for hosts that should not carry this at all:
+
+    QNNT_REGISTRY_ROLE=client    never be elected. The node publishes and
+                                 subscribes normally but never contends for the
+                                 port and never mirrors -- a warm copy exists only
+                                 to make a takeover fast, and this node will not
+                                 take over. For a sensor board or a tight
+                                 container that should not be handed the whole
+                                 host's directory.
+    QNNT_REGISTRY_MIRROR=0       stay a candidate, but cold. Able to take the
+                                 role, without the round trip every probe interval
+                                 or the copy in memory -- which is exactly the
+                                 behaviour before mirroring existed.
+
+If every node on a host opts out of the role, the port stays vacant and there is
+no registry. That is the configured outcome rather than a fault, and it is visible:
+the declining node says so once, at startup.
+
+    established delivery    never paused, in any run
+
+Two things follow.
+
+THE REGISTRY IS A CONTROL PLANE, exactly as federation is (section 16). An
+established subscription is direct TCP between publisher and subscriber; the
+registry is how the two were introduced, not how they talk. Killing it did not
+drop a single message in any run.
+
+RECOVERY IS TWO PHASES, and only the first is fixed. Taking the role costs up to
+one probe interval, depending where the standby was in its cycle. Re-registration
+costs a second one UNLESS the publisher itself takes over, in which case its topic
+is already local to the directory it now serves and resolution is immediate --
+usually. Five runs of six; the sixth still paid the second interval.
+
+The timing is jittery enough that the harness takes `--runs N` and reports a
+distribution rather than a verdict, which is not a stylistic choice: during
+development this test produced a confident and WRONG answer twice from single
+runs, first that the publisher case is always immediate, then -- over-correcting
+on three samples that included the one outlier -- that it never is. Eight samples
+say "usually, but not reliably".
+
+FOUR INSTRUMENT BUGS, all mine, all in the probe rather than the library, and all
+of the same shape -- an error path producing plausible data instead of an error:
+
+  * `sub <topic>` sent with no trailing newline. The registry waits for the rest
+    of the line and replies with its banner alone, which parses as an empty answer
+    and is indistinguishable from "topic unknown".
+  * "who holds the role" read by grepping a log for "role acquired", which reports
+    EVER held, not currently. Read after teardown it showed two holders at once,
+    because terminating one frees the port and the survivor grabs it on its way out.
+  * (section 16) `qnnt-cat` used to detect whether an endpoint was handed out. It
+    prints its line only on a successful ATTACH, so against a dead publisher it
+    prints nothing either way.
+  * (section 16) judging expiry by a topic listing, when listing and serving are
+    two different clocks.
+
+The registry answers all of these directly if asked properly. `sub <topic>`
+distinguishes served / expired / not-found, and `list` shows refreshed age and
+origin per entry.

@@ -14,6 +14,8 @@
 //! Variables, all optional:
 //!
 //!   QNNT_REGISTRY_PORT     the host-local registry port (default 2222)
+//!   QNNT_REGISTRY_ROLE     candidate (default) or client: a client is never elected
+//!   QNNT_REGISTRY_MIRROR   1 (default) or 0: keep a warm copy of the directory
 //!   QNNT_ADVERTISE_ADDR    the address remote subscribers should dial
 //!   QNNT_BIND_ADDR         what publisher sockets bind
 //!   QNNT_CLUSTER_KEY       enables federation; required for it
@@ -38,6 +40,22 @@ fn get(name: [*:0]const u8) ?[]const u8 {
     const value = std.c.getenv(name) orelse return null;
     const text = std.mem.span(value);
     return if (text.len == 0) null else text;
+}
+
+/// The spellings a person actually types for a flag. Anything else is rejected loudly
+/// rather than guessed at, since silently reading "off" as true would disable exactly the
+/// safety a node was configured for.
+fn parseBool(text: []const u8) ?bool {
+    if (eqlAnyOf(text, &.{ "1", "true", "yes", "on" })) return true;
+    if (eqlAnyOf(text, &.{ "0", "false", "no", "off" })) return false;
+    return null;
+}
+
+fn eqlAnyOf(text: []const u8, names: []const []const u8) bool {
+    for (names) |name| {
+        if (std.ascii.eqlIgnoreCase(text, name)) return true;
+    }
+    return false;
 }
 
 fn parsePort(text: []const u8) ?u16 {
@@ -115,6 +133,20 @@ pub fn configureFromEnvironment() void {
         if (parsePort(text)) |value| {
             if (!qnnt.setRegistryPortFn(value)) reject("QNNT_REGISTRY_PORT", text);
         } else reject("QNNT_REGISTRY_PORT", text);
+    }
+
+    if (get("QNNT_REGISTRY_ROLE")) |text| {
+        if (std.mem.eql(u8, text, "client")) {
+            _ = qnnt.setRegistryRoleFn(.client);
+        } else if (std.mem.eql(u8, text, "candidate")) {
+            _ = qnnt.setRegistryRoleFn(.candidate);
+        } else reject("QNNT_REGISTRY_ROLE", text);
+    }
+
+    if (get("QNNT_REGISTRY_MIRROR")) |text| {
+        if (parseBool(text)) |on| {
+            _ = qnnt.setRegistryMirrorFn(on);
+        } else reject("QNNT_REGISTRY_MIRROR", text);
     }
 
     if (get("QNNT_ADVERTISE_ADDR")) |text| {

@@ -49,6 +49,10 @@ pub const default_port = 2223;
 // A remote entry stops being handed out once this stale, because pointing a subscriber at
 // an unreachable host just makes it retry, and is dropped entirely after `forget`.
 const fed_serve_until_us: u64 = 30 * std.time.us_per_s;
+/// Readable from qnnt.zig, which needs it to decide how often a standby must take a FULL
+/// mirror: merging is what refreshes a mirrored entry's lease, so the full pull has to
+/// happen well inside this window or a warm copy goes cold without saying so.
+pub const serve_until_us = fed_serve_until_us;
 const fed_forget_after_us: u64 = 300 * std.time.us_per_s;
 
 const Peer = struct {
@@ -286,7 +290,13 @@ fn setRemoteSubCount(entry: *TopicEntry, count: u32, endpoint: net.IpAddress) !v
 
 // ---------------------------------------------------------------- serialising
 
-fn writeFedEntries(buffer: *std.ArrayList(u8)) !void {
+/// Serialise the directory as `fed-entry` lines.
+///
+/// Public because the host-local mirror uses it too: a standby pulling the directory from
+/// the elected registry wants exactly what a federation peer wants, and for the same
+/// reasons -- origin preserved so the standby never claims authorship, version so a merge
+/// can be ordered, and unservable entries skipped so a dead address is not taught onward.
+pub fn writeFedEntries(buffer: *std.ArrayList(u8)) !void {
     qnnt.directory_mutex.lockUncancelable(qnnt.io);
     defer qnnt.directory_mutex.unlock(qnnt.io);
 
@@ -331,6 +341,25 @@ fn writeFedEntries(buffer: *std.ArrayList(u8)) !void {
             entry.peers.items.len,
         });
     }
+}
+
+/// Merge a block of `fed-entry` lines into the directory. Returns how many changed it.
+///
+/// The host-local mirror's receiving half. It is the same parse-and-merge the federation
+/// exchange does, so a standby inherits the whole merge policy for free: it will not take
+/// back its own entries, a newer version from one origin wins, and a rival origin cannot
+/// steal a live topic. What it is NOT is a second copy of that policy.
+pub fn applyMirrorEntries(text: []const u8, observed_host: []const u8) u64 {
+    var applied: u64 = 0;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0 or std.mem.startsWith(u8, line, qnnt.comment_prefix)) continue;
+        var it = std.mem.tokenizeAny(u8, line, " \t\r\n");
+        if (!qnnt.eqlAny(it.next() orelse continue, &.{"fed-entry"})) continue;
+        const entry = parseFedEntry(&it) orelse continue;
+        if (applyRemoteEntry(entry, observed_host) catch false) applied += 1;
+    }
+    return applied;
 }
 
 // ---------------------------------------------------------------- listener side
@@ -951,4 +980,79 @@ test "peers reports why federation is off, rather than a port it is not listenin
     // Leave the module as it was found: these are globals shared with the other tests.
     cluster_key_len = 0;
     peer_count = 0;
+}
+
+test "a mirrored block is parsed and merged, and junk in it is skipped not fatal" {
+    // The host-local mirror's receiving half. A standby feeds whatever the holder sent
+    // straight in here, so it has to tolerate the banner, the terminator, blank lines and
+    // anything a future firmware adds -- and still apply the entries it does understand.
+    const Q = @import("qnnt.zig").Qnnt;
+
+    try testing.expect(Q.setRegistryPort(22306));
+    try testing.expect(Q.run());
+    defer Q.deinit();
+
+    const origin: NodeId = @splat(0xC1);
+    var id_buf: [32]u8 = undefined;
+    const origin_text = qnnt.formatNodeId(&id_buf, origin);
+
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(allocator);
+    try block.print(allocator,
+        \\# qnnt registry, type 'help' for commands
+        \\# end
+        \\fed-entry {s} 7 mirror/one 10.0.0.4 9101 0
+        \\fed-entry {s} 7 mirror/two - 9102 3
+        \\fed-entry not-a-node-id 7 mirror/bad 10.0.0.4 9103 0
+        \\garbage line that is not an entry at all
+        \\
+        \\# end
+        \\
+    , .{ origin_text, origin_text });
+
+    // Two good entries; the malformed one and the noise are skipped rather than aborting
+    // the block, because a standby that discarded a whole mirror over one bad line would
+    // silently keep an empty directory.
+    try testing.expectEqual(@as(u64, 2), applyMirrorEntries(block.items, "127.0.0.1"));
+    try testing.expectEqual(@as(u16, 9101), heldPort("mirror/one"));
+    try testing.expectEqual(@as(u16, 9102), heldPort("mirror/two"));
+    try testing.expect(qnnt.directory.getPtr("mirror/bad") == null);
+
+    // An empty host means "you decide", and the receiver fills in the address it was
+    // reached on -- loopback, for a mirror pulled from the holder on this host.
+    {
+        qnnt.directory_mutex.lockUncancelable(qnnt.io);
+        defer qnnt.directory_mutex.unlock(qnnt.io);
+        var host_buf: [resolve.max_host_text]u8 = undefined;
+        const held = qnnt.directory.getPtr("mirror/two").?;
+        try testing.expectEqualStrings("127.0.0.1", resolve.hostText(held.endpoint, &host_buf));
+    }
+
+    // Re-applying the same version changes nothing: a standby pulls every couple of
+    // seconds, and a mirror that reported every entry as new every time would make
+    // `notifyChange` fire continuously.
+    try testing.expectEqual(@as(u64, 0), applyMirrorEntries(block.items, "127.0.0.1"));
+}
+
+test "a standby will not mirror an entry that claims to be its own" {
+    // The safety property the mirror inherits from applyRemoteEntry, and the one that
+    // matters most: this node is authoritative for the topics it publishes. If a holder
+    // handed back an entry bearing our own NodeId -- because we published it a moment ago
+    // -- accepting it would let a copy of our own registration, possibly a stale one,
+    // overwrite the live one we are still refreshing.
+    const Q = @import("qnnt.zig").Qnnt;
+
+    try testing.expect(Q.setRegistryPort(22307));
+    try testing.expect(Q.run());
+    defer Q.deinit();
+
+    var id_buf: [32]u8 = undefined;
+    const mine = qnnt.formatNodeId(&id_buf, qnnt.node_id);
+
+    var block: std.ArrayList(u8) = .empty;
+    defer block.deinit(allocator);
+    try block.print(allocator, "fed-entry {s} 99 mirror/mine 10.0.0.9 9200 0\n", .{mine});
+
+    try testing.expectEqual(@as(u64, 0), applyMirrorEntries(block.items, "127.0.0.1"));
+    try testing.expect(qnnt.directory.getPtr("mirror/mine") == null);
 }

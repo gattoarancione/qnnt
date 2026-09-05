@@ -166,15 +166,20 @@ def registry_sub(site, name):
     except OSError as e:
         return f"unreachable ({e})"
     s.sendall(f"sub {name}\n".encode())
+    # To the terminator, not to a socket timeout -- the registry holds the connection open
+    # after answering, so waiting for a close adds the whole timeout to every probe.
     s.settimeout(3)
     data = b""
-    try:
-        while True:
+    ends = 0
+    while ends < 2:                    # banner, then the reply
+        try:
             chunk = s.recv(4096)
-            if not chunk: break
-            data += chunk
-    except socket.timeout:
-        pass
+        except socket.timeout:
+            break
+        if not chunk:
+            break
+        data += chunk
+        ends = data.count(b"# end")
     s.close()
     lines = [l for l in data.decode(errors="replace").splitlines()
              if l and not l.startswith("#")]
@@ -367,7 +372,7 @@ def check_clocks(long_run=False):
 # -- main ------------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    libs = glob.glob(os.path.join(REPO, "zig-out/lib/libqnnt*"))
+    libs = glob.glob(os.path.join(REPO, "zig-out/lib/libqnnt_c.*"))
     LIB = libs[0] if libs else None
     if not os.path.exists(os.path.join(REPO, "zig-out/bin/qnnt-ls")):
         print("build first: zig build"); sys.exit(2)

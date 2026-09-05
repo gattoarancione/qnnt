@@ -101,7 +101,31 @@ pub const TopicEntry = struct {
 };
 
 pub var directory: std.StringHashMap(TopicEntry) = .init(allocator);
+
+/// Bumped whenever the directory MATERIALLY changes -- a topic appears, its endpoint moves,
+/// or it is removed. Deliberately not bumped by a refresh, which is why this can stand in
+/// for a content digest: `version` is set to `now_us` on every refresh, so anything derived
+/// from it changes every probe interval per publisher and a "has it changed?" check built
+/// on it would always say yes.
+///
+/// The distinction already existed -- `registerTopic` computes `changed` precisely so
+/// federation is not woken by heartbeats -- so this counter is that same signal, counted.
+/// A standby quotes the epoch it last mirrored and the holder answers "unchanged" in a
+/// dozen bytes instead of re-sending the directory.
+///
+/// Paired with the holder's NodeId on the wire, because the counter is per-process: a
+/// standby that mirrored epoch 42 from one holder must not think it is current against a
+/// different holder that happens to be at epoch 42.
+pub var directory_epoch: std.atomic.Value(u64) = .init(0);
 pub var directory_mutex: Io.Mutex = .init;
+
+/// One place that says "the directory really changed": bump the epoch, then wake
+/// federation. Both were previously the same call, and they still fire together -- the
+/// epoch exists so a standby can ask cheaply whether it missed one.
+fn markDirectoryChanged() void {
+    _ = directory_epoch.fetchAdd(1, .monotonic);
+    federation.notifyChange();
+}
 
 // When the current registry role was acquired, for `status`. Written by the registry
 // thread and read by client handlers, hence atomic.
@@ -1051,6 +1075,31 @@ fn clientCommand(command: []const u8) !Reply {
         }
     } else if (eqlAny(verb, &.{"peers"})) {
         try federation.writePeerList(&buffer);
+    } else if (eqlAny(verb, &.{"mirror"})) {
+        // `mirror` alone: the whole directory. `mirror <holder-id> <epoch>`: the whole
+        // directory, or a one-line "you are current" if nothing material has changed
+        // since that epoch.
+        //
+        // The holder's id is checked as well as the epoch because the counter is
+        // per-process. A standby holding epoch 42 from a previous holder is not current
+        // against a new one that happens to have reached 42 by a different route, and
+        // answering "unchanged" there would leave it mirroring a directory it never saw.
+        var id_buf: [32]u8 = undefined;
+        const mine = formatNodeId(&id_buf, node_id);
+        const epoch = directory_epoch.load(.monotonic);
+
+        const their_id = it.next();
+        const their_epoch = it.next();
+        const current = their_id != null and their_epoch != null and
+            std.mem.eql(u8, their_id.?, mine) and
+            (std.fmt.parseInt(u64, their_epoch.?, 10) catch (epoch +% 1)) == epoch;
+
+        if (current) {
+            try buffer.print(allocator, "mirror-unchanged {s} {d}\n", .{ mine, epoch });
+        } else {
+            try buffer.print(allocator, "mirror-state {s} {d}\n", .{ mine, epoch });
+            try federation.writeFedEntries(&buffer);
+        }
     } else if (eqlAny(verb, &.{ "status", "stat" })) {
         try writeStatus(&buffer);
     } else if (eqlAny(verb, &.{"ping"})) {
@@ -1074,6 +1123,7 @@ fn writeHelp(buffer: *std.ArrayList(u8)) !void {
         \\#   subs <topic>         who is subscribed to a topic: address, connected, messages
         \\#   sub <topic>          resolve a topic to its publisher URI
         \\#   pub <topic> <uri>    register or refresh a topic's publisher endpoint
+        \\#   mirror [id epoch]    the directory, or 'unchanged' if you are current
         \\#   unpub <topic>        drop a registration
         \\#   peers                other REGISTRIES federated with this one, not subscribers
         \\#   status               registry uptime, topic count, timings
@@ -1329,6 +1379,10 @@ fn writeStatus(buffer: *std.ArrayList(u8)) !void {
     try buffer.print(allocator, "advertise {s}\n", .{advertiseText()});
     try buffer.print(allocator, "port {d}\n", .{registry_port});
     try buffer.print(allocator, "probe-interval {d}ms\n", .{registry_probe_interval_ms});
+    try buffer.print(allocator, "bind-retry {d}ms\n", .{registry_bind_retry_ms});
+    try buffer.print(allocator, "registry-role {s}\n", .{@tagName(registry_role)});
+    try buffer.print(allocator, "registry-mirror {s}\n", .{if (registry_mirror) "on" else "off"});
+    try buffer.print(allocator, "directory-epoch {d}\n", .{directory_epoch.load(.monotonic)});
     try buffer.print(allocator, "stale-after {d}ms\n", .{stale_after_us / 1000});
     if (federation.enabled()) {
         try buffer.print(allocator, "federation port {d}\n", .{federation.currentPort()});
@@ -1347,7 +1401,7 @@ fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId) !vo
     // mutex would have it block on the very lock it needs to serialise what it was woken
     // for.
     var changed = false;
-    defer if (changed) federation.notifyChange();
+    defer if (changed) markDirectoryChanged();
 
     directory_mutex.lockUncancelable(io);
     defer directory_mutex.unlock(io);
@@ -1408,7 +1462,7 @@ fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId) !vo
 
 fn unregisterTopic(topic: []const u8) bool {
     var removed = false;
-    defer if (removed) federation.notifyChange();
+    defer if (removed) markDirectoryChanged();
 
     directory_mutex.lockUncancelable(io);
     defer directory_mutex.unlock(io);
@@ -1699,6 +1753,40 @@ pub var node_running = false;
 /// Distinct ports give fully independent registries in one machine, which is what makes it
 /// possible to run tests and examples side by side instead of having them fight over one
 /// well-known port.
+/// Whether this node will ever hold the registry.
+///
+/// `client` is for a node that must not be elected -- a sensor board, a container with a
+/// tight memory budget, anything where holding the directory for the whole host is not a
+/// job it should be given. It still publishes and subscribes normally; it simply never
+/// contends for the port, and never mirrors, because a warm copy exists only to make a
+/// takeover fast and a client will never take over.
+pub const RegistryRole = enum { candidate, client };
+
+var registry_role: RegistryRole = .candidate;
+
+/// Whether a candidate keeps a warm copy of the directory. Separable from the role because
+/// the two costs are different: being a candidate is free until the holder dies, while
+/// mirroring is a round trip every probe interval and a copy of the directory in memory.
+/// Turning it off leaves a node able to take over, but cold -- which is what it was before
+/// mirroring existed.
+var registry_mirror: bool = true;
+
+pub fn setRegistryRoleFn(role: RegistryRole) bool {
+    if (node_running) return false;
+    registry_role = role;
+    return true;
+}
+
+pub fn setRegistryMirrorFn(on: bool) bool {
+    if (node_running) return false;
+    registry_mirror = on;
+    return true;
+}
+
+pub fn registryRoleFn() RegistryRole {
+    return registry_role;
+}
+
 pub fn setRegistryPortFn(port: u16) bool {
     if (node_running) return false;
     registry_port = port;
@@ -1710,9 +1798,27 @@ pub fn currentRegistryPort() u16 {
     return registry_port;
 }
 
-// How often standby nodes re-check the port, publishers refresh their registration,
-// and subscribers re-poll for a topic URI.
+// How often publishers refresh their registration and subscribers re-poll for a topic
+// URI. Also the unit `stale_after_us` is expressed in, so changing it changes when an
+// entry is considered stale.
 pub const registry_probe_interval_ms = 2000;
+
+// How often a standby re-contends for the registry port. Deliberately NOT
+// `registry_probe_interval_ms`, though it was until measurement separated them.
+//
+// The two answer different questions and cost different amounts. A refresh is a round trip
+// to the registry, so doing it eight times a second across every publisher on a host would
+// be real traffic. Re-contending is a socket, a bind that fails with EADDRINUSE, and a
+// close -- three syscalls against a port nobody is listening on, costing nothing on the
+// wire.
+//
+// They were one constant, and that made the standby wait up to two seconds to notice a
+// dead holder. Recovery from the holder's death has two phases: taking the role, then the
+// directory refilling as publishers re-register. Measured over eight runs
+// (examples/registry/failover.py), taking the role was 2.0-4.0s and the refill only
+// 0-2.2s -- so the larger half of the outage was a standby sleeping, which is the half
+// that costs nothing to fix.
+pub const registry_bind_retry_ms = 250;
 
 // Open the registry listener with SO_REUSEADDR but NOT SO_REUSEPORT; see the note on
 // `registry_port` for why std's one-flag-for-both is unusable here. Everything after
@@ -1764,12 +1870,111 @@ pub fn listenExclusiveOn(addr: net.IpAddress) !net.Server {
 
 const registry_backlog = 128;
 
+// The standby's copy of the directory is pulled into this. File scope rather than a local
+// because it is large and only the registry thread ever touches it -- a 64 KiB frame on a
+// worker's stack is not worth the risk for a buffer with exactly one user.
+//
+// It bounds how big a directory a standby can mirror: `registryCommand` stops copying when
+// the next line would not fit, so beyond roughly 600 entries a standby's copy is a prefix
+// rather than the whole thing. That degrades the warm copy, it does not corrupt it -- the
+// missing topics simply re-register within a probe interval, which is the behaviour a
+// standby had for everything before it mirrored anything.
+var mirror_buf: [64 * 1024]u8 = undefined;
+
+/// What a standby remembers between pulls, so it can ask "anything new?" instead of
+/// "send me everything".
+const MirrorState = struct {
+    holder: [32]u8 = @splat(0),
+    holder_len: usize = 0,
+    epoch: u64 = 0,
+    /// When the whole directory was last taken. See `pullMirror` for why this matters even
+    /// when nothing has changed.
+    last_full_us: i64 = 0,
+
+    fn holderText(m: *const MirrorState) []const u8 {
+        return m.holder[0..m.holder_len];
+    }
+};
+
+/// Pull the directory from whoever currently holds the registry and merge it.
+///
+/// This is what makes a takeover warm. Without it a new holder starts empty and every
+/// topic is unresolvable until its publisher's next refresh -- measured at about two
+/// seconds, and the dominant term in the outage once the bind retry was shortened.
+///
+/// Pulled rather than pushed, deliberately. A standby already wakes to re-contend for the
+/// port, so it can fetch in the same cycle: no registration with the holder, no fan-out, no
+/// tracking of which standbys are alive, and no failure mode where a slow standby stalls
+/// the holder's publish path. A missed pull corrects itself on the next one. The cost is
+/// that the copy is up to one pull interval stale, which is hidden by the fact that a
+/// standby's copy only ever matters at the moment it takes the role.
+fn pullMirror(state: *MirrorState) void {
+    const now_us = nowMicrosFn();
+
+    // A full pull every so often even when nothing has changed, because merging is what
+    // refreshes a mirrored entry's lease. `entryIsServable` stops serving an entry this
+    // node has not heard about for `fed_serve_until_us`, so a standby that only ever heard
+    // "unchanged" would watch its warm copy quietly go cold and then, on takeover, refuse
+    // to serve topics that were alive the whole time. Half the lease is the interval.
+    const lease_refresh_us: i64 = @intCast(federation.serve_until_us / 2);
+    const force_full = state.holder_len == 0 or
+        (now_us -| state.last_full_us) >= lease_refresh_us;
+
+    var cmd_buf: [96]u8 = undefined;
+    const command = if (force_full)
+        "mirror"
+    else
+        std.fmt.bufPrint(&cmd_buf, "mirror {s} {d}", .{ state.holderText(), state.epoch }) catch
+            "mirror";
+
+    const text = registryCommand(command, &mirror_buf) catch return;
+
+    // "You are current": nothing to merge, and nothing to pay for it beyond the round trip.
+    if (std.mem.indexOf(u8, text, "mirror-unchanged") != null) return;
+
+    // Otherwise the reply opens with the holder's identity and epoch, and the rest is the
+    // directory. Record them so the next poll can be the cheap one.
+    if (std.mem.indexOf(u8, text, "mirror-state ")) |at| {
+        var it = std.mem.tokenizeAny(u8, text[at..], " \t\r\n");
+        _ = it.next(); // mirror-state
+        if (it.next()) |id_text| {
+            if (id_text.len <= state.holder.len) {
+                @memcpy(state.holder[0..id_text.len], id_text);
+                state.holder_len = id_text.len;
+            }
+        }
+        if (it.next()) |epoch_text| {
+            state.epoch = std.fmt.parseInt(u64, epoch_text, 10) catch state.epoch;
+        }
+    }
+    state.last_full_us = now_us;
+
+    // Loopback is the address a local publisher that named none is reachable at, which is
+    // exactly what an empty host field in a `fed-entry` line asks the receiver to decide.
+    _ = federation.applyMirrorEntries(text, "127.0.0.1");
+}
+
 fn registryRun() void {
     // Whether the "standing by" notice has been printed for the current contention.
     // Printing every probe would be noise; printing nothing at all is worse — a node
     // silently failing to bind is indistinguishable from one that simply is not the
     // registry, which hid an AddressInUse loop for a long time.
+    // A node that will never be elected has nothing to do here. It still publishes and
+    // subscribes; it simply never contends, and never mirrors, because a warm copy is only
+    // ever read at a takeover this node has opted out of.
+    if (registry_role == .client) {
+        std.debug.print(
+            "registry role declined: this node is a client, it will not be elected\n",
+            .{},
+        );
+        return;
+    }
+
     var announced_standby = false;
+    // Last time this node pulled the holder's directory. Zero so the first standby cycle
+    // mirrors immediately rather than waiting out an interval.
+    var last_mirror_us: i64 = 0;
+    var mirror_state: MirrorState = .{};
 
     while (!isShuttingDown()) {
         const addr: net.IpAddress = net.IpAddress.parse("127.0.0.1", registry_port) catch |err| {
@@ -1783,7 +1988,21 @@ fn registryRun() void {
                 std.debug.print("registry standing by (port {d}: {})\n", .{ registry_port, err });
                 announced_standby = true;
             }
-            if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
+
+            // Keep a warm copy, but not on every bind retry: re-contending is three
+            // syscalls against a port nobody answers, while this is a round trip to the
+            // holder. Binding stays fast so a dead holder is noticed quickly; mirroring
+            // runs at the slower refresh cadence, which is all the freshness a copy needs
+            // when it is only read at the moment of takeover.
+            const now_us = nowMicrosFn();
+            if (registry_mirror and
+                now_us -| last_mirror_us >= registry_probe_interval_ms * 1000)
+            {
+                last_mirror_us = now_us;
+                pullMirror(&mirror_state);
+            }
+
+            if (!sleepMsInterruptible(registry_bind_retry_ms)) return;
             continue;
         };
         defer server.deinit(io); // released before we re-contend for the role
@@ -2752,4 +2971,62 @@ test {
     // file, so testing it as a root would recompile and re-run the whole suite in a second
     // binary -- and both copies would race for the same test registry port.
     _ = @import("./federation.zig");
+}
+
+test "the directory epoch counts material changes and ignores refresh heartbeats" {
+    // This is the premise the whole conditional mirror rests on. If a refresh bumped the
+    // epoch, a standby's "am I current?" would be answered "no" every probe interval per
+    // publisher, every full directory would be re-sent, and the cheap path would never
+    // fire once. It is also why the epoch is not a digest over the entries: `version` is
+    // set to `now_us` on every refresh, so anything derived from entry contents changes
+    // constantly while nothing has actually happened.
+    const testing = std.testing;
+
+    try testing.expect(setRegistryPortFn(22308));
+    try testing.expect(nodeRun());
+    defer nodeDeinit();
+
+    const first = try net.IpAddress.parse("127.0.0.1", 9401);
+    const moved = try net.IpAddress.parse("127.0.0.1", 9402);
+
+    const before = directory_epoch.load(.monotonic);
+
+    // A topic appearing is a change.
+    try registerTopic("epoch/one", first, node_id);
+    const after_insert = directory_epoch.load(.monotonic);
+    try testing.expect(after_insert > before);
+
+    // Refreshing it is not. This is the heartbeat every publisher sends every couple of
+    // seconds, and it must be free.
+    try registerTopic("epoch/one", first, node_id);
+    try registerTopic("epoch/one", first, node_id);
+    try testing.expectEqual(after_insert, directory_epoch.load(.monotonic));
+
+    // The endpoint moving is a change: a standby holding the old address would hand
+    // subscribers somewhere nothing is listening.
+    try registerTopic("epoch/one", moved, node_id);
+    const after_move = directory_epoch.load(.monotonic);
+    try testing.expect(after_move > after_insert);
+
+    // And so is going away.
+    try testing.expect(unregisterTopic("epoch/one"));
+    try testing.expect(directory_epoch.load(.monotonic) > after_move);
+}
+
+test "a client node declines the registry role" {
+    // The opt-out for a resource-constrained host: it publishes and subscribes normally
+    // but is never elected, so it never holds the whole host's directory.
+    const testing = std.testing;
+
+    try testing.expect(setRegistryRoleFn(.client));
+    defer _ = setRegistryRoleFn(.candidate);
+    try testing.expectEqual(RegistryRole.client, registryRoleFn());
+
+    // Refused once a node is running, like every other pre-start knob: changing it under a
+    // live node would leave the registry thread's decision and the reported role disagreeing.
+    try testing.expect(setRegistryPortFn(22309));
+    try testing.expect(nodeRun());
+    defer nodeDeinit();
+    try testing.expect(!setRegistryRoleFn(.candidate));
+    try testing.expect(!setRegistryMirrorFn(false));
 }
