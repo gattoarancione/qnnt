@@ -254,3 +254,52 @@ descriptor that is never closed, or an entry that ages out wrongly over hours wo
 show. And every container is on one bridge with the same MTU and no middlebox, so nothing
 here says anything about a real WAN path, a NAT that rewrites addresses, or a firewall
 that drops idle connections.
+
+# A CAN gateway mesh
+
+```sh
+zig build can -Dtarget=aarch64-linux-gnu    # Apple silicon
+zig build can -Dtarget=x86_64-linux-gnu     # Intel, or --platform linux/amd64
+docker/can.sh
+```
+
+Four hosts, each with its own `vcan0` and `vcan1`, bridged so that a frame put on one
+appears on all the others. Two logical buses ride the same mesh and never mix, and one host
+bridges only the first — it is federated with hosts carrying the second and must never see
+any of it. Full documentation in EXAMPLES.txt section 21.
+
+Each container has its own network namespace, so each has its own interfaces. That is the
+point of running it here: on one machine with one set of interfaces every gateway would
+already be sharing a bus, and a broken gateway would look like a working one.
+
+```
+docker/can.sh            # the gateways
+docker/can.sh wire       # the qnnt half only — no kernel CAN needed
+docker/can.sh shell alpha
+```
+
+## This needs a kernel with CAN, and Docker Desktop does not have one
+
+`vcan` needs `CONFIG_CAN` and `CONFIG_CAN_VCAN`. Every mainstream distribution kernel has
+them as modules. **Docker Desktop's LinuxKit kernel has neither** — not as a module, not
+built in — so no amount of `--privileged` will create a vcan interface on a Mac or a Windows
+box. One line to check:
+
+```sh
+docker run --rm --privileged --entrypoint bash debian:bookworm-slim \
+  -c 'ip link add dev p type vcan && echo yes || echo no'
+```
+
+`docker/can.sh` asks this first and says so plainly rather than failing obscurely, then runs
+`wire` instead — which exercises the topics, the glob subscriptions, the federated directory
+and the frame format, everything except the socket. Run the full harness on a Linux host, or
+in a VM with a stock distribution kernel.
+
+## What it found
+
+Federation merged a peer's directory entries without moving `directory_epoch`. A
+`subscribePattern` re-lists only when that number moves, so every topic reached through
+federation was invisible to every glob subscription on the receiving host: the gateways each
+saw only their own traffic. Nothing before this had subscribed to a *pattern* across a
+federation boundary — a named subscription resolves its topic directly and never consults
+the epoch — so the bug had nowhere to show.

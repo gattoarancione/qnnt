@@ -1,0 +1,73 @@
+# The gateway's qnnt half, without the kernel half.
+#
+# Same hosts, same topics, same glob subscriptions and the same federation as
+# docker/compose.can.yml -- but the frames are produced by examples/can/wire_check.py
+# instead of read from a vcan interface. That makes it runnable on any kernel, including
+# the ones with no CAN subsystem at all, and it isolates the two halves when something
+# breaks: if this passes and the real one does not, the fault is in SocketCAN or in the
+# interfaces, not in the mesh.
+#
+# It is NOT a substitute for docker/compose.can.yml. Nothing here touches a CAN socket.
+
+x-node: &node
+  image: qnnt-fed
+  networks: [canwire]
+  entrypoint: ["python3", "/qnnt/examples/can/wire_check.py"]
+  environment: &node-env
+    QNNT_CLUSTER_KEY: ${QNNT_CLUSTER_KEY:-can-demo}
+    QNNT_LIBRARY: /qnnt/lib/libqnnt_c.so
+
+services:
+  alpha:
+    <<: *node
+    hostname: alpha
+    environment:
+      <<: *node-env
+      QNNT_PEERS: bravo,charlie,delta
+    command: ["alpha", "--bus", "powertrain", "--bus", "body", "--tag", "0xA1",
+              "--seconds", "${WIRE_SECONDS:-10}"]
+
+  bravo:
+    <<: *node
+    hostname: bravo
+    environment:
+      <<: *node-env
+      QNNT_PEERS: alpha,charlie,delta
+    command: ["bravo", "--bus", "powertrain", "--bus", "body", "--tag", "0xB2",
+              "--seconds", "${WIRE_SECONDS:-10}"]
+
+  charlie:
+    <<: *node
+    hostname: charlie
+    environment:
+      <<: *node-env
+      QNNT_PEERS: alpha,bravo,delta
+    command: ["charlie", "--bus", "powertrain", "--tag", "0xC3",
+              "--seconds", "${WIRE_SECONDS:-10}"]
+
+  # powertrain only: it must never see a body frame, though it is federated with two hosts
+  # that carry them. The separation is the topic, not the network.
+  delta:
+    <<: *node
+    hostname: delta
+    environment:
+      <<: *node-env
+      QNNT_PEERS: alpha,bravo,charlie
+    command: ["delta", "--bus", "powertrain", "--tag", "0xD4",
+              "--seconds", "${WIRE_SECONDS:-10}"]
+
+  # The control: a different cluster key, so it federates with nobody however hard it
+  # dials. It must see its own frames and no one else's.
+  zulu:
+    <<: *node
+    hostname: zulu
+    environment:
+      <<: *node-env
+      QNNT_CLUSTER_KEY: outsider
+      QNNT_PEERS: alpha,bravo,charlie,delta
+    command: ["zulu", "--bus", "powertrain", "--tag", "0x2E",
+              "--seconds", "${WIRE_SECONDS:-10}"]
+
+networks:
+  canwire:
+    driver: bridge

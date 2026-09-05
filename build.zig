@@ -675,6 +675,46 @@ pub fn build(b: *Build) void {
         mesh_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
     }
 
+    // ---------------------------------------------------------------- the CAN gateway
+    //
+    // examples/can/ bridges a local SocketCAN interface onto a qnnt mesh: several hosts,
+    // several independent buses, no gateway configured with the names of the others.
+    //
+    // LINUX ONLY, and the step says so on anything else rather than failing to compile a
+    // file full of AF_CAN. CAN is a kernel subsystem; there is nothing to port. Everything
+    // that is not the kernel lives in examples/can/frame.zig, whose tests run everywhere --
+    // which is the only reason this example has any coverage on a mac at all.
+    const can_step = b.step("can", "Build the CAN gateway (examples/can/, Linux only)");
+    if (target.result.os.tag == .linux) {
+        const can_mod = b.createModule(.{
+            .root_source_file = b.path("examples/can/gateway.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        });
+        can_mod.addImport("qnnt", qnnt_lib_mod);
+        can_mod.addAnonymousImport("frame", .{
+            .root_source_file = b.path("examples/can/frame.zig"),
+            .imports = &.{.{ .name = "qnnt", .module = qnnt_lib_mod }},
+        });
+        can_mod.addAnonymousImport("socketcan", .{
+            .root_source_file = b.path("examples/can/socketcan.zig"),
+            .imports = &.{.{ .name = "qnnt", .module = qnnt_lib_mod }},
+        });
+
+        const can_gw = b.addExecutable(.{ .name = "qnnt-can-gw", .root_module = can_mod });
+        can_gw.root_module.linkLibrary(qnnt_lib);
+        b.installArtifact(can_gw);
+        can_step.dependOn(&b.addInstallArtifact(can_gw, .{}).step);
+    } else {
+        const explain = b.addSystemCommand(&.{
+            "echo",
+            "the CAN gateway is Linux only (SocketCAN is a kernel subsystem). " ++
+                "Cross-compile it with: zig build can -Dtarget=aarch64-linux-gnu",
+        });
+        can_step.dependOn(&explain.step);
+    }
+
     const test_step = b.step("test", "Run unit tests");
 
     // These used to need serialising, because every node contended for one well-known
@@ -699,6 +739,7 @@ pub fn build(b: *Build) void {
         "examples/dirigera/ws.zig",
         "examples/ugv/sio.zig",
         "examples/ugv/beast.zig",
+        "examples/can/frame.zig",
     }) |src| {
         // Skipped without -Ddirigera-openssl, since it cannot link. See below.
         if (std.mem.eql(u8, src, "examples/dirigera/https.zig") and openssl_path == null)
@@ -719,6 +760,12 @@ pub fn build(b: *Build) void {
             test_mod.linkLibrary(qnnt_lib);
             test_mod.addImport("qnnt", qnnt_lib_mod);
             test_mod.addImport("stdout", stdout_mod);
+        }
+        // The CAN wire format is defined in terms of TLD and matched with the library's
+        // own matcher, so its tests reach the library the way the gateway does.
+        if (std.mem.startsWith(u8, src, "examples/can/")) {
+            test_mod.linkLibrary(qnnt_lib);
+            test_mod.addImport("qnnt", qnnt_lib_mod);
         }
         // The camera driver is written against the shared vocabulary the same way a
         // consumer would be, so its tests need that module.

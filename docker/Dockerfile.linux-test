@@ -13,8 +13,12 @@ FROM debian:bookworm-slim
 # docker/compose.federation.yml -- the smoke-test container does not get it and does not
 # need it.
 
+# can-utils carries candump and cansend, for looking at a bus by hand. The automated
+# checks do not need it -- examples/can/traffic.py speaks SocketCAN through Python's
+# stdlib -- but a CAN example you cannot candump is an unpleasant one to debug.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends netcat-openbsd python3 file procps iproute2 \
+ && apt-get install -y --no-install-recommends \
+      netcat-openbsd python3 file procps iproute2 can-utils \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /qnnt
@@ -24,6 +28,9 @@ COPY python/ /qnnt/python/
 # The federation harness scripts, so a container can BE a site rather than only run the
 # smoke tests. See docker/compose.federation.yml.
 COPY examples/federation/ /qnnt/examples/federation/
+# The CAN gateway harness: an entrypoint that creates the vcan interfaces and a traffic
+# generator that speaks SocketCAN through Python's stdlib. See docker/compose.can.yml.
+COPY examples/can/ /qnnt/examples/can/
 COPY docker/run-tests.sh /qnnt/run-tests.sh
 
 ENV QNNT_LIBRARY=/qnnt/lib/libqnnt_c.so

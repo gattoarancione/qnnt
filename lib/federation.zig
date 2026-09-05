@@ -195,7 +195,22 @@ fn parseNodeId(text: []const u8, out: *NodeId) bool {
 // Returns true if the directory changed, which is what phase 4's push-on-change will key
 // off. `observed_host` is the address we reached the sender on, used when the entry
 // declines to name one.
+/// Merge one entry a peer told us about. True when the directory actually changed.
+///
+/// The epoch bump is here rather than at the three call sites because forgetting it at one
+/// of them is invisible: the entry is in the directory, `qnnt-ls` shows it, and only the
+/// things that poll for CHANGE -- a pattern subscription, a standby's mirror -- quietly
+/// never see it.
 fn applyRemoteEntry(entry: RemoteEntry, observed_host: []const u8) !bool {
+    const changed = try applyRemoteEntryLocked(entry, observed_host);
+    // Outside the lock. It only bumps a counter today, but the directory mutex is the one
+    // lock everything here contends for and nothing that can be done outside it should be
+    // done inside it.
+    if (changed) qnnt.bumpDirectoryEpoch();
+    return changed;
+}
+
+fn applyRemoteEntryLocked(entry: RemoteEntry, observed_host: []const u8) !bool {
     // Never take our own entries back from a peer: we are authoritative for them, and
     // accepting them would let a stale copy overwrite the live one.
     if (std.mem.eql(u8, &entry.origin, &qnnt.node_id)) return false;
@@ -1360,4 +1375,49 @@ test "what writeFedEntries emits is what parseFedEntry reads back" {
         found = true;
     }
     try testing.expect(found);
+}
+
+test "learning an entry from a peer moves the directory version" {
+    // The bug this exists for: applying a remote entry changed the directory but left the
+    // epoch alone, so everything that polls for CHANGE rather than for content never saw
+    // it. A `subscribePattern` re-lists only when the epoch moves, which made every topic
+    // reached through federation invisible to every glob subscription on the receiving
+    // host -- the gateways in examples/can/ each saw only their own traffic.
+    var origin: qnnt.NodeId = @splat(0);
+    origin[0] = 0x51;
+
+    const before = qnnt.directory_epoch.load(.monotonic);
+    try testing.expect(try applyRemoteEntry(.{
+        .origin = origin,
+        .version = 1,
+        .topic = "merge/epoch/topic",
+        .host = "10.0.0.11",
+        .port = 7100,
+        .subs = 0,
+    }, "10.0.0.11"));
+    const after_insert = qnnt.directory_epoch.load(.monotonic);
+    try testing.expect(after_insert > before);
+
+    // An entry that changes nothing must not move it either, or a standby would re-pull the
+    // whole directory on every anti-entropy round and the epoch would be worthless.
+    try testing.expect(!try applyRemoteEntry(.{
+        .origin = origin,
+        .version = 1,
+        .topic = "merge/epoch/topic",
+        .host = "10.0.0.11",
+        .port = 7100,
+        .subs = 0,
+    }, "10.0.0.11"));
+    try testing.expectEqual(after_insert, qnnt.directory_epoch.load(.monotonic));
+
+    // A newer version of the same entry is a real change and moves it again.
+    try testing.expect(try applyRemoteEntry(.{
+        .origin = origin,
+        .version = 2,
+        .topic = "merge/epoch/topic",
+        .host = "10.0.0.12",
+        .port = 7100,
+        .subs = 0,
+    }, "10.0.0.12"));
+    try testing.expect(qnnt.directory_epoch.load(.monotonic) > after_insert);
 }

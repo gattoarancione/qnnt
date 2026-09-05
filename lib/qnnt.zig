@@ -127,8 +127,22 @@ pub var directory_mutex: Io.Mutex = .init;
 /// federation. Both were previously the same call, and they still fire together -- the
 /// epoch exists so a standby can ask cheaply whether it missed one.
 fn markDirectoryChanged() void {
-    _ = directory_epoch.fetchAdd(1, .monotonic);
+    bumpDirectoryEpoch();
     federation.notifyChange();
+}
+
+/// The directory changed, but not because anything here did it -- federation learned an
+/// entry from a peer. Bumps the version WITHOUT waking the peer connectors.
+///
+/// Both halves matter. The bump matters because everything that watches for change watches
+/// the epoch: a `subscribePattern` re-lists only when it moves, and a standby re-pulls the
+/// mirror only when it moves, so a remote topic that arrived without one is a topic no
+/// pattern subscription on this host will ever join. The absence of the notify matters
+/// because whether a learned entry should be relayed onward is federation's decision, taken
+/// at the call site that knows which peer it came from; waking every connector for every
+/// entry received is how a mesh amplifies its own gossip.
+pub fn bumpDirectoryEpoch() void {
+    _ = directory_epoch.fetchAdd(1, .monotonic);
 }
 
 // When the current registry role was acquired, for `status`. Written by the registry

@@ -1916,3 +1916,112 @@ WHAT IT STILL DOES NOT COVER. Sustained behaviour -- these runs last minutes, so
 slow leak or an entry ageing out wrongly over hours would not show. And one bridge
 with one MTU and no middlebox says nothing about a real WAN path, a NAT that
 rewrites addresses, or a firewall that drops idle connections.
+
+
+--------------------------------------------------------------------------------
+ 21. A CAN gateway mesh: examples/can/
+--------------------------------------------------------------------------------
+
+Several hosts, each with a local CAN interface, joined so that a frame put on one appears
+on all the others -- and several such buses at once over the same mesh, never mixing.
+
+    zig build can -Dtarget=aarch64-linux-gnu     # Linux only; see below
+    docker/can.sh
+
+    qnnt-can-gw --name alpha --bus powertrain=vcan0 --bus body=vcan1
+
+Each gateway publishes what it reads from a local interface, and subscribes to the shape of
+what every other gateway publishes:
+
+    can/<bus>/<gateway>     frames <gateway> read from its local <bus>
+    can/<bus>/*             what each gateway subscribes to
+
+That second line is the whole example. A gateway is never told the names of its peers, is
+never given a list to keep in step, and needs no restart when one appears: it subscribes to
+a shape, and a gateway that joins later is found because its topic turns up in the
+directory. Adding a fifth host is editing one host's QNNT_PEERS, not editing five gateways.
+Section 13 is the call; this is what it is for.
+
+THE BUS NAME IS LOGICAL, NOT AN INTERFACE NAME. The segment this host reaches on vcan0 may
+be vcan1 on the next, and `--bus powertrain=vcan0` says which is which. Naming the wire
+after one host's cabling is how two unrelated segments end up spliced together.
+
+TWO BUSES ARE TWO NETWORKS. `--bus powertrain=vcan0 --bus body=vcan1` bridges both over one
+mesh and one federation link, and nothing crosses between them, because a topic names its
+bus. In docker/compose.can.yml one host deliberately bridges powertrain only: it is
+federated with hosts carrying body traffic and must never see any of it. The separation is
+the topic, not the network.
+
+LOOPS ARE PREVENTED TWICE, and both are needed:
+
+  * The handler skips its own topic. `can/<bus>/*` matches `can/<bus>/alpha`, because
+    matching means matching -- the library does not special-case a subscriber's own topics,
+    and the handler is given the topic name precisely so it can decide. Without this check
+    a frame would be written straight back to the bus it came from, duplicating every local
+    message.
+  * SocketCAN does not loop a transmitted frame back to the socket that sent it. One socket
+    per bus does both the reading and the writing, so a frame this gateway injects is never
+    read by its own reader and never republished. Without this, a frame from alpha would be
+    injected at bravo, read back by bravo, republished as bravo's, injected at alpha, and
+    the mesh would saturate in under a second. The gateway sets CAN_RAW_RECV_OWN_MSGS to 0
+    explicitly rather than relying on the default, because the whole design rests on it.
+
+The consequence of the second rule is a constraint worth stating: ONE GATEWAY PER INTERFACE
+PER HOST. Two gateways on one vcan would each read the other's injections.
+
+What travels is not `struct can_frame`. That struct is a Linux ABI -- an identifier and
+three flags sharing one word at bit positions the kernel chose -- and putting it on the
+network would oblige every other consumer to know those positions. So the flags are named
+fields and the identifier is already masked; see examples/can/frame.zig. Error frames are
+published, so a monitor sees bus health, but never written to another segment: an error
+frame describes a condition on the segment that produced it, and injecting it elsewhere
+reports a fault on a bus that is healthy.
+
+Watching it needs no special tool. The frames are TLD on ordinary topics:
+
+    qnnt-ls --tree
+    qnnt-cat 'can/powertrain/*'          # every host's view of one bus
+    qnnt-cat 'can/*/*'                   # every bus, every host
+    candump vcan0                        # and the ordinary CAN tool, locally
+
+A KERNEL WITH CAN IS REQUIRED, and this is the part that trips people up. CAN is a kernel
+subsystem: `vcan` needs CONFIG_CAN and CONFIG_CAN_VCAN. Any mainstream distribution kernel
+has them as modules. DOCKER DESKTOP'S LINUXKIT KERNEL HAS NEITHER -- not as a module and
+not built in -- so no amount of --privileged will create a vcan interface on a Mac or a
+Windows box running Docker Desktop. Check in one line:
+
+    docker run --rm --privileged --entrypoint bash debian:bookworm-slim \
+      -c 'ip link add dev p type vcan && echo yes || echo no'
+
+docker/can.sh detects this and says so rather than failing obscurely, then runs the half
+that does not need a kernel:
+
+    docker/can.sh            # the gateways, or the reason they cannot run here
+    docker/can.sh wire       # the qnnt half only: topics, globs, federation
+    docker/can.sh shell alpha
+
+`wire` runs examples/can/wire_check.py in place of the gateways. It speaks exactly the same
+topics and publishes exactly the same TLD frames, so it exercises the topic layout, the glob
+subscription, the federated directory and the frame format -- everything except the socket.
+It is also a cross-language check on that format: the frames are packed by Python against
+the field names in frame.zig, so a rename on either side shows up as a gateway that receives
+and silently discards. When the real harness fails and this one passes, the fault is in
+SocketCAN or in the interfaces, not in the mesh.
+
+WHAT THIS FOUND. Federation merged a peer's entries into the directory without moving
+`directory_epoch`. Everything that polls for CHANGE rather than for content watches that
+number -- a `subscribePattern` re-lists only when it moves, and a warm standby re-pulls its
+mirror only when it moves -- so a topic reached through federation was a topic no glob
+subscription on the receiving host would ever join. The gateways each saw only their own
+traffic. It was invisible until now because nothing before this subscribed to a PATTERN
+across a federation boundary: a named subscription resolves the topic directly and never
+consults the epoch at all.
+
+WHAT IS NOT COVERED. The SocketCAN calls themselves -- open, bind, read, write -- have no
+automated coverage, because this repository is developed on a mac and Docker Desktop cannot
+provide a CAN interface. The struct layouts they depend on ARE checked: examples/can/
+socketcan.zig asserts every size and offset at compile time, and those numbers were taken
+from <linux/can.h> on both aarch64 and x86_64. Everything above the socket is covered by
+`zig build test` and by `docker/can.sh wire`. Classic CAN only: CAN FD carries up to 64
+bytes and needs CAN_RAW_FD_FRAMES, which this gateway does not set, and it says so rather
+than truncating.

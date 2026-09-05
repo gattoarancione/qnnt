@@ -1,0 +1,86 @@
+# A CAN gateway mesh: four hosts, two independent buses.
+#
+# Each container is a host with its own network namespace, so each has its OWN vcan0 and
+# vcan1. That is the whole point of running it here: frames put on alpha's vcan0 reach
+# bravo's vcan0 only if the gateways actually carried them across the qnnt mesh. On one
+# machine with one set of interfaces, every gateway would be sharing a bus already and a
+# broken gateway would look like a working one.
+#
+#   powertrain   alpha, bravo, charlie, delta   -- all four
+#   body         alpha, bravo                   -- only two
+#
+# The second bus is not decoration. It is what shows that two CAN networks ride the same
+# mesh without touching: delta bridges powertrain only, and must never see a body frame,
+# even though it is federated with hosts that carry both.
+#
+# Prerequisites:
+#   * Linux binaries: zig build can -Dtarget=aarch64-linux-gnu   (or x86_64-linux-gnu)
+#   * a kernel with vcan. Docker Desktop's LinuxKit kernel has NONE -- see docker/README.md.
+
+x-gw: &gw
+  image: qnnt-fed
+  networks: [can]
+  entrypoint: ["/bin/bash", "/qnnt/examples/can/start-gateway.sh"]
+  # For `ip link add type vcan`. Each container creates its own interfaces in its own
+  # namespace; nothing here touches the host's networking.
+  cap_add: [NET_ADMIN]
+  environment: &gw-env
+    QNNT_CLUSTER_KEY: ${QNNT_CLUSTER_KEY:-can-demo}
+    QNNT_LIBRARY: /qnnt/lib/libqnnt_c.so
+    STATS_MS: ${STATS_MS:-5000}
+
+services:
+  # A full mesh: every gateway dials every other. A CAN segment is a broadcast medium and a
+  # gateway mesh that mirrors it has no relay hop to add latency, and no single host whose
+  # loss splits the bus in two. A ring or a star federates just as well -- see
+  # docker/federation.sh -- but they put one host on the path between two others, which is
+  # not what a bus looks like.
+  alpha:
+    <<: *gw
+    hostname: alpha
+    environment:
+      <<: *gw-env
+      QNNT_PEERS: bravo,charlie,delta
+    command: ["alpha", "powertrain=vcan0", "body=vcan1"]
+
+  bravo:
+    <<: *gw
+    hostname: bravo
+    environment:
+      <<: *gw-env
+      QNNT_PEERS: alpha,charlie,delta
+    command: ["bravo", "powertrain=vcan0", "body=vcan1"]
+
+  charlie:
+    <<: *gw
+    hostname: charlie
+    environment:
+      <<: *gw-env
+      QNNT_PEERS: alpha,bravo,delta
+    command: ["charlie", "powertrain=vcan0"]
+
+  # Bridges powertrain only. It is federated with hosts that carry body traffic and must
+  # never see any of it: the separation is the topic, not the network.
+  delta:
+    <<: *gw
+    hostname: delta
+    environment:
+      <<: *gw-env
+      QNNT_PEERS: alpha,bravo,charlie
+    command: ["delta", "powertrain=vcan0"]
+
+  # The control. Bridges powertrain under a DIFFERENT cluster key, so it federates with
+  # nobody: it must see its own frames and no one else's. Without it, "every gateway sees
+  # every frame" would equally be the result of everything having been merged by accident.
+  zulu:
+    <<: *gw
+    hostname: zulu
+    environment:
+      <<: *gw-env
+      QNNT_CLUSTER_KEY: outsider
+      QNNT_PEERS: alpha,bravo,charlie,delta
+    command: ["zulu", "powertrain=vcan0"]
+
+networks:
+  can:
+    driver: bridge
