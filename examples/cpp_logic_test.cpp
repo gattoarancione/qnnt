@@ -12,6 +12,7 @@
 #include "../examples/ugv/steering.hpp"
 #include "../examples/dirigera/devices.hpp"
 #include "../examples/dirigera/frames.hpp"
+#include "../examples/can/frames.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -248,6 +249,124 @@ void boundary()
           "C++ packs a command to the same bytes Zig does");
 }
 
+/// The CAN station's own logic: what it does to a frame between receiving it and drawing
+/// it. None of this needs Qt, and putting it in station.cpp is what would have made it
+/// untestable.
+void canStation()
+{
+    std::printf("\nCAN station:\n");
+
+    // -- topics. The station subscribes to `can/*/*`, so it sees whatever matches, and a
+    // topic that is not a gateway's must not be drawn as one.
+    const auto a = can::parseTopic("can/powertrain/alpha");
+    check(a.valid() && a.bus == "powertrain" && a.gateway == "alpha", "a topic splits");
+    check(can::parseTopic("can/body/b-2").gateway == "b-2", "a hyphenated gateway splits");
+    check(!can::parseTopic("mesh/zig").valid(), "a foreign topic is rejected");
+    check(!can::parseTopic("can/powertrain").valid(), "a two-segment topic is rejected");
+    check(!can::parseTopic("can/powertrain/").valid(), "an empty gateway is rejected");
+    check(!can::parseTopic("can/a/b/c").valid(), "a four-segment topic is rejected");
+
+    // -- formatting. The width says which kind of identifier it is even when the numbers
+    // would otherwise look alike.
+    check(can::formatId(0x123, false) == "0x123", "a standard id is three digits");
+    check(can::formatId(0x123, true) == "0x00000123", "an extended id is eight");
+    check(can::formatId(0x1ABCDEF, true) == "0x01ABCDEF", "a large extended id formats");
+    check(can::formatData({0xA1, 0x0A, 0x00}) == "A1 0A 00", "a payload formats like candump");
+    check(can::formatData({}).empty(), "an empty payload formats to nothing");
+
+    can::Frame flagged;
+    flagged.ext = true;
+    flagged.err = true;
+    check(can::formatFlags(flagged) == "E!", "flags concatenate");
+    check(can::formatFlags(can::Frame{}).empty(), "an ordinary frame has no flags");
+
+    // -- the inject box. This one puts frames on a real bus, so what it refuses matters
+    // more than what it accepts.
+    std::vector<std::uint8_t> bytes;
+    check(can::parseHex("A1 0A 0D", bytes) && bytes == std::vector<std::uint8_t>{0xA1, 0x0A, 0x0D},
+          "spaced hex parses");
+    check(can::parseHex("a10a0d", bytes) && bytes.size() == 3, "unspaced lowercase parses");
+    check(can::parseHex("A1,0A:0D", bytes) && bytes.size() == 3, "mixed separators parse");
+    check(can::parseHex("", bytes) && bytes.empty(), "empty is a valid empty payload");
+    check(!can::parseHex("12 3", bytes), "an odd digit count is refused, not padded");
+    check(!can::parseHex("zz", bytes), "non-hex is refused");
+    check(!can::parseHex("0011223344556677 88", bytes), "more than 8 bytes is refused");
+
+    // -- the rate. The property that matters is that it can FALL: a count-since-start
+    // average would report a dead gateway's last healthy rate for ever.
+    can::Rate r;
+    for (int i = 0; i < 10; ++i) r.tick(1000 + i * 100);  // 10 frames over 900ms
+    check(r.total() == 10, "every frame is counted");
+    check(r.perSecond(1900) > 5.0, "a live rate is reported");
+    check(!r.stale(2000, 5000), "a live source is not stale");
+
+    // Nothing for ten seconds.
+    check(r.perSecond(12000) < 1.0, "the rate falls when frames stop");
+    check(r.stale(12000, 5000), "silence past the threshold reads as stale");
+    check(r.total() == 10, "and the total still says what was seen");
+
+    // -- per-identifier rows, which is what a CAN tool shows instead of a scroll.
+    std::vector<can::IdRow> rows;
+    can::Frame f;
+    f.id = 0x123;
+    check(can::rowFor(rows, f) == 0 && rows.size() == 1, "a new identifier makes a row");
+    check(can::rowFor(rows, f) == 0 && rows.size() == 1, "the same identifier reuses it");
+
+    // The same number as an EXTENDED identifier is a different frame to every controller
+    // on the bus, so merging the two would draw one conversation as two interleaved ones.
+    f.ext = true;
+    check(can::rowFor(rows, f) == 1 && rows.size() == 2,
+          "standard and extended ids with the same number stay apart");
+}
+
+/// The CAN wire format across the language boundary, pinned to bytes packed by Zig from
+/// examples/can/frame.zig's canonical frame. A field renamed on either side is not an error
+/// anywhere: it is a frame drawn on screen with identifier 0 and no payload.
+void canBoundary()
+{
+    const auto bytes = readGolden("examples/can/testdata/can_frame.tld");
+    check(!bytes.empty(), "the CAN golden frame is readable");
+    if (bytes.empty()) return;
+
+    const auto f = qnnt::tld::unpack<can::Frame>(bytes);
+    check(f.id == 0x1ABCDEF, "id crosses");
+    check(f.ext, "ext crosses as true");
+    check(!f.rtr, "rtr crosses as false");
+    check(!f.err, "err crosses as false");
+    check(f.dlc == 8, "dlc crosses");
+    check(f.us == 1700000000123456LL, "us crosses");
+    check(f.data == std::vector<std::uint8_t>({0xA1, 0x0A, 0x0D, 0x00, 0xFF, 0xDE, 0xAD, 0x5A}),
+          "the payload crosses byte for byte, 0x0A and 0x0D included");
+
+    // An empty payload is a legal CAN frame -- DLC 0, and every RTR frame -- and it has to
+    // survive a round trip through the C encoder. An empty std::vector's data() may be
+    // null, which the C writers rejected as a null pointer rather than reading as the empty
+    // buffer that (null, 0) means in C; packing one threw, and in the station that was an
+    // uncaught exception taking the window down.
+    can::Frame empty;
+    empty.id = 0x400;
+    empty.dlc = 0;
+    const auto empty_bytes = qnnt::tld::pack(empty);
+    check(!empty_bytes.empty(), "a frame with no payload packs");
+    const auto empty_back = qnnt::tld::unpack<can::Frame>(empty_bytes);
+    check(empty_back.id == 0x400 && empty_back.dlc == 0 && empty_back.data.empty(),
+          "and unpacks back to an empty payload");
+
+    // The same hole, reached through a string rather than a buffer.
+    can::Frame rtr;
+    rtr.id = 0x201;
+    rtr.rtr = true;
+    rtr.dlc = 8;   // an RTR frame requests bytes without carrying any
+    const auto rtr_back = qnnt::tld::unpack<can::Frame>(qnnt::tld::pack(rtr));
+    check(rtr_back.rtr && rtr_back.dlc == 8 && rtr_back.data.empty(),
+          "a remote request packs with a length but no data");
+
+    // And the station's own rendering of it, so the golden also pins what reaches a screen.
+    check(can::formatId(f.id, f.ext) == "0x01ABCDEF", "the golden frame renders its id");
+    check(can::formatData(f.data) == "A1 0A 0D 00 FF DE AD 5A", "and its payload");
+    check(can::formatFlags(f) == "E", "and its flags");
+}
+
 } // namespace
 
 int main()
@@ -257,6 +376,8 @@ int main()
     devices();
     motion();
     boundary();
+    canStation();
+    canBoundary();
 
     if (failures == 0) {
         std::printf("  all %d C++ logic checks passed\n", checks);

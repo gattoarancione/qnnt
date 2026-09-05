@@ -139,6 +139,62 @@ pub fn validName(name: []const u8) bool {
     return true;
 }
 
+// ---------------------------------------------------------------- the golden frame
+//
+// `frames.hpp` declares the same struct in C++, for the station in examples/can/station.cpp,
+// and the two must agree FIELD BY FIELD. Neither side errors when they do not: TLD ignores
+// a key the receiving struct does not declare, and the C++ macros leave a member the frame
+// did not carry exactly as its constructor left it. A renamed field is therefore a frame
+// that arrives with id 0 and no payload, drawn on screen as a real frame.
+//
+// So it is pinned to bytes rather than to review.
+
+/// A frame with every field set and no two values alike, so a pair of fields swapped across
+/// the language boundary cannot still compare equal.
+///
+/// `rtr` is false and `err` is false here on purpose, and `ext` is true: a bool that is
+/// false is indistinguishable from a field the other side stopped declaring, so at least
+/// one of them has to be true for the check to have teeth, and `ext` is the one whose
+/// meaning a reader is most likely to get wrong.
+pub const canonical_frame: Frame = .{
+    .id = 0x1ABCDEF,
+    .ext = true,
+    .rtr = false,
+    .err = false,
+    .dlc = 8,
+    // 0x0A and 0x0D early on: a CAN payload is arbitrary bytes, and these are the two that
+    // a text transport would have mangled.
+    .data = .{ .data = &.{ 0xA1, 0x0A, 0x0D, 0x00, 0xFF, 0xDE, 0xAD, 0x5A } },
+    .us = 1_700_000_000_123_456,
+};
+
+const golden_frame = @embedFile("testdata/can_frame.tld");
+
+test "the canonical frame still packs to the golden bytes" {
+    // To regenerate deliberately: run with QNNT_WRITE_GOLDEN set, which prints the bytes as
+    // hex for you to write out. Nothing overwrites the file on its own -- reviewing the
+    // change is the point of having it.
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try tld.packTo(testing.allocator, &buf, canonical_frame);
+
+    if (std.c.getenv("QNNT_WRITE_GOLDEN") != null) {
+        std.debug.print("can_frame.tld = {x}\n", .{buf.items});
+    }
+    try testing.expectEqualSlices(u8, golden_frame, buf.items);
+}
+
+test "the golden frame unpacks back to the canonical values" {
+    const back = try tld.unpackFrom(Frame, golden_frame, null);
+    try testing.expectEqual(canonical_frame.id, back.id);
+    try testing.expectEqual(canonical_frame.ext, back.ext);
+    try testing.expectEqual(canonical_frame.rtr, back.rtr);
+    try testing.expectEqual(canonical_frame.err, back.err);
+    try testing.expectEqual(canonical_frame.dlc, back.dlc);
+    try testing.expectEqual(canonical_frame.us, back.us);
+    try testing.expectEqualSlices(u8, canonical_frame.data.data, back.data.data);
+}
+
 // ---------------------------------------------------------------- tests
 
 const testing = std.testing;

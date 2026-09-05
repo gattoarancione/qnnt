@@ -1977,7 +1977,48 @@ published, so a monitor sees bus health, but never written to another segment: a
 frame describes a condition on the segment that produced it, and injecting it elsewhere
 reports a fault on a bus that is healthy.
 
-Watching it needs no special tool. The frames are TLD on ordinary topics:
+THE STATION: can-station
+------------------------
+
+    zig build can-station -Dqt=/Users/you/Qt/6.10.3/macos
+    ./zig-out/bin/can-station
+
+A Qt/QML view of the whole mesh, and a node on it. The fifth station in this repository and
+the first that does not know what it is looking at when it starts: lidar-viewer is pointed
+at a topic, ugv-pilot at a robot, dirigera-home at a bridge. This one subscribes to
+`can/*/*` and finds out. Which buses exist, which gateways are on them, and which
+identifiers those gateways carry are all read off the topic names, because a topic name is
+all a gateway publishes about itself.
+
+It is NOT Linux-only, unlike the gateway. It watches topics, and a topic does not care which
+kernel produced it -- so it runs on a mac against gateways on any number of Linux hosts.
+
+    left     the mesh: each bus, and under it every gateway publishing to that bus, with
+             its own rate. A gateway that has stopped shows here and nowhere else.
+    centre   the bus: one row per CAN identifier, sorted by rate, with the latest payload
+             and which gateway last carried it.
+    bottom   send: compose a frame and put it on the bus.
+
+Three of its decisions are worth knowing.
+
+  * THE SCREEN IS REPAINTED ON A TIMER, NOT ON A FRAME. A CAN bus at 500 kbit/s carries a
+    few thousand frames a second and a mesh carries the sum of all of them. Touching a QML
+    model per frame would spend the machine on layout and still show a blur. Frames update
+    counters; the model is rebuilt at 10 Hz.
+  * A ROW PER IDENTIFIER, NOT A SCROLLING LOG. A bus repeats a handful of identifiers
+    endlessly, so a scroll shows the fastest and hides the rest. Standard and extended
+    identifiers with the same number stay on separate rows, because they are different
+    frames to every controller on the bus.
+  * SENDING IS REAL. The station publishes on `can/<bus>/<its own name>` exactly as a
+    gateway does, so every gateway on that bus writes the frame to its local interface. It
+    is a participant, not an observer, which is why the payload box refuses a malformed
+    value rather than padding it: "12 3" is a typo, and guessing whether it meant 0x03 or
+    0x30 puts a frame nobody wrote onto real hardware.
+
+Its own topic matches its own pattern, so the station appears in its own gateway list --
+marked, because a reader who did not know that would think a gateway had duplicated.
+
+Watching it needs no special tool either. The frames are TLD on ordinary topics:
 
     qnnt-ls --tree
     qnnt-cat 'can/powertrain/*'          # every host's view of one bus
@@ -2069,6 +2110,19 @@ to talk to.
 
 The struct layouts are checked separately, at compile time: every size and offset is
 asserted against the numbers <linux/can.h> produces, verified on both aarch64 and x86_64.
+
+The station adds a fourth layer, `zig build cpp-logic`, which is Qt-free on purpose: topic
+parsing, identifier and payload formatting, the hex parser behind the send box and the rate
+estimator are ordinary C++ and are tested as such, and the wire format is pinned to
+testdata/can_frame.tld -- bytes packed by Zig, unpacked by the C++ struct, so a field
+renamed on either side fails a test instead of drawing a frame with identifier 0.
+
+That last layer found a hole in the C API rather than in itself. An empty payload -- a
+legal CAN frame with DLC 0, and every remote request -- could not be encoded from C++:
+`std::vector<T>::data()` on an empty vector may return null, and the TLD writers rejected a
+null pointer outright instead of reading (null, 0) as the empty buffer it means in C. It
+threw, and in the station an uncaught exception took the window down. The three writers now
+accept it.
 
 CLASSIC CAN ONLY. CAN FD carries up to 64 bytes and needs CAN_RAW_FD_FRAMES, which this
 gateway does not set. It refuses an over-long frame rather than truncating it.

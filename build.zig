@@ -554,6 +554,13 @@ pub fn build(b: *Build) void {
                 .help = "Build the Qt/QML depth camera viewer (needs -Dqt=...)",
                 .quick = true,
             },
+            .{
+                .name = "can-station",
+                .src = "examples/can/station.cpp",
+                .step = "can-station",
+                .help = "Build the Qt/QML CAN mesh station (needs -Dqt=...)",
+                .quick = true,
+            },
         };
 
         for (qt_examples) |ex| {
@@ -602,8 +609,11 @@ pub fn build(b: *Build) void {
             const exe = b.addExecutable(.{ .name = ex.name, .root_module = ex_mod });
             b.installArtifact(exe);
 
+            // The install step, not the compile step, for the same reason `mesh` above
+            // does it: a step named after a binary has to leave the binary in zig-out/bin
+            // where it can be run, not merely prove it compiles.
             const step = b.step(ex.step, ex.help);
-            step.dependOn(&exe.step);
+            step.dependOn(&b.addInstallArtifact(exe, .{}).step);
 
             // So that `zig build mesh -Dqt=...` builds all five rather than four.
             if (std.mem.eql(u8, ex.name, "mesh-qt")) {
@@ -621,6 +631,10 @@ pub fn build(b: *Build) void {
             if (std.mem.eql(u8, ex.name, "dirigera-home")) {
                 dirigera_step.dependOn(&b.addInstallArtifact(exe, .{}).step);
             }
+            // can-station is deliberately NOT tied to the `can` step. That step is guarded
+            // on Linux because SocketCAN is; the station only watches topics, and a topic
+            // does not care which kernel produced it -- so it builds and runs on a mac
+            // against a mesh of gateways running anywhere.
         }
     }
 
