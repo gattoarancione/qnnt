@@ -4,8 +4,43 @@ Zig cross-compiles the whole library, so the binaries are built on the host and 
 *run* in the container. The image carries no toolchain, and what gets tested is exactly
 the artefact that would ship.
 
+## The runtime: colima, not Docker Desktop
+
+Everything in this directory runs on a colima VM. One command sets it up:
+
+    brew install colima
+    docker/colima.sh              # start it, load the CAN modules, select the context
+    docker/colima.sh stop         # when you are done
+
+**Why not Docker Desktop.** Its LinuxKit kernel is built without `CONFIG_CAN`, so
+`ip link add type vcan` fails there however many capabilities you grant, and
+[examples/can/](../examples/can/) cannot run on it at all — see [A CAN gateway
+mesh](#a-can-gateway-mesh) below. Since one runtime has to be able to run all of it, it is
+colima. Everything else works identically on both; these harnesses were run on Docker
+Desktop for months and were moved, not rewritten.
+
+There is a second, quieter reason. colima boots an ordinary Ubuntu kernel with its own
+module set and its own network stack, so what runs there is closer to a deployment than
+Docker Desktop's tuned VM is.
+
+`docker/colima.sh` pins 4 CPUs and 6 GB, because colima's 2/2 default is not enough:
+`docker/federation.sh` runs six containers and `docker/can.sh` five, each a full node with
+its own registry. Kernel modules do not survive a VM restart, so run the script again after
+every `colima start` — that is all it does the second time.
+
+To go back to Docker Desktop for everything except the CAN harness:
+`docker context use desktop-linux`. Note the two keep **separate image stores**, so an
+image built under one is not there under the other; rebuild after switching.
+
+One sharp edge worth knowing: `colima stop` resets the docker context to `default`, which
+points at `/var/run/docker.sock` — a socket nothing is listening on unless Docker Desktop
+is running. `docker` then fails with a missing-file error that says nothing about why.
+`docker/colima.sh stop` prints the context and the two ways back.
+
+## The smoke tests
+
     # build Linux binaries (glibc; use -linux-musl with an alpine base instead)
-    zig build -Dtarget=x86_64-linux-gnu          # or aarch64-linux-gnu, native on Apple silicon
+    zig build -Dtarget=aarch64-linux-gnu         # or x86_64-linux-gnu
 
     docker build -f docker/Dockerfile.linux-test -t qnnt-linux-test .
     docker run --rm qnnt-linux-test
@@ -18,12 +53,16 @@ container's port and point it at the host:
 
     docker run --rm -p 31107:31107 -e HOST_FEDERATION_PORT=2223 qnnt-linux-test
 
-`host.docker.internal` resolves to the macOS host from inside Docker Desktop. Note this
-exercises the observed-address path in earnest: the container reaches the host at one
-address and the host sees the container at another, and neither has to be told its own.
+`host.docker.internal` resolves to the macOS host from inside the container under both
+runtimes — 192.168.5.2 on colima, 192.168.65.254 on Docker Desktop, and neither number is
+worth memorising. Note this exercises the observed-address path in earnest: the container
+reaches the host at one address and the host sees the container at another, and neither has
+to be told its own.
 
 Match the target to the container's architecture — `aarch64-linux-gnu` for the default
-arm64 images on Apple silicon, `x86_64-linux-gnu` with `--platform linux/amd64`.
+arm64 images on Apple silicon, `x86_64-linux-gnu` with `--platform linux/amd64`. The sample
+output below was captured on Docker Desktop; the addresses differ on colima, nothing else
+does.
 
 ## Peers by name
 
@@ -57,6 +96,8 @@ address, and the entry stays dialable by nodes that never heard the name.
 Six containers on one bridge network, each a host with its own address. One command:
 
 ```bash
+docker/colima.sh                         # the VM, once per boot
+
 zig build -Dtarget=aarch64-linux-gnu     # Apple silicon / arm64 images
 # zig build -Dtarget=x86_64-linux-gnu    # amd64 images
 
@@ -161,7 +202,14 @@ The script checks first and says so, but the usual causes:
   binaries there and the script will tell you they are not ELF.
 * **The entrypoint.** `Dockerfile.linux-test` runs the Linux smoke tests by default, so the
   compose file overrides `entrypoint` — without that every container runs `run-tests.sh`
-  and none is a federation site.
+  and none is a federation site. The same trap catches ad-hoc `docker run` probes: a
+  `command` is appended to an entrypoint, not substituted for it, so pass
+  `--entrypoint bash` when you want a shell.
+* **The wrong daemon.** colima and Docker Desktop keep separate image stores, so a
+  `docker build` under one is invisible to the other. `docker context show` says which you
+  are on; `docker/colima.sh` selects colima.
+* **Too small a VM.** colima's 2 CPU / 2 GB default cannot hold six nodes. `docker/colima.sh`
+  asks for 4 and 6.
 
 ## Latency and packet loss
 
@@ -297,25 +345,14 @@ your own beside Docker Desktop, not a change to it, since Docker Desktop ships i
 signed VM with no way to swap the kernel. If the PR merges, nothing here needs changing:
 the harness probes for vcan and stops skipping.
 
-To run the real thing on a Mac today, use a VM with a distribution kernel rather than
-LinuxKit's. This works:
+This is why everything here runs on colima, whose Ubuntu kernel has CAN as a loadable
+module. `docker/colima.sh` does the setup; `docker/can.sh` then passes 15 checks.
 
-```sh
-brew install colima
-colima start --cpu 4 --memory 6
-colima ssh -- sh -c 'sudo apt-get update &&
-  sudo apt-get install -y linux-modules-extra-$(uname -r)'
-colima ssh -- sudo modprobe vcan can can_raw
-docker context use colima
-docker/can.sh                      # 15 checks, all green
-docker context use desktop-linux   # to put it back
-```
-
-The Ubuntu cloud image ships a trimmed module set, so `modprobe vcan` fails on a fresh VM
-with "Module vcan not found" — which reads exactly like a kernel without CAN, and is not.
-`linux-modules-extra` is what supplies it. Load it in the VM, not in a container: a
-container has no `/lib/modules` and can only `ip link add` against a subsystem the kernel
-already has.
+The one trap it hides for you: the Ubuntu **cloud** image ships a trimmed module set, so
+`modprobe vcan` on a fresh VM fails with "Module vcan not found" — which reads exactly like
+a kernel without CAN, and is not. `linux-modules-extra` supplies it. It loads in the VM,
+never in a container: a container has no `/lib/modules` and can only `ip link add` against
+a subsystem the kernel already has.
 
 `docker/can.sh` asks this first and says so plainly rather than failing obscurely, then runs
 `wire` instead — which exercises the topics, the glob subscriptions, the federated directory

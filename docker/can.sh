@@ -223,7 +223,8 @@ case "$MODE" in
       echo "== this kernel has no vcan =="
       echo "  \`ip link add type vcan\` fails in a privileged container, so there is no CAN"
       echo "  subsystem here. Docker Desktop's LinuxKit kernel is built without CONFIG_CAN."
-      echo "  Run this on a Linux host, or in a VM with a stock distribution kernel."
+      echo "  On a Mac:  docker/colima.sh   (starts a VM whose kernel has it, and selects it)"
+      echo "  Elsewhere: run this on a Linux host with vcan available."
       echo
       skipped "the five gateway checks" "(no vcan in this kernel)"
       echo

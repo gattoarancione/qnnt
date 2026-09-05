@@ -2002,26 +2002,26 @@ change to it: Docker Desktop ships its own signed VM and offers no way to substi
 kernel. If the PR ever merges, this example needs no change -- the harness probes for vcan
 and would simply stop skipping.
 
-The way to run it on a Mac today is a VM with an ordinary distribution kernel instead of
-LinuxKit's. colima boots Ubuntu, where CAN is a loadable module. This is the whole recipe,
-and it works:
+The way to run it on a Mac is a VM with an ordinary distribution kernel instead of
+LinuxKit's. colima boots Ubuntu, where CAN is a loadable module, and everything under
+docker/ runs there for exactly this reason -- one runtime has to be able to run all of it.
+Setting it up is one command:
 
     brew install colima
-    colima start --cpu 4 --memory 6
-    colima ssh -- sh -c 'sudo apt-get update && \
-      sudo apt-get install -y linux-modules-extra-$(uname -r)'
-    colima ssh -- sudo modprobe vcan can can_raw
-    docker context use colima
-    docker/can.sh
+    docker/colima.sh          # start the VM, load the CAN modules, select the context
+    docker/can.sh             # 15 checks
+    docker/colima.sh stop
 
-Two things about it are not obvious. The Ubuntu CLOUD image ships a trimmed module set, so
-vcan is missing until `linux-modules-extra` is installed -- `modprobe vcan` fails with
-"Module vcan not found" on a fresh VM, which reads exactly like a kernel without CAN and is
-not. And the module is loaded in the VM, not in the container: a container has no
-/lib/modules and cannot modprobe anything, it can only `ip link add` against a subsystem
-the kernel already has.
+Two things it hides for you. The Ubuntu CLOUD image ships a trimmed module set, so vcan is
+missing until `linux-modules-extra` is installed -- `modprobe vcan` fails with "Module vcan
+not found" on a fresh VM, which reads exactly like a kernel without CAN and is not. And the
+module loads in the VM, never in a container: a container has no /lib/modules and cannot
+modprobe anything, it can only `ip link add` against a subsystem the kernel already has.
+Modules do not survive a VM restart either, so `docker/colima.sh` is run after every
+`colima start`; that is all it does the second time.
 
-`docker context use desktop-linux` puts things back.
+`docker context use desktop-linux` goes back to Docker Desktop for everything except this
+example. The two keep separate image stores, so rebuild after switching.
 
 docker/can.sh detects this and says so rather than failing obscurely, then runs the half
 that does not need a kernel:
