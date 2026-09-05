@@ -16,6 +16,9 @@ WORKDIR /qnnt
 COPY zig-out/bin/ /qnnt/bin/
 COPY zig-out/lib/ /qnnt/lib/
 COPY python/ /qnnt/python/
+# The federation harness scripts, so a container can BE a site rather than only run the
+# smoke tests. See docker/compose.federation.yml.
+COPY examples/federation/ /qnnt/examples/federation/
 COPY docker/run-tests.sh /qnnt/run-tests.sh
 
 ENV QNNT_LIBRARY=/qnnt/lib/libqnnt_c.so

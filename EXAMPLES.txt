@@ -1426,6 +1426,7 @@ ways:
     topologies.py    the harness: four checks across four topologies
 
     python3 examples/federation/topologies.py            # all of it, ~5 min
+    bash docker/federation.sh                            # the same four, on real hosts
     python3 examples/federation/topologies.py converge
     python3 examples/federation/topologies.py clocks --forget   # adds a 5 min wait
 
@@ -1741,3 +1742,56 @@ classes themselves, every QML binding, and the frame decode and projection in
 examples/zed/viewer.cpp and examples/lidar/viewer.cpp. The projection in
 particular has had two bugs (a degenerate first-person eye, and a fov taken from
 the wrong axis) and remains covered only by looking at it.
+
+--------------------------------------------------------------------------------
+ 19. Federation on real hosts: docker/
+--------------------------------------------------------------------------------
+
+    zig build -Dtarget=aarch64-linux-gnu     # or x86_64-linux-gnu
+    bash docker/federation.sh
+
+Six containers on one bridge network, each a host with its own address, running the
+same four topologies as section 16 and then cutting a host off the network on
+each. See docker/README.md for the operator's version of this; what follows is
+what it added over the loopback harness.
+
+WHY IT WAS WORTH BUILDING. Section 16 runs the topologies as ports on one machine,
+which is faster and needs no Docker, and it stays the right check for most work.
+Three things it cannot reach, all of which this does:
+
+  * OBSERVED-ADDRESS SUBSTITUTION, which is the interesting one. No node here is
+    told its own address -- none sets QNNT_ADVERTISE_ADDR -- so an entry travels
+    with an empty host and the receiver fills in the address it was reached on.
+    That is the whole NAT story in federation.zig, and on loopback it was
+    untestable: every address is 127.0.0.1, so a wrong answer looks exactly like a
+    right one. Here the script checks every learned endpoint against the peer's
+    real container address, and a wrong answer is a wrong container.
+  * THE DEFAULT PORTS. Registry 2222 and federation 2223 everywhere, because each
+    host has an address of its own. The loopback harness must give every site
+    different ports, which is not how anything is deployed.
+  * A PARTITION. `docker network disconnect` removes a host the way a cable does:
+    the process keeps running and keeps believing it is fine. Killing a process is
+    a different failure, and it is the only one the loopback harness can produce.
+
+Peers are named rather than numbered (QNNT_PEERS=alpha,charlie), so Docker's DNS
+and the libc resolution path are exercised too -- an address literal skips both.
+
+RESULT, 16 checks across the four topologies:
+
+    all four converge              every linked host sees every linked topic
+    learned endpoints              the peer's real address, never loopback
+    a cut host stops being served  inside its 30s lease
+    re-learned after healing       15-20s
+
+A NOTE ON THE RECOVERY NUMBER, because the first version of this test got it
+wrong. Recovery was asserted against a fixed 12s wait and failed on every
+topology, which looked like federation not recovering from a partition at all. It
+recovers in 15-20s; the test was impatient. It now polls and reports the time it
+actually took, for the same reason the failover harness does: a fixed deadline on
+a jittery quantity produces confident wrong answers.
+
+WHAT IT STILL DOES NOT COVER. Latency and packet loss. Containers on one bridge
+talk at memory speed, so a peer that is SLOW rather than absent is untested -- and
+that is the condition most likely to expose a timing assumption. docker/README.md
+records what adding it would take (NET_ADMIN and tc netem); nothing here does it,
+and no claim about behaviour under loss should be read into these results.

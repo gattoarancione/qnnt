@@ -1,0 +1,82 @@
+# Federation across real hosts.
+#
+# Six containers on one bridge network, each a separate host with its own address. That is
+# the point of running it here rather than as ports on one machine: everything the loopback
+# harness (examples/federation/topologies.py) could not reach is reachable now.
+#
+#   * Every node uses the DEFAULT ports -- registry 2222, federation 2223 -- because each
+#     has an address of its own. The loopback harness had to give every site different
+#     ports, which is not how anything is actually deployed.
+#   * No node is told its own address. None sets QNNT_ADVERTISE_ADDR, so an entry travels
+#     with an empty host and the receiver substitutes the address it was reached on. On
+#     loopback that substitution was untestable: every address was 127.0.0.1, so a wrong
+#     answer looked exactly like a right one.
+#   * Peers are named, not numbered. Docker's DNS resolves the service names, exercising
+#     the libc resolution path that an address literal skips.
+#
+# The topology is whatever the *_PEERS variables say. docker/federation.sh sets them; empty
+# means no peers, which the library reads as "unset".
+
+x-site: &site
+  image: qnnt-fed
+  networks: [fed]
+  # The image's ENTRYPOINT runs the Linux smoke tests. `command` appends to an entrypoint
+  # rather than replacing it, so it has to be overridden or every container here would run
+  # run-tests.sh and none would be a federation site.
+  entrypoint: ["python3"]
+  environment: &site-env
+    QNNT_CLUSTER_KEY: ${QNNT_CLUSTER_KEY:-federation-demo}
+    QNNT_LIBRARY: /qnnt/lib/libqnnt_c.so
+
+services:
+  alpha:
+    <<: *site
+    hostname: alpha
+    environment:
+      <<: *site-env
+      QNNT_PEERS: ${ALPHA_PEERS:-}
+    command: ["examples/federation/node.py", "fed/alpha/beacon"]
+
+  bravo:
+    <<: *site
+    hostname: bravo
+    environment:
+      <<: *site-env
+      QNNT_PEERS: ${BRAVO_PEERS:-}
+    command: ["examples/federation/node.py", "fed/bravo/beacon"]
+
+  charlie:
+    <<: *site
+    hostname: charlie
+    environment:
+      <<: *site-env
+      QNNT_PEERS: ${CHARLIE_PEERS:-}
+    command: ["examples/federation/node.py", "fed/charlie/beacon"]
+
+  delta:
+    <<: *site
+    hostname: delta
+    environment:
+      <<: *site-env
+      QNNT_PEERS: ${DELTA_PEERS:-}
+    command: ["examples/federation/node.py", "fed/delta/beacon"]
+
+  echo:
+    <<: *site
+    hostname: echo
+    environment:
+      <<: *site-env
+      QNNT_PEERS: ${ECHO_PEERS:-}
+    command: ["examples/federation/node.py", "fed/echo/beacon"]
+
+  # The control. Carries the cluster key, has no peers, and nobody dials it. It must see
+  # only its own topic, and nothing may see its topic -- without it, "every host sees every
+  # topic" would equally be the result of a misconfiguration that merged them all.
+  zulu:
+    <<: *site
+    hostname: zulu
+    command: ["examples/federation/node.py", "fed/zulu/beacon"]
+
+networks:
+  fed:
+    driver: bridge
