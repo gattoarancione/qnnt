@@ -1981,7 +1981,15 @@ THE STATION: can-station
 ------------------------
 
     zig build can-station -Dqt=/Users/you/Qt/6.10.3/macos
-    ./zig-out/bin/can-station
+    bash examples/can/demo.sh        # four gateways and two buses to look at
+    ./zig-out/bin/can-station        # or against gateways of your own
+
+`demo.sh` produces the mesh with examples/can/wire_check.py rather than with gateways on
+vcan interfaces, so it needs no CAN support and runs anywhere Qt does. It publishes exactly
+the topics and exactly the frames a gateway publishes, and the station cannot tell the
+difference -- which is the point. Everything it starts is stopped when the window closes,
+including if you interrupt it: four publishers left talking to nobody is not a good way to
+end a demo. For the real thing, gateways on real interfaces, see docker/can.sh.
 
 A Qt/QML view of the whole mesh, and a node on it. The fifth station in this repository and
 the first that does not know what it is looking at when it starts: lidar-viewer is pointed

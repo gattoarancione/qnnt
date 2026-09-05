@@ -1,6 +1,7 @@
 //! can-station: the Qt/QML view of a CAN gateway mesh, and a node on it.
 //!
-//!   docker/colima.sh && docker/can.sh   # a mesh to watch, or real gateways of your own
+//!   bash examples/can/demo.sh            # a mesh to look at, no CAN interface needed
+//!   docker/colima.sh && docker/can.sh    # or real gateways on real vcan interfaces
 //!   ./zig-out/bin/can-station
 //!
 //!   can-station [path/to/main.qml] [gateway-name]
