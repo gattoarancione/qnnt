@@ -1790,8 +1790,38 @@ recovers in 15-20s; the test was impatient. It now polls and reports the time it
 actually took, for the same reason the failover harness does: a fixed deadline on
 a jittery quantity produces confident wrong answers.
 
-WHAT IT STILL DOES NOT COVER. Latency and packet loss. Containers on one bridge
-talk at memory speed, so a peer that is SLOW rather than absent is untested -- and
-that is the condition most likely to expose a timing assumption. docker/README.md
-records what adding it would take (NET_ADMIN and tc netem); nothing here does it,
-and no claim about behaviour under loss should be read into these results.
+LATENCY AND LOSS, with tc netem:
+
+    bash docker/federation.sh netem
+
+    a perfect network (the baseline)               2s
+    100ms added to every host                      1s
+    10% packet loss on every host                  9s
+    one host at 2000ms: the four unaffected        8s
+      and the slow host itself                     21s
+
+Each number is how long a BRAND NEW topic published on one host takes to reach
+every host being waited for -- a fresh name each time, since one already in the
+directory would measure nothing.
+
+Latency and loss turn out to be unremarkable. The exchange is TCP, so 10% loss
+becomes retransmission rather than lost entries, and 100ms on every link changes
+nothing measurable.
+
+A SLOW PEER IS WORSE THAN A DEAD ONE. In a full mesh of five, making one host slow
+cost the other four roughly 4-7x their convergence (14s, 13s, 14s against a 2s
+baseline in one run), while STOPPING that same host cost them nothing -- 1-2s. The
+expensive failure is the one that keeps answering slowly.
+
+The mechanism is not established, and the script says so rather than guessing.
+Connectors are one worker per peer waiting on a futex, so structurally a slow peer
+should not hold up the others, and a relay topology built to isolate the effect
+did not reproduce it (1s, 1s, 6s healthy against 6s, 6s, 1s slow, which is noise).
+Real, repeatable in a mesh, unexplained. It is reported rather than asserted:
+only "did everyone converge at all" is pass/fail, because a red FAIL for behaviour
+nobody has shown to be a defect teaches people to ignore the output.
+
+WHAT IT STILL DOES NOT COVER. Sustained behaviour -- these runs last minutes, so a
+slow leak or an entry ageing out wrongly over hours would not show. And one bridge
+with one MTU and no middlebox says nothing about a real WAN path, a NAT that
+rewrites addresses, or a firewall that drops idle connections.

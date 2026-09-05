@@ -24,6 +24,9 @@ x-site: &site
   # rather than replacing it, so it has to be overridden or every container here would run
   # run-tests.sh and none would be a federation site.
   entrypoint: ["python3"]
+  # For `tc qdisc ... netem`, which docker/federation.sh uses to add latency and loss.
+  # Nothing here changes the network unless that script asks it to.
+  cap_add: [NET_ADMIN]
   environment: &site-env
     QNNT_CLUSTER_KEY: ${QNNT_CLUSTER_KEY:-federation-demo}
     QNNT_LIBRARY: /qnnt/lib/libqnnt_c.so

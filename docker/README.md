@@ -163,20 +163,68 @@ The script checks first and says so, but the usual causes:
   compose file overrides `entrypoint` — without that every container runs `run-tests.sh`
   and none is a federation site.
 
-## What this still does not cover
+## Latency and packet loss
 
-Latency and packet loss. Containers on one bridge talk at memory speed, so a peer that is
-*slow* rather than absent is untested — which is the condition most likely to expose a
-timing assumption. Adding it needs `NET_ADMIN` and `tc`:
-
-```yaml
-    cap_add: [NET_ADMIN]
+```bash
+bash docker/federation.sh netem
 ```
+
+Puts a real network underneath federation with `tc netem`, on a mesh. Needs `NET_ADMIN`,
+which `compose.federation.yml` grants to these containers only.
+
+```
+  a perfect network (the baseline)               2s
+  100ms added to every host                      1s
+  10% packet loss on every host                  9s
+  one host at 2000ms: the four unaffected        8s
+    and the slow host itself                     21s
+```
+
+Each number is how long a brand-new topic published on `alpha` takes to reach every host
+being waited for. A fresh name each time, because a topic already in the directory would
+measure nothing. The probe publisher carries no cluster key — it is an ordinary
+application on alpha's host — and `docker exec` reaches it over the daemon's channel
+rather than the container network, so the instrument is not slowed by the condition under
+test.
+
+**Latency and loss are unremarkable.** 100ms on every link changes nothing measurable,
+and 10% loss costs a few seconds: the exchange is TCP, so loss becomes retransmission
+rather than lost entries.
+
+**A slow peer is worse than a dead one, and that is worth knowing.** In a full mesh of
+five, making one host slow cost the other four roughly 4–7× their convergence time
+(measured 14s, 13s, 14s against a 2s baseline in one run; 8s against 2s in another).
+Stopping that same host outright costs them nothing — 1–2s. So the expensive failure is
+the one that keeps answering slowly, not the one that goes away.
+
+The mechanism is **not** established, and the script says so rather than guessing.
+Connectors are one worker per peer waiting on a futex, so structurally a slow peer should
+not hold up the others; and a targeted relay topology built to isolate it did not
+reproduce the effect (1s, 1s, 6s healthy against 6s, 6s, 1s slow — noise). It is real and
+repeatable in a mesh and unexplained. Treat convergence times on a network with one bad
+link as unpredictable until somebody chases it down.
+
+That measurement is reported, not asserted. Only "did everyone converge at all" is a
+pass/fail, because printing a red FAIL for behaviour nobody has shown to be a defect
+trains people to ignore the output.
+
+### Doing your own
 
 ```bash
 docker compose -f docker/compose.federation.yml -p qnntfed exec delta \
-  tc qdisc add dev eth0 root netem delay 200ms loss 5%
+  tc qdisc replace dev eth0 root netem delay 200ms loss 5% duplicate 1%
+docker compose -f docker/compose.federation.yml -p qnntfed exec delta \
+  tc qdisc del dev eth0 root      # back to normal
 ```
 
-Nothing here does that yet, and no claim about behaviour under loss should be read into
-these results.
+`netem` also does reordering, corruption and rate limiting; `man tc-netem` has the list.
+Note the delay applies to the container's own interface, so it affects both directions for
+that host.
+
+## What this still does not cover
+
+Anything about *sustained* behaviour: these runs last minutes, so a slow leak, a
+descriptor that is never closed, or an entry that ages out wrongly over hours would not
+show. And every container is on one bridge with the same MTU and no middlebox, so nothing
+here says anything about a real WAN path, a NAT that rewrites addresses, or a firewall
+that drops idle connections.

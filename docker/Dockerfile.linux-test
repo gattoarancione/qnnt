@@ -8,8 +8,13 @@
 # (-Dtarget=*-linux-musl) use alpine instead.
 FROM debian:bookworm-slim
 
+# iproute2 carries `tc`, which docker/federation.sh uses to put latency and loss on a
+# container's link (netem). It needs NET_ADMIN, granted per-service in
+# docker/compose.federation.yml -- the smoke-test container does not get it and does not
+# need it.
+
 RUN apt-get update \
- && apt-get install -y --no-install-recommends netcat-openbsd python3 file procps \
+ && apt-get install -y --no-install-recommends netcat-openbsd python3 file procps iproute2 \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /qnnt
