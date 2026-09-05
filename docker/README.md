@@ -191,18 +191,37 @@ test.
 and 10% loss costs a few seconds: the exchange is TCP, so loss becomes retransmission
 rather than lost entries.
 
-**A slow peer is worse than a dead one, and that is worth knowing.** In a full mesh of
-five, making one host slow cost the other four roughly 4–7× their convergence time
-(measured 14s, 13s, 14s against a 2s baseline in one run; 8s against 2s in another).
-Stopping that same host outright costs them nothing — 1–2s. So the expensive failure is
-the one that keeps answering slowly, not the one that goes away.
+**A slow peer is worse than a dead one, and the cost falls on whoever dials it.** In a
+full mesh of five, making one host slow cost the other four 4–7× their convergence
+(14s, 13s, 14s against a 2s baseline), while *stopping* that same host cost them nothing
+(1–2s).
 
-The mechanism is **not** established, and the script says so rather than guessing.
-Connectors are one worker per peer waiting on a futex, so structurally a slow peer should
-not hold up the others; and a targeted relay topology built to isolate it did not
-reproduce the effect (1s, 1s, 6s healthy against 6s, 6s, 1s slow — noise). It is real and
-repeatable in a mesh and unexplained. Treat convergence times on a network with one bad
-link as unpredictable until somebody chases it down.
+Narrowed by bisecting the topology until only one ingredient was left:
+
+| who dials the slow host | healthy | slow |
+|---|---|---|
+| only the **receiver** of the news | 0–1s | **4s, 4s, 4s** |
+| only the **sender** of the news | 0–1s | 0–1s |
+| the slow host dials others, nobody dials it | 0–1s | 0–2s |
+
+So: **a host that dials a slow peer is delayed in learning from its other, healthy
+peers.** Being *dialed by* a slow peer costs nothing, and a slow outbound connector does
+not delay the dialer's own sending — only its receiving.
+
+The mechanism is **not** established, and these are ruled out by measurement or by
+reading the code:
+
+* not a sequential peer loop — connectors are one worker per peer (`peerConnectorRun`)
+* not worker starvation — `spawnWorker` spawns a thread, there is no bounded pool
+* not a serial listener — `handleFederationClient` gets a worker per connection
+* not the directory lock held across a slow socket write — `fedCommand` and
+  `writeFedEntries` build a buffer under the lock and the caller writes it afterwards
+
+The one clue worth following: the delay is consistently ~4s, and `fed_sync_interval_ms`
+is 5000. That is what falling back to the anti-entropy timer looks like, as though the
+push that normally delivers news within a second is being missed while a sibling
+connector is inside a long exchange. `waitForChangeOrDeadline` and `fed_change_seq` — a
+single global counter shared by every connector on the host — is where to look.
 
 That measurement is reported, not asserted. Only "did everyone converge at all" is a
 pass/fail, because printing a red FAIL for behaviour nobody has shown to be a defect

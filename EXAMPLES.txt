@@ -1808,18 +1808,40 @@ Latency and loss turn out to be unremarkable. The exchange is TCP, so 10% loss
 becomes retransmission rather than lost entries, and 100ms on every link changes
 nothing measurable.
 
-A SLOW PEER IS WORSE THAN A DEAD ONE. In a full mesh of five, making one host slow
-cost the other four roughly 4-7x their convergence (14s, 13s, 14s against a 2s
-baseline in one run), while STOPPING that same host cost them nothing -- 1-2s. The
-expensive failure is the one that keeps answering slowly.
+A SLOW PEER IS WORSE THAN A DEAD ONE, AND IT COSTS WHOEVER DIALS IT. In a full
+mesh of five, making one host slow cost the other four 4-7x their convergence
+(14s, 13s, 14s against a 2s baseline), while STOPPING that same host cost them
+nothing (1-2s).
 
-The mechanism is not established, and the script says so rather than guessing.
-Connectors are one worker per peer waiting on a futex, so structurally a slow peer
-should not hold up the others, and a relay topology built to isolate the effect
-did not reproduce it (1s, 1s, 6s healthy against 6s, 6s, 1s slow, which is noise).
-Real, repeatable in a mesh, unexplained. It is reported rather than asserted:
-only "did everyone converge at all" is pass/fail, because a red FAIL for behaviour
-nobody has shown to be a defect teaches people to ignore the output.
+Bisecting the topology until one ingredient was left:
+
+    who dials the slow host             healthy   slow
+    only the RECEIVER of the news       0-1s      4s, 4s, 4s
+    only the SENDER of the news         0-1s      0-1s
+    the slow host dials out, none in    0-1s      0-2s
+
+So a host that dials a slow peer is delayed in learning from its OTHER, healthy
+peers. Being dialled by a slow peer costs nothing, and a slow outbound connector
+does not delay the dialler's own sending -- only its receiving.
+
+The mechanism is not established. Ruled out, by measurement or by reading:
+
+  * not a sequential peer loop -- one worker per peer (peerConnectorRun)
+  * not worker starvation -- spawnWorker spawns a thread, there is no pool
+  * not a serial listener -- a worker per connection
+  * not the directory lock held across a slow socket write -- fedCommand and
+    writeFedEntries build a buffer under the lock and the caller writes it after
+
+The clue worth following: the delay is consistently ~4s and fed_sync_interval_ms
+is 5000, which is what falling back to the anti-entropy timer looks like -- as
+though the push that normally delivers news within a second is missed while a
+sibling connector is inside a long exchange. waitForChangeOrDeadline and
+fed_change_seq, a single global counter shared by every connector on a host, is
+where to look.
+
+It is reported rather than asserted: only "did everyone converge at all" is
+pass/fail, because a red FAIL for behaviour nobody has shown to be a defect
+teaches people to ignore the output.
 
 WHAT IT STILL DOES NOT COVER. Sustained behaviour -- these runs last minutes, so a
 slow leak or an entry ageing out wrongly over hours would not show. And one bridge
