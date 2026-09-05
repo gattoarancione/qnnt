@@ -113,6 +113,14 @@ pub fn build(b: *Build) void {
 
     const dirigera_step = b.step("dirigera", "Build the IKEA DIRIGERA bridge");
 
+    // The topic payload types, shared with the C++ station through a golden frame.
+    const dirigera_frames_mod = b.createModule(.{
+        .root_source_file = b.path("examples/dirigera/frames.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    dirigera_frames_mod.addImport("qnnt", qnnt_lib_mod);
+
     const dirigera_bridge_mod = b.createModule(.{
         .root_source_file = b.path("examples/dirigera/bridge.zig"),
         .target = target,
@@ -122,6 +130,7 @@ pub fn build(b: *Build) void {
     dirigera_bridge_mod.addImport("https", dirigera_https_mod);
     dirigera_bridge_mod.addImport("hub", dirigera_hub_mod);
     dirigera_bridge_mod.addImport("ws", dirigera_ws_mod);
+    dirigera_bridge_mod.addImport("frames", dirigera_frames_mod);
     dirigera_bridge_mod.addImport("qnnt", qnnt_lib_mod);
     dirigera_bridge_mod.linkLibrary(qnnt_lib);
 
@@ -692,6 +701,7 @@ pub fn build(b: *Build) void {
         "examples/net/wire.zig",
         "examples/dirigera/https.zig",
         "examples/dirigera/hub.zig",
+        "examples/dirigera/frames.zig",
         "examples/dirigera/ws.zig",
         "examples/ugv/sio.zig",
         "examples/ugv/beast.zig",
@@ -731,6 +741,8 @@ pub fn build(b: *Build) void {
         }
         if (std.mem.startsWith(u8, src, "examples/dirigera/")) {
             test_mod.addImport("wire", wire_mod);
+            test_mod.addImport("qnnt", qnnt_lib_mod);
+            test_mod.linkLibrary(qnnt_lib);
             test_mod.addImport("tls_openssl", dirigera_tls_mod);
             // https.zig's tests reach OpenSSL to prove the embedded anchor loads, so they
             // only run when the library is available. Everything else in the example --
@@ -825,6 +837,30 @@ pub fn build(b: *Build) void {
     const run_cpp_demo = b.addRunArtifact(cpp_demo);
     const cpp_demo_step = b.step("cpp-demo", "Build and run the C++ example against the wrapper");
     cpp_demo_step.dependOn(&run_cpp_demo.step);
+
+    // The C++ logic the viewers depend on, extracted into headers so it can be tested with
+    // no Qt, no hub and no robot. Deliberately not behind -Dqt=: anything testable only
+    // through the Qt executables would in practice never run, which is how this side of
+    // the repository ended up with no coverage at all.
+    const cpp_logic_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    cpp_logic_mod.link_libcpp = true;
+    cpp_logic_mod.addCSourceFile(.{
+        .file = b.path("examples/cpp_logic_test.cpp"),
+        .flags = &.{ "-std=c++20", "-Wall", "-Wextra", "-Werror" },
+    });
+    // The golden-frame checks decode real TLD, so this needs the wrapper and the C library
+    // behind it -- but still no Qt.
+    cpp_logic_mod.addIncludePath(b.path("include"));
+    cpp_logic_mod.linkLibrary(tld_c_static);
+
+    const cpp_logic = b.addExecutable(.{ .name = "cpp-logic-test", .root_module = cpp_logic_mod });
+    const run_cpp_logic = b.addRunArtifact(cpp_logic);
+    const cpp_logic_step = b.step("cpp-logic", "Run the Qt-free C++ logic checks");
+    cpp_logic_step.dependOn(&run_cpp_logic.step);
 
     // The struct mapping in C++: TLD_* macros, the msgpack-shaped calls, and the check
     // that this side agrees byte-for-byte with the Zig and Python mappings on one golden
@@ -974,6 +1010,7 @@ pub fn build(b: *Build) void {
 
     test_step.dependOn(&run_c_demo.step);
     test_step.dependOn(&run_cpp_demo.step);
+    test_step.dependOn(&run_cpp_logic.step);
     test_step.dependOn(&run_node_demo.step);
     test_step.dependOn(&run_tld_map.step);
     test_step.dependOn(&run_tld_map_c.step);

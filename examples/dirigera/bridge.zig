@@ -49,6 +49,7 @@ const tld = qnnt_mod.Tld;
 const https = @import("https");
 const hub = @import("hub");
 const ws = @import("ws");
+const frames = @import("frames");
 
 const allocator = std.heap.page_allocator;
 
@@ -69,98 +70,14 @@ const path_events = "/v1";
 
 // -- the wire types ---------------------------------------------------------------------
 
-/// One device's state. Optionals are genuinely optional: a motion sensor has no
-/// `light_level`, and TLD carries the absence rather than a zero that a consumer would have
-/// to know to disbelieve.
-const DeviceFrame = struct {
-    id: []const u8,
-    type: []const u8,
-    name: []const u8,
-    room: []const u8,
-    model: []const u8,
-    /// False means the hub cannot currently reach it, so the values below are its last
-    /// known state rather than a live reading. Carried because a consumer that ignores it
-    /// will happily display hours-old data as current.
-    reachable: bool,
-    is_on: ?bool,
-    light_level: ?u8,
-    color_temperature: ?u16,
-    battery: ?u8,
-    is_detected: ?bool,
-    illuminance: ?u32,
-    /// Whether this bridge would accept any command for it -- a summary of the three
-    /// flags below, kept because most consumers only need the yes/no.
-    controllable: bool,
-    /// Which attributes the hub will actually accept, from its own `canReceive`. Published
-    /// separately because a controller has to know WHICH control to offer: a dimmable white
-    /// bulb and a tunable one differ only here, and guessing from the device type gets it
-    /// wrong.
-    can_set_on: bool,
-    can_set_level: bool,
-    can_set_temperature: bool,
-    /// The bulb's colour-temperature range in Kelvin, already sorted low-to-high -- the hub
-    /// reports its `min` above its `max`. Null when the device has no such range.
-    temperature_min: ?u16,
-    temperature_max: ?u16,
-    /// Devices sharing one physical unit share this. A VALLHORN is a single sensor on the
-    /// wall that the hub presents as two devices -- a motion sensor and a light sensor --
-    /// and this is the only thing that says so. Published because a consumer that shows
-    /// them separately is showing one sensor twice, and the light-sensor half carries
-    /// neither a name nor a room of its own.
-    relation: []const u8,
-};
-
-const StateFrame = struct {
-    seq: u64,
-    t_us: u64,
-    /// What the hub called the event, e.g. `deviceStateChanged`. Carried verbatim because
-    /// this bridge does not pretend to know every event type a firmware may introduce.
-    event: []const u8,
-    /// The device was in the last inventory, so `device` below carries its name, room and
-    /// capabilities. False for a device paired since the last refresh, where only the
-    /// changed attributes are known.
-    identified: bool,
-    device: DeviceFrame,
-};
-
-const InventoryFrame = struct {
-    t_us: u64,
-    hub: []const u8,
-    count: u32,
-    devices: []const DeviceFrame,
-};
-
-const StatusFrame = struct {
-    t_us: u64,
-    hub: []const u8,
-    firmware: []const u8,
-    /// The REST API answered the last time it was tried.
-    api_link: bool,
-    /// The push stream is connected. Tracked apart from `api_link` because the two fail
-    /// independently, and the whole value of this bridge is the push stream.
-    event_link: bool,
-    devices: u32,
-    events_received: u64,
-    events_unparsed: u64,
-    /// WebSocket continuation frames, which this reader does not reassemble. Non-zero means
-    /// events are being lost and ws.zig needs the fragmentation it currently skips.
-    dropped_fragments: u64,
-    commands_sent: u64,
-    commands_failed: u64,
-    /// Commands for a device the hub does not accept commands for, or an unknown id.
-    commands_refused: u64,
-    reconnects: u64,
-};
-
-/// A command from the command topic. Every field but the id is optional, so a controller can
-/// dim without touching colour, or switch on without touching level.
-const LightCommand = struct {
-    /// The hub's device id. `--list` prints them.
-    id: []const u8,
-    on: ?bool = null,
-    level: ?u8 = null,
-    kelvin: ?u16 = null,
-};
+// The topic payload types live in frames.zig, which is also where the golden frames that
+// hold them in step with the C++ station's definitions are checked. They were here; moving
+// them out is what let them be tested at all.
+const DeviceFrame = frames.DeviceFrame;
+const StateFrame = frames.StateFrame;
+const InventoryFrame = frames.InventoryFrame;
+const StatusFrame = frames.StatusFrame;
+const LightCommand = frames.LightCommand;
 
 // -- shared state ------------------------------------------------------------------------
 
@@ -444,15 +361,15 @@ fn publishState(event: []const u8, d: hub.Device) !void {
 }
 
 fn publishInventory(inv: hub.Inventory) !void {
-    var frames = try allocator.alloc(DeviceFrame, inv.devices.len);
-    defer allocator.free(frames);
-    for (inv.devices, 0..) |d, i| frames[i] = deviceFrame(d);
+    const rows = try allocator.alloc(DeviceFrame, inv.devices.len);
+    defer allocator.free(rows);
+    for (inv.devices, 0..) |d, i| rows[i] = deviceFrame(d);
 
     const out: InventoryFrame = .{
         .t_us = @intCast(qnnt.nowMicros()),
         .hub = hub_name,
-        .count = @intCast(frames.len),
-        .devices = frames,
+        .count = @intCast(rows.len),
+        .devices = rows,
     };
     try tld.packTo(allocator, &publish_buf, out);
     try qnnt.publish(topic_inventory, publish_buf.items);

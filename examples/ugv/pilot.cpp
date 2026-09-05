@@ -28,6 +28,7 @@
 //!    visibly explained rather than silently true.
 
 #include "qnnt_qt.hpp"
+#include "steering.hpp"
 
 #include <QColor>
 #include <QElapsedTimer>
@@ -192,12 +193,11 @@ public:
     double left() const { return m_left; }
     double right() const { return m_right; }
 
-    /// How fast, forward positive: the MEAN of the two tracks.
-    double driveAxis() const { return (m_left + m_right) / 2.0; }
-    /// How hard it is turning, right positive. A right turn drives the left track forward
-    /// and the right track back -- left +1, right -1 -- so the difference that means
-    /// "turning right" is (left - right).
-    double steerAxis() const { return (m_left - m_right) / 2.0; }
+    /// The same command as the two axes an operator thinks in. Defined once in
+    /// steering.hpp; deriving it a second time in a QML binding is how the pad indicator
+    /// once ran backwards.
+    double driveAxis() const { return ugv::driveAxis({ m_left, m_right }); }
+    double steerAxis() const { return ugv::steerAxis({ m_left, m_right }); }
 
     QString robot() const { return m_status.robot.isEmpty() ? QStringLiteral("UGV") : m_status.robot; }
     bool link() const { return m_have_status && m_status.link; }
@@ -367,19 +367,11 @@ private:
             if (m_leftward) turn -= 1.0;
         }
 
-        double l = fwd + turn;
-        double r = fwd - turn;
-
-        // Normalise rather than clip, so that full-forward-and-full-turn keeps the ratio
-        // between the tracks and only loses magnitude. Clipping would straighten the turn.
-        const double peak = std::max(std::abs(l), std::abs(r));
-        if (peak > 1.0) {
-            l /= peak;
-            r /= peak;
-        }
-
-        m_left = l * m_throttle;
-        m_right = r * m_throttle;
+        // The arithmetic lives in steering.hpp so it can be tested without Qt, an event
+        // loop or a robot.
+        const ugv::Tracks tracks = ugv::mix(fwd, turn, m_throttle);
+        m_left = tracks.left;
+        m_right = tracks.right;
         Q_EMIT inputChanged();
     }
 

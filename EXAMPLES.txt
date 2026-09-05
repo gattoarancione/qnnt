@@ -1665,3 +1665,79 @@ of the same shape -- an error path producing plausible data instead of an error:
 The registry answers all of these directly if asked properly. `sub <topic>`
 distinguishes served / expired / not-found, and `list` shows refreshed age and
 origin per entry.
+
+--------------------------------------------------------------------------------
+ 18. Testing the C++ side: examples/cpp_logic_test.cpp
+--------------------------------------------------------------------------------
+
+    zig build cpp-logic          # 80 checks, no Qt needed
+    zig build test               # runs them too
+
+The C++ half of this repository had no tests at all. Four viewers, and the one
+crash that reached a user (camera-viewer at --scale below 4, fixed in cf1cd51)
+lived there and survived several "verified end to end" runs.
+
+The obstacle was structural rather than anything to do with willingness: the logic
+sat inside .cpp files next to main() and a moc include, reachable only by building
+a Qt executable. Anything testable only that way would in practice never be tested,
+because the Qt targets are built only when -Dqt= is passed. So the logic came out
+into headers that carry no Qt at all:
+
+    examples/ugv/steering.hpp        differential steering, as arithmetic
+    examples/dirigera/devices.hpp    what a device is FOR, and which get a row
+    examples/dirigera/frames.hpp     the topic payload types
+    examples/dirigera/frames.zig     their Zig counterparts, and the goldens
+
+The viewers include the same headers, so the tests exercise the code that ships
+rather than a copy of it.
+
+WHAT IS CHECKED, and each of these is a bug that actually happened or nearly did:
+
+  * The steering sign convention. A right turn drives the left track forward, so
+    steerAxis is POSITIVE -- the quantity the pad indicator once derived a second
+    time in QML and got backwards.
+  * Normalising rather than clipping. Full forward plus half a turn wants 1.5 and
+    0.5; clipping the first would leave the second alone and quietly straighten
+    the curve. The test asserts the RATIO survives, since both approaches keep the
+    values in range.
+  * An unknown deviceType is Other, not whatever the first branch returns.
+  * One physical sensor, one row: a VALLHORN's light-sensor half folds into its
+    motion twin, but a light sensor with no twin keeps its own row.
+  * Motion as an event: a repeated detection is not a new rising edge and must not
+    restart the clock, or a sensor held in front of always looks like it just fired.
+
+THE CROSS-LANGUAGE CHECK is the one nothing else makes. The station's structs and
+the bridge's must agree field by field, and a mismatch is silent on both sides:
+TLD ignores a key the receiving struct does not declare, and the TLD_DEFINE_MAP
+macros leave a member the frame did not carry exactly as its constructor left it.
+The result is plausible data -- a light that reports itself uncontrollable, a
+sensor with no room -- not an error.
+
+So the agreement is pinned to a golden frame, the same shape as lib/testdata/
+interop.tld: examples/dirigera/testdata/*.tld holds bytes packed by Zig from
+canonical values, a Zig test asserts they still pack to exactly those bytes, and
+the C++ test asserts they unpack to the same values. Either side drifting fails.
+The command direction is checked both ways, because a mismatch there is a click
+that silently does nothing.
+
+One thing that had to be designed for rather than assumed: EVERY plain bool in the
+canonical frame is true. A `bool` default-constructs to false in C++, so a field
+the station stopped declaring reads as false -- and a canonical value of false
+would have been indistinguishable from a dropped field, letting the check pass
+straight through the bug it exists to catch. False-ness is tested on the optional
+bools instead, where absent and present-but-false are different things.
+
+MUTATION-TESTED, because a passing test proves nothing about whether it would
+catch the bug. Five deliberate breaks of the logic -- flip the steer sign, clip
+instead of normalise, drop the unknown-type default, restart the motion clock on
+every reading, invert the pairing rule -- all five caught. For the boundary, a
+field renamed consistently across the C++ struct AND its macro AND the test
+compiles cleanly and is caught by the golden with two failures; a rename that
+misses the macro does not compile at all, which is a second layer rather than the
+same one.
+
+WHAT STILL HAS NO TESTS, stated plainly rather than left to be discovered: the Qt
+classes themselves, every QML binding, and the frame decode and projection in
+examples/zed/viewer.cpp and examples/lidar/viewer.cpp. The projection in
+particular has had two bugs (a degenerate first-person eye, and a fov taken from
+the wrong axis) and remains covered only by looking at it.

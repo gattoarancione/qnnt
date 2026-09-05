@@ -30,6 +30,8 @@
 //! current is the whole failure mode of a home dashboard.
 
 #include "qnnt_qt.hpp"
+#include "devices.hpp"
+#include "frames.hpp"
 
 #include <QColor>
 #include <QElapsedTimer>
@@ -49,80 +51,13 @@
 
 namespace {
 
-/// Mirrors DeviceFrame in examples/dirigera/bridge.zig. TLD matches on field names, so the
-/// two have to agree; the optionals are genuinely optional -- a motion sensor has no
-/// brightness, and null says so rather than a zero the consumer must know to disbelieve.
-struct DeviceFrame {
-    std::string id;
-    std::string type;
-    std::string name;
-    std::string room;
-    std::string model;
-    bool reachable{};
-    std::optional<bool> is_on;
-    std::optional<std::uint8_t> light_level;
-    std::optional<std::uint16_t> color_temperature;
-    std::optional<std::uint8_t> battery;
-    std::optional<bool> is_detected;
-    std::optional<std::uint32_t> illuminance;
-    bool controllable{};
-    bool can_set_on{};
-    bool can_set_level{};
-    bool can_set_temperature{};
-    std::optional<std::uint16_t> temperature_min;
-    std::optional<std::uint16_t> temperature_max;
-    std::string relation;
-    TLD_DEFINE_MAP(id, type, name, room, model, reachable, is_on, light_level,
-                   color_temperature, battery, is_detected, illuminance, controllable,
-                   can_set_on, can_set_level, can_set_temperature, temperature_min,
-                   temperature_max, relation)
-};
-
-struct InventoryFrame {
-    std::uint64_t t_us{};
-    std::string hub;
-    std::uint32_t count{};
-    std::vector<DeviceFrame> devices;
-    TLD_DEFINE_MAP(t_us, hub, count, devices)
-};
-
-struct StateFrame {
-    std::uint64_t seq{};
-    std::uint64_t t_us{};
-    std::string event;
-    bool identified{};
-    DeviceFrame device;
-    TLD_DEFINE_MAP(seq, t_us, event, identified, device)
-};
-
-struct StatusFrame {
-    std::uint64_t t_us{};
-    std::string hub;
-    std::string firmware;
-    bool api_link{};
-    bool event_link{};
-    std::uint32_t devices{};
-    std::uint64_t events_received{};
-    std::uint64_t events_unparsed{};
-    std::uint64_t dropped_fragments{};
-    std::uint64_t commands_sent{};
-    std::uint64_t commands_failed{};
-    std::uint64_t commands_refused{};
-    std::uint64_t reconnects{};
-    TLD_DEFINE_MAP(t_us, hub, firmware, api_link, event_link, devices, events_received,
-                   events_unparsed, dropped_fragments, commands_sent, commands_failed,
-                   commands_refused, reconnects)
-};
-
-/// What goes on the command topic. Optional throughout, so dimming a light does not also
-/// restate its colour -- and so the bridge sends the hub only what was actually asked for.
-struct LightCommand {
-    std::string id;
-    std::optional<bool> on;
-    std::optional<std::uint8_t> level;
-    std::optional<std::uint16_t> kelvin;
-    TLD_DEFINE_MAP(id, on, level, kelvin)
-};
+// The topic payload types, defined in frames.hpp and held in step with the Zig side by a
+// golden frame -- see the header there.
+using dirigera::DeviceFrame;
+using dirigera::InventoryFrame;
+using dirigera::LightCommand;
+using dirigera::StateFrame;
+using dirigera::StatusFrame;
 
 /// How long a click stays marked pending before the interface admits nothing came back.
 /// Generous, because the hub applies changes asynchronously and a Zigbee round trip through
@@ -183,7 +118,7 @@ class Device : public QObject
     Q_PROPERTY(QString age READ age NOTIFY changed)
 
 public:
-    explicit Device(const DeviceFrame& f, QObject* parent = nullptr) : QObject(parent)
+    explicit Device(const dirigera::DeviceFrame& f, QObject* parent = nullptr) : QObject(parent)
     {
         m_id = QString::fromStdString(f.id);
         m_kind = QString::fromStdString(f.type);
@@ -193,6 +128,8 @@ public:
     /// What a device is for. Grouping by room alone puts a lamp, an occupancy sensor and a
     /// light meter in one list, and they answer three different questions -- what can I
     /// switch, is anyone there, how bright is it. Room stays a label; this is the axis.
+    // Mirrors dirigera::Role so QML can compare against it; the classification itself
+    // lives in devices.hpp, where it is testable without Qt.
     enum class Role {
         Light,      ///< an actuator: you operate it
         Presence,   ///< occupancy: motion, transient, event-driven
@@ -204,20 +141,12 @@ public:
 
     Role role() const
     {
-        if (m_kind == QStringLiteral("light") || m_kind == QStringLiteral("outlet")
-            || m_kind == QStringLiteral("blinds"))
-            return Role::Light;
-        if (m_kind == QStringLiteral("motionSensor")) return Role::Presence;
-        if (m_kind == QStringLiteral("lightSensor")
-            || m_kind == QStringLiteral("environmentSensor"))
-            return Role::Ambient;
-        if (m_kind == QStringLiteral("lightController")) return Role::Control;
-        return Role::Other;
+        return static_cast<Role>(dirigera::roleFor(m_kind.toStdString()));
     }
 
     int roleValue() const { return static_cast<int>(role()); }
 
-    void apply(const DeviceFrame& f)
+    void apply(const dirigera::DeviceFrame& f)
     {
         m_name = QString::fromStdString(f.name);
         m_relation = QString::fromStdString(f.relation);
@@ -552,7 +481,7 @@ private:
         return m_prefix + QLatin1Char('/') + QLatin1String(leaf);
     }
 
-    void applyInventory(const InventoryFrame& inv)
+    void applyInventory(const dirigera::InventoryFrame& inv)
     {
         bool structure_changed = false;
         for (const auto& frame : inv.devices) {
@@ -580,7 +509,7 @@ private:
         Q_EMIT devicesChanged();
     }
 
-    void applyState(const StateFrame& state)
+    void applyState(const dirigera::StateFrame& state)
     {
         const QString id = QString::fromStdString(state.device.id);
         auto* device = find(id);
@@ -624,7 +553,11 @@ private:
                     m_sensors.append(d);
                     break;
                 case Device::Role::Ambient:
-                    if (!hasPresenceTwin(d->relation())) m_sensors.append(d);
+                    // Folded into its motion twin's row when it has one -- see
+                    // dirigera::ownRow.
+                    if (dirigera::ownRow(dirigera::Role::Ambient,
+                                         hasPresenceTwin(d->relation())))
+                        m_sensors.append(d);
                     break;
                 case Device::Role::Control:
                     m_controls.append(d);
@@ -655,7 +588,7 @@ private:
         return nullptr;
     }
 
-    void send(const QString& id, const LightCommand& cmd)
+    void send(const QString& id, const dirigera::LightCommand& cmd)
     {
         qnnt::QnntNode::instance()->publishPacked(topic("light"), cmd);
         // Marked pending, not applied: the hub confirms through the state topic, and until
