@@ -107,7 +107,8 @@ def registry(command):
     # the connection open after answering, so waiting for a close added the full socket
     # timeout to every successful probe -- which silently inflated every timing this
     # harness reported by about two seconds. `# end` exists precisely so a client need not
-    # wait: FEDERATION-PLAN.md phase 1 measured it at 81.6ms -> 0.22ms per command.
+    # wait: measured at 81.6ms per command against 0.47ms, about 170x -- EXAMPLES.txt
+    # section 5.
     s.settimeout(3)
     data = b""
     ends = 0

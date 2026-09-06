@@ -234,6 +234,19 @@ so anything shown to a human can be added without breaking a parser. Every
 non-empty reply ends with '# end', which is how a client knows a multi-line reply
 is complete instead of having to guess with a timeout.
 
+THAT TERMINATOR IS NOT COSMETIC, and it is the sort of thing a later tidy-up
+removes for looking redundant. The protocol had no terminator at first, so a
+client reading a multi-line reply had no way to know it had all of it: the
+registry keeps the connection open after answering, so waiting for a close meant
+waiting out the socket timeout on every single command. Measured before the fix,
+at 81.6 ms per command against 0.47 ms once the reply says where it ends -- about
+170 times slower, on replies that take under a millisecond to produce.
+
+It also bites instruments rather than programs, which is what makes it expensive
+to find. examples/registry/failover.py read until its socket timed out and so
+added roughly two seconds to every measurement it reported, making a failover
+that took 0.2 s look like one that took 2 s.
+
 
 --------------------------------------------------------------------------------
  6. The registry port
