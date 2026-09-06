@@ -241,6 +241,9 @@ fn applyRemoteEntryLocked(entry: RemoteEntry, observed_host: []const u8) !bool {
             .version = entry.version,
             .learned_us = now_us,
             .conflict_us = 0,
+            // Learned from a peer, so its port is on THAT host and says nothing about what
+            // is bound here. The publisher port allocator has to know the difference.
+            .local = false,
         };
         // Subscriber detail is not federated -- only the count, recorded by padding the
         // peer list with placeholders. Detail stays with the host that owns it and is
@@ -278,6 +281,7 @@ fn applyRemoteEntryLocked(entry: RemoteEntry, observed_host: []const u8) !bool {
         held.last_us = now_us;
         held.learned_us = now_us;
         held.conflict_us = now_us;
+        held.local = false;
         try setRemoteSubCount(held, entry.subs, endpoint);
         return true;
     }
@@ -370,7 +374,20 @@ pub fn applyMirrorEntries(text: []const u8, observed_host: []const u8) u64 {
     while (lines.next()) |line| {
         if (line.len == 0 or std.mem.startsWith(u8, line, qnnt.comment_prefix)) continue;
         var it = std.mem.tokenizeAny(u8, line, " \t\r\n");
-        if (!qnnt.eqlAny(it.next() orelse continue, &.{"fed-entry"})) continue;
+        const verb = it.next() orelse continue;
+
+        // The holder's publisher port range, so a standby that takes the role can still
+        // arbitrate. Adopted only when this node has none of its own: a locally configured
+        // range is the operator's statement about this machine's firewall and is never
+        // overridden by what a peer happens to be running.
+        if (qnnt.eqlAny(verb, &.{"mirror-ports"})) {
+            const low = std.fmt.parseInt(u16, it.next() orelse continue, 10) catch continue;
+            const high = std.fmt.parseInt(u16, it.next() orelse continue, 10) catch continue;
+            if (!qnnt.publisherPortsConfigured()) _ = qnnt.setPublisherPortsFn(low, high);
+            continue;
+        }
+
+        if (!qnnt.eqlAny(verb, &.{"fed-entry"})) continue;
         const entry = parseFedEntry(&it) orelse continue;
         if (applyRemoteEntry(entry, observed_host) catch false) applied += 1;
     }
@@ -1097,6 +1114,9 @@ const Held = struct {
     version: u64,
     learned_us: u64,
     conflict_us: u64,
+    /// Registered here rather than learned from a peer -- what the publisher port allocator
+    /// keys on, so a merge test can assert that a learned entry never claims to be local.
+    local: bool,
     subs: usize,
 };
 
@@ -1110,6 +1130,7 @@ fn heldEntry(topic: []const u8) ?Held {
         .version = entry.version,
         .learned_us = entry.learned_us,
         .conflict_us = entry.conflict_us,
+        .local = entry.local,
         .subs = entry.peers.items.len,
     };
 }
@@ -1420,4 +1441,47 @@ test "learning an entry from a peer moves the directory version" {
         .subs = 0,
     }, "10.0.0.12"));
     try testing.expect(qnnt.directory_epoch.load(.monotonic) > after_insert);
+}
+
+test "an entry learned from a peer is never counted as holding a local port" {
+    // The publisher port range is a HOST resource, and the allocator decides what is free
+    // by looking at the directory. A peer running the same range would otherwise fill ours
+    // with ports that are bound on ITS machine, and this host would report itself out of
+    // ports while every one of them was free.
+    var origin: qnnt.NodeId = @splat(0);
+    origin[0] = 0x77;
+
+    try testing.expect(try applyRemoteEntry(.{
+        .origin = origin,
+        .version = 1,
+        .topic = "ports/from/peer",
+        .host = "10.0.0.20",
+        .port = 2300,
+        .subs = 0,
+    }, "10.0.0.20"));
+
+    const held = heldEntry("ports/from/peer").?;
+    try testing.expectEqual(@as(u16, 2300), held.port);
+    try testing.expect(!held.local);
+}
+
+test "the mirror carries a port range only to a node that has none" {
+    // A standby inherits the holder's range so the registry role can move without it being
+    // lost -- `qnnt-ls` and `qnnt-cat` start real nodes and can win the election.
+    _ = qnnt.setPublisherPortsFn(0, 0);
+    try testing.expect(!qnnt.publisherPortsConfigured());
+
+    _ = applyMirrorEntries("mirror-ports 24100 24199\n", "127.0.0.1");
+    try testing.expect(qnnt.publisherPortsConfigured());
+    try testing.expectEqual(@as(u16, 24100), qnnt.publisher_port_low);
+    try testing.expectEqual(@as(u16, 24199), qnnt.publisher_port_high);
+
+    // But a locally configured range is the operator's statement about THIS machine's
+    // firewall, and is never overridden by what some other node happens to be running.
+    try testing.expect(qnnt.setPublisherPortsFn(24200, 24299));
+    _ = applyMirrorEntries("mirror-ports 24100 24199\n", "127.0.0.1");
+    try testing.expectEqual(@as(u16, 24200), qnnt.publisher_port_low);
+    try testing.expectEqual(@as(u16, 24299), qnnt.publisher_port_high);
+
+    _ = qnnt.setPublisherPortsFn(0, 0);
 }

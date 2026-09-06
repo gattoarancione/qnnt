@@ -10,6 +10,7 @@ const testing = std.testing;
 const qnnt = @import("./qnnt.zig").Qnnt;
 const tld = @import("./qnnt.zig").Tld;
 const QueuedMessage = @import("./qnnt.zig").QueuedMessage;
+const fed = @import("./federation.zig");
 
 // A port of our own, so this binary neither disturbs a node the developer is running nor
 // competes with the example programs — which used to have to be serialised against it.
@@ -657,4 +658,190 @@ test "a zero rescan joins what exists now and then stops looking" {
     try testing.expect(qnnt.runPublisher("test/once/later", source, 50_000, null));
     qnnt.sleepMs(1500);
     try testing.expect(!PatternSink.seen("test/once/later"));
+}
+
+/// The port the registry says `topic` should use. Asked the way a publisher asks.
+fn askPort(topic: []const u8, skip: u16) !u16 {
+    var cmd: [128]u8 = undefined;
+    const command = if (skip == 0)
+        try std.fmt.bufPrint(&cmd, "port {s}", .{topic})
+    else
+        try std.fmt.bufPrint(&cmd, "port {s} skip {d}", .{ topic, skip });
+
+    var buf: [512]u8 = undefined;
+    const reply = try qnnt.registryCommand(command, &buf);
+    var lines = std.mem.splitScalar(u8, reply, '\n');
+    while (lines.next()) |line| {
+        const text = std.mem.trim(u8, line, " \t\r");
+        if (text.len == 0 or text[0] == '#') continue;
+        return std.fmt.parseInt(u16, text, 10) catch error.NotAPort;
+    }
+    return error.NoReply;
+}
+
+test "with no range the registry tells a publisher to take what it likes" {
+    try startNode();
+    defer qnnt.deinit();
+
+    // The default, and the whole existing behaviour: port 0, chosen by the OS.
+    try testing.expectEqual(@as(u16, 0), try askPort("test/ports/none", 0));
+}
+
+test "publishers take their ports from the configured range" {
+    try testing.expect(qnnt.setPublisherPorts(23400, 23409));
+    defer _ = qnnt.setPublisherPorts(0, 0);
+
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.runPublisher("test/ports/one", null, null, null));
+    try testing.expect(qnnt.runPublisher("test/ports/two", null, null, null));
+
+    // Registered asynchronously, so wait for the directory rather than guessing.
+    var names: [32][]const u8 = undefined;
+    var buf: [2048]u8 = undefined;
+    var waited: usize = 0;
+    while (waited < 3000) : (waited += 25) {
+        const n = try qnnt.listTopics(&names, &buf);
+        var seen: usize = 0;
+        for (names[0..n]) |name| {
+            if (std.mem.startsWith(u8, name, "test/ports/")) seen += 1;
+        }
+        if (seen >= 2) break;
+        qnnt.sleepMs(25);
+    }
+
+    const one = try askPort("test/ports/one", 0);
+    const two = try askPort("test/ports/two", 0);
+    try testing.expect(one >= 23400 and one <= 23409);
+    try testing.expect(two >= 23400 and two <= 23409);
+    // Two topics never share a port, or one publisher's bind would fail against the other.
+    try testing.expect(one != two);
+
+    // STICKY. Asking again gives the same answer, because the directory already holds it.
+    // This is what makes a stale entry harmless: a restarting publisher reclaims its own
+    // port, so an address a peer is still serving points at the topic it always meant.
+    try testing.expectEqual(one, try askPort("test/ports/one", 0));
+    try testing.expectEqual(two, try askPort("test/ports/two", 0));
+
+    // Unless the asker says that port just failed to bind, which is the race the registry
+    // cannot see: it names a port, it does not hold the socket.
+    const moved = try askPort("test/ports/one", one);
+    try testing.expect(moved != one);
+    try testing.expect(moved >= 23400 and moved <= 23409);
+}
+
+test "a freed port is the last to be handed out again, not the first" {
+    try testing.expect(qnnt.setPublisherPorts(23500, 23503));
+    defer _ = qnnt.setPublisherPorts(0, 0);
+
+    try startNode();
+    defer qnnt.deinit();
+
+    // Four topics that never register, so nothing is held and each ask allocates afresh.
+    // Round-robin means consecutive asks walk the range rather than repeating its floor.
+    const a = try askPort("test/rr/a", 0);
+    const b = try askPort("test/rr/b", 0);
+    const c = try askPort("test/rr/c", 0);
+    try testing.expect(a != b and b != c and a != c);
+
+    // Lowest-free allocation would have answered 23500 every time, since nothing is
+    // registered -- and a port freed by a dead publisher would be reissued immediately,
+    // while a peer may still be serving the address that used to mean it.
+    try testing.expect(a == 23500);
+    try testing.expect(b == 23501);
+    try testing.expect(c == 23502);
+}
+
+test "a full range is refused rather than quietly falling back" {
+    try testing.expect(qnnt.setPublisherPorts(23600, 23601));
+    defer _ = qnnt.setPublisherPorts(0, 0);
+
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.runPublisher("test/full/one", null, null, null));
+    try testing.expect(qnnt.runPublisher("test/full/two", null, null, null));
+
+    var names: [32][]const u8 = undefined;
+    var buf: [2048]u8 = undefined;
+    var waited: usize = 0;
+    while (waited < 3000) : (waited += 25) {
+        const n = try qnnt.listTopics(&names, &buf);
+        var seen: usize = 0;
+        for (names[0..n]) |name| {
+            if (std.mem.startsWith(u8, name, "test/full/")) seen += 1;
+        }
+        if (seen >= 2) break;
+        qnnt.sleepMs(25);
+    }
+
+    // Both slots are held by registered publishers, so a third topic cannot be placed. The
+    // reply is an error, NOT 0: answering 0 would give the publisher an ephemeral port,
+    // which works locally and is unreachable through the firewall the range exists for.
+    try testing.expectError(error.NotAPort, askPort("test/full/three", 0));
+}
+
+test "the range is refused when it is not a range" {
+    try testing.expect(qnnt.setPublisherPorts(2300, 2399));
+    defer _ = qnnt.setPublisherPorts(0, 0);
+
+    // High below low, and port 0 as a bound, are both configuration errors rather than
+    // something to interpret.
+    try testing.expect(!qnnt.setPublisherPorts(2400, 2300));
+    try testing.expect(!qnnt.setPublisherPorts(0, 2300));
+
+    var low: u16 = 0;
+    var high: u16 = 0;
+    try testing.expect(qnnt.parsePublisherPorts("2300-2399", &low, &high));
+    try testing.expectEqual(@as(u16, 2300), low);
+    try testing.expectEqual(@as(u16, 2399), high);
+
+    // A single port is a range of one, which is what pinning one topic looks like.
+    try testing.expect(qnnt.parsePublisherPorts("2300", &low, &high));
+    try testing.expectEqual(low, high);
+
+    try testing.expect(!qnnt.parsePublisherPorts("2399-2300", &low, &high));
+    try testing.expect(!qnnt.parsePublisherPorts("", &low, &high));
+    try testing.expect(!qnnt.parsePublisherPorts("2300-", &low, &high));
+    try testing.expect(!qnnt.parsePublisherPorts("http", &low, &high));
+}
+
+test "a peer's port inside our range does not consume a slot here" {
+    // The range is a HOST resource. A peer running the same range fills the directory with
+    // ports bound on ITS machine; counting those would make this host report itself out of
+    // ports while every one of them was free. Only entries registered here hold a port here.
+    try testing.expect(qnnt.setPublisherPorts(23700, 23701));
+    defer _ = qnnt.setPublisherPorts(0, 0);
+
+    try startNode();
+    defer qnnt.deinit();
+
+    // Two slots, one taken locally.
+    try testing.expect(qnnt.runPublisher("test/peerport/mine", null, null, null));
+    var names: [32][]const u8 = undefined;
+    var buf: [2048]u8 = undefined;
+    var waited: usize = 0;
+    while (waited < 3000) : (waited += 25) {
+        const n = try qnnt.listTopics(&names, &buf);
+        for (names[0..n]) |name| {
+            if (std.mem.eql(u8, name, "test/peerport/mine")) break;
+        } else {
+            qnnt.sleepMs(25);
+            continue;
+        }
+        break;
+    }
+
+    // A federated entry arrives carrying the other slot, on another host's address. Fed in
+    // the way a standby learns one, which is the path that marks an entry as NOT local.
+    const learned = fed.applyMirrorEntries(
+        "fed-entry 5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a 1 test/peerport/theirs 10.9.9.9 23701 0\n",
+        "10.9.9.9",
+    );
+    try testing.expectEqual(@as(u64, 1), learned);
+
+    // The remaining slot is still ours to give, because 23701 is bound on 10.9.9.9.
+    const port = try askPort("test/peerport/other", 0);
+    try testing.expectEqual(@as(u16, 23701), port);
 }

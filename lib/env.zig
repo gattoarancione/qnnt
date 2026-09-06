@@ -18,6 +18,7 @@
 //!   QNNT_REGISTRY_MIRROR   1 (default) or 0: keep a warm copy of the directory
 //!   QNNT_ADVERTISE_ADDR    the address remote subscribers should dial
 //!   QNNT_BIND_ADDR         what publisher sockets bind
+//!   QNNT_PUBLISHER_PORTS   low-high: take publisher ports from this range, not port 0
 //!   QNNT_CLUSTER_KEY       enables federation; required for it
 //!   QNNT_FEDERATION_PORT   federation's port (default 2223, 0 disables)
 //!   QNNT_PEERS             host[:port],... to dial; host may be an address or a name
@@ -151,6 +152,21 @@ pub fn configureFromEnvironment() void {
 
     if (get("QNNT_ADVERTISE_ADDR")) |text| {
         if (!qnnt.setAdvertiseAddressFn(text)) reject("QNNT_ADVERTISE_ADDR", text);
+    }
+
+    // Set this on EVERY node on the host, not just one. It says which ports this machine's
+    // firewall forwards, so it is a property of the machine; a node without it takes an
+    // ephemeral port and is unreachable through that firewall while looking healthy
+    // everywhere else.
+    if (get("QNNT_PUBLISHER_PORTS")) |text| {
+        var low: u16 = 0;
+        var high: u16 = 0;
+        if (qnnt.parsePublisherPorts(text, &low, &high) and qnnt.setPublisherPortsFn(low, high)) {
+            // Nothing to print: the publisher announces the port it actually got, which is
+            // the number that goes in a forwarding rule.
+        } else {
+            reject("QNNT_PUBLISHER_PORTS", text);
+        }
     }
 
     if (get("QNNT_BIND_ADDR")) |text| {

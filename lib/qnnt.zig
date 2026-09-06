@@ -82,6 +82,12 @@ pub const TopicEntry = struct {
     /// address: see the note on `NodeId`.
     origin: NodeId,
 
+    /// Registered by a process on THIS host rather than learned from a peer. The registry
+    /// listens on loopback only, so anything that arrives through `registerTopic` is local
+    /// by construction -- which is what makes this a reliable answer to "is that port in
+    /// use on this machine", the question the publisher port range has to ask.
+    local: bool,
+
     /// The origin's own clock when it last published this state. Only ever compared
     /// against other versions from the SAME origin, which makes clock skew between hosts
     /// irrelevant -- no vector clocks and no NTP dependency -- and is also what stops an
@@ -911,6 +917,14 @@ pub const Qnnt = struct {
     pub const sleepUs = &sleepUsFn;
     pub const nowMicros = &nowMicrosFn;
 
+    /// Take publisher ports from `low..high` instead of letting the OS choose, so a
+    /// firewall can forward them. See the note on the publisher port range. `(0, 0)` puts
+    /// it back to ephemeral. Set before starting publishers.
+    pub const setPublisherPorts = &setPublisherPortsFn;
+
+    /// "2300-2399" -> the pair, for a caller reading its own configuration.
+    pub const parsePublisherPorts = &@import("qnnt.zig").parsePublisherPorts;
+
     /// Registry port control. Set before `run()`; see `setRegistryPort`.
     pub const setRegistryPort = &setRegistryPortFn;
     pub const registryPort = &currentRegistryPort;
@@ -1123,8 +1137,39 @@ fn clientCommand(command: []const u8) !Reply {
             try buffer.print(allocator, "mirror-unchanged {s} {d}\n", .{ mine, epoch });
         } else {
             try buffer.print(allocator, "mirror-state {s} {d}\n", .{ mine, epoch });
+            // The publisher port range travels with the directory, and only here -- it is a
+            // property of THIS HOST's firewall, so federating it would push one host's
+            // forwarding rules onto another where they are meaningless.
+            //
+            // A standby inherits it so that the registry role can move without the range
+            // being lost. That is not hypothetical: `qnnt-ls` and `qnnt-cat` start real
+            // nodes and can win the election, and neither has any reason to be configured
+            // with a port range. Without this, a tool becoming the registry would answer
+            // every publisher "take what you like" and quietly un-forward the whole host.
+            if (publisherPortsConfigured()) {
+                try buffer.print(allocator, "mirror-ports {d} {d}\n",
+                    .{ publisher_port_low, publisher_port_high });
+            }
             try federation.writeFedEntries(&buffer);
         }
+    } else if (eqlAny(verb, &.{"port"})) {
+        // `port <topic>` -> the port that topic should listen on, or 0 for "take what you
+        // like". `port <topic> skip <n>` when the asker has just failed to bind <n>.
+        //
+        // Answered by the registry rather than decided by each publisher because the range
+        // is a HOST resource shared by every process on it, and only the registry sees them
+        // all.
+        const want = it.next() orelse return errorReply(&buffer, "port needs a topic");
+        var avoid: u16 = 0;
+        if (it.next()) |kw| {
+            if (eqlAny(kw, &.{ "skip", "not" })) {
+                avoid = std.fmt.parseInt(u16, it.next() orelse "", 10) catch
+                    return errorReply(&buffer, "skip needs a port");
+            }
+        }
+        const assigned = assignPublisherPort(want, avoid) catch
+            return errorReply(&buffer, "publisher port range is full");
+        try buffer.print(allocator, "{d}\n", .{assigned});
     } else if (eqlAny(verb, &.{"epoch"})) {
         // Deliberately tiny, because it is polled. A pattern subscriber asks this a few
         // times a second and only pays for `list` when the answer has moved.
@@ -1161,6 +1206,7 @@ fn writeHelp(buffer: *std.ArrayList(u8)) !void {
         \\#   sub <topic>          resolve a topic to its publisher URI
         \\#   pub <topic> <uri>    register or refresh a topic's publisher endpoint
         \\#   epoch                who holds the directory, and its version
+        \\#   port <topic> [skip n] the port that topic should listen on, 0 for 'any'
         \\#   mirror [id epoch]    the directory, or 'unchanged' if you are current
         \\#   unpub <topic>        drop a registration
         \\#   peers                other REGISTRIES federated with this one, not subscribers
@@ -1416,6 +1462,15 @@ fn writeStatus(buffer: *std.ArrayList(u8)) !void {
     try buffer.print(allocator, "node {s}\n", .{formatNodeId(&id_buf, node_id)});
     try buffer.print(allocator, "advertise {s}\n", .{advertiseText()});
     try buffer.print(allocator, "port {d}\n", .{registry_port});
+    // Shown because the commonest way to get this wrong is invisible otherwise: a node
+    // holding the registry WITHOUT a range answers every publisher "take what you like",
+    // and the host quietly stops being forwardable while every process looks healthy.
+    if (publisherPortsConfigured()) {
+        try buffer.print(allocator, "publisher-ports {d}-{d}\n",
+            .{ publisher_port_low, publisher_port_high });
+    } else {
+        try buffer.print(allocator, "publisher-ports ephemeral\n", .{});
+    }
     try buffer.print(allocator, "probe-interval {d}ms\n", .{registry_probe_interval_ms});
     try buffer.print(allocator, "bind-retry {d}ms\n", .{registry_bind_retry_ms});
     try buffer.print(allocator, "registry-role {s}\n", .{@tagName(registry_role)});
@@ -1461,6 +1516,7 @@ fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId) !vo
             .version = now_us,
             .learned_us = now_us,
             .conflict_us = 0,
+            .local = true,
         };
         changed = true;
         return;
@@ -1477,6 +1533,7 @@ fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId) !vo
         gop.value_ptr.endpoint = endpoint;
         gop.value_ptr.last_us = now_us;
         gop.value_ptr.version = now_us;
+        gop.value_ptr.local = true;
         return;
     }
 
@@ -1490,6 +1547,7 @@ fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId) !vo
     // before the local publisher's first refresh, so "first" was almost always the remote
     // one and every host ended up preferring someone else's publisher.
     gop.value_ptr.conflict_us = now_us;
+    gop.value_ptr.local = true;
     gop.value_ptr.origin = origin;
     gop.value_ptr.endpoint = endpoint;
     gop.value_ptr.last_us = now_us;
@@ -1733,6 +1791,224 @@ pub fn bindText() []const u8 {
 
     // Nothing asked to be reachable: stay private and expose no port by accident.
     return loopback_text;
+}
+
+// ---------------------------------------------------------------- publisher port range
+//
+// By default a publisher binds port 0 and takes whatever the OS gives it. That is right for
+// a routed network and wrong for one with a firewall in it: nobody can forward a port they
+// cannot predict, which is why federation crosses a NAT happily -- one well-known port per
+// host -- while the data plane does not.
+//
+// A range makes the data plane forwardable. `QNNT_PUBLISHER_PORTS=2300-2399` and one rule
+// covers every topic on the host.
+//
+// THE REGISTRY ARBITRATES, not each publisher independently. Several processes on one host
+// share the range, and only the registry sees all of them; two publishers picking "the
+// first free port" would race, and a publisher picking by hash would collide. So a
+// publisher asks and the registry answers -- with a port, with 0 for "no range here, take
+// what you like", or with a refusal when the range is full.
+//
+// The answer is STICKY, and that matters more than it looks. A federated entry is served
+// for up to `fed_serve_until_us` after a peer learned it, and each hop restarts that clock,
+// so a remote subscriber can hold a dead publisher's address for tens of seconds. The data
+// connection carries no topic name -- a subscriber cannot tell it reached the wrong
+// publisher -- so handing a recycled port to a DIFFERENT topic would deliver one topic's
+// frames under another's name, silently. Stickiness comes from the directory itself: a
+// topic's entry holds its port, so a restarting publisher gets its own port back, and a
+// stale entry still points where it always meant to.
+//
+// Allocation is round-robin over the range rather than lowest-free, for the same reason: a
+// freed port becomes the LAST to be handed out again instead of the first, so reuse takes a
+// full lap of the range instead of happening immediately.
+//
+// The assignment is advisory. The registry does not hold the socket, so a port it names can
+// be taken between the answer and the bind; the publisher says which one failed and asks
+// again.
+
+/// 0,0 means unset: publishers bind port 0 and the registry answers "take what you like".
+pub var publisher_port_low: u16 = 0;
+pub var publisher_port_high: u16 = 0;
+
+/// Where the next round-robin scan starts. Not reset when a port is freed -- that is the
+/// point of it.
+var publisher_port_cursor: u16 = 0;
+
+pub fn publisherPortsConfigured() bool {
+    return publisher_port_low != 0 and publisher_port_high >= publisher_port_low;
+}
+
+pub fn setPublisherPortsFn(low: u16, high: u16) bool {
+    if (low == 0 and high == 0) {
+        publisher_port_low = 0;
+        publisher_port_high = 0;
+        return true;
+    }
+    if (low == 0 or high < low) return false;
+    publisher_port_low = low;
+    publisher_port_high = high;
+    if (publisher_port_cursor < low or publisher_port_cursor > high) publisher_port_cursor = low;
+    return true;
+}
+
+/// "2300-2399" -> the pair. A single port is a range of one.
+pub fn parsePublisherPorts(text: []const u8, low: *u16, high: *u16) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    const dash = std.mem.indexOfScalar(u8, trimmed, '-');
+    const lo_text = if (dash) |d| trimmed[0..d] else trimmed;
+    const hi_text = if (dash) |d| trimmed[d + 1 ..] else trimmed;
+    const lo = std.fmt.parseInt(u16, std.mem.trim(u8, lo_text, " \t"), 10) catch return false;
+    const hi = std.fmt.parseInt(u16, std.mem.trim(u8, hi_text, " \t"), 10) catch return false;
+    if (lo == 0 or hi < lo) return false;
+    low.* = lo;
+    high.* = hi;
+    return true;
+}
+
+pub const PortAssignError = error{RangeFull};
+
+/// How many times a publisher will re-ask after losing a race for the port it was given.
+/// Each attempt costs one loopback round trip and names the port that failed, so the
+/// registry converges quickly; the bound is only here so a host whose range is being eaten
+/// by something else fails loudly instead of spinning.
+const publisher_port_attempts = 8;
+
+/// Bind the listener a publisher will accept on, taking its port from the registry when a
+/// range is configured.
+fn listenForPublisher(topic: []const u8) !net.Server {
+    if (!publisherPortsConfigured()) {
+        const addr: net.IpAddress = try .parse(bindText(), 0);
+        return addr.listen(io, .{ .reuse_address = false });
+    }
+
+    // Two different retries, deliberately not one counter. Waiting for a registry is
+    // unbounded, exactly as `registerLoop` waits -- a node whose registry is mid-election
+    // should come up when it finishes, not give up. Losing a race for a named port is
+    // bounded, because something else on the host is eating the range and spinning on that
+    // would hide it.
+    var avoid: u16 = 0;
+    var lost_races: usize = 0;
+    var announced_wait = false;
+
+    while (!isShuttingDown()) {
+        const port = requestPublisherPort(topic, avoid) orelse {
+            // No registry answered. Retrying rather than falling back to port 0: a range is
+            // configured, so an ephemeral port would be a publisher that works perfectly on
+            // this host and is unreachable from the network the range exists for.
+            if (!announced_wait) {
+                announced_wait = true;
+                std.debug.print(
+                    "publisher {s}: waiting for a registry to assign a port from {d}-{d}\n",
+                    .{ topic, publisher_port_low, publisher_port_high },
+                );
+            }
+            if (!sleepMsInterruptible(registry_probe_interval_ms)) return error.ShuttingDown;
+            continue;
+        };
+
+        if (port == 0) {
+            // The registry has no range, though we do. It is holding the role without the
+            // configuration, which the mirror covers when the role MOVES to it -- but not
+            // when such a node wins the election in the first place, having had nothing to
+            // mirror from.
+            std.debug.print(
+                "publisher {s}: this node wants ports {d}-{d} but the registry assigns none. " ++
+                    "Set QNNT_PUBLISHER_PORTS on every node on this host, including tools.\n",
+                .{ topic, publisher_port_low, publisher_port_high },
+            );
+            return error.NoPortAssigned;
+        }
+
+        const addr: net.IpAddress = try .parse(bindText(), port);
+        return addr.listen(io, .{ .reuse_address = false }) catch |err| {
+            // The registry names a port; it does not hold the socket. Anything on the host
+            // can take it in between, so say which one failed and ask for another.
+            lost_races += 1;
+            if (lost_races >= publisher_port_attempts) {
+                std.debug.print(
+                    "publisher {s}: could not bind any port in {d}-{d} after {d} attempts " ++
+                        "({t}) -- something outside qnnt is using the range\n",
+                    .{ topic, publisher_port_low, publisher_port_high, lost_races, err },
+                );
+                return err;
+            }
+            avoid = port;
+            continue;
+        };
+    }
+    return error.ShuttingDown;
+}
+
+/// Ask the registry for this topic's port. Null when no registry answered, which is
+/// different from an answer of 0.
+fn requestPublisherPort(topic: []const u8, avoid: u16) ?u16 {
+    var cmd_buf: [256]u8 = undefined;
+    const command = if (avoid == 0)
+        std.fmt.bufPrint(&cmd_buf, "port {s}", .{topic}) catch return null
+    else
+        std.fmt.bufPrint(&cmd_buf, "port {s} skip {d}", .{ topic, avoid }) catch return null;
+
+    var reply_buf: [512]u8 = undefined;
+    const reply = registryCommand(command, &reply_buf) catch return null;
+
+    var lines = std.mem.splitScalar(u8, reply, '\n');
+    while (lines.next()) |line| {
+        const text = std.mem.trim(u8, line, " \t\r");
+        if (text.len == 0 or std.mem.startsWith(u8, text, comment_prefix)) continue;
+        // An error reply is not a port. Reported by the caller, which knows the topic.
+        return std.fmt.parseInt(u16, text, 10) catch null;
+    }
+    return null;
+}
+
+/// The port `topic` should listen on: its own if the directory already holds one, otherwise
+/// the next free port in the range. 0 when no range is configured, which means "port 0".
+///
+/// `avoid` is a port the asker has just failed to bind, so it is never handed back.
+fn assignPublisherPort(topic: []const u8, avoid: u16) PortAssignError!u16 {
+    if (!publisherPortsConfigured()) return 0;
+
+    directory_mutex.lockUncancelable(io);
+    defer directory_mutex.unlock(io);
+
+    const low = publisher_port_low;
+    const high = publisher_port_high;
+
+    // Sticky: this topic's own port, if it still holds one in range. Checked before the
+    // scan so a restarting publisher always reclaims what a stale entry still advertises.
+    if (directory.get(topic)) |entry| {
+        const held = entry.endpoint.getPort();
+        if (entry.local and held >= low and held <= high and held != avoid) return held;
+    }
+
+    // Only entries registered HERE hold a port on this machine. A peer's entry may well
+    // carry a port inside our range -- if that host has the same range configured -- and
+    // treating it as taken would exhaust the range with ports that are not ours.
+    const span: usize = @as(usize, high - low) + 1;
+    var i: usize = 0;
+    while (i < span) : (i += 1) {
+        const offset = (@as(usize, publisher_port_cursor - low) + i) % span;
+        const port: u16 = low + @as(u16, @intCast(offset));
+        if (port == avoid) continue;
+
+        var taken = false;
+        var it = directory.iterator();
+        while (it.next()) |kv| {
+            const entry = kv.value_ptr;
+            if (!entry.local) continue;
+            if (entry.endpoint.getPort() != port) continue;
+            // Its own reservation is not a reason to refuse it.
+            if (std.mem.eql(u8, kv.key_ptr.*, topic)) continue;
+            taken = true;
+            break;
+        }
+        if (taken) continue;
+
+        publisher_port_cursor = if (port == high) low else port + 1;
+        return port;
+    }
+    return PortAssignError.RangeFull;
 }
 
 /// The address remote subscribers are told to dial, with `port` filled in. Set it before
@@ -2187,9 +2463,19 @@ fn publisherSchedule(topic: []const u8, source: Qnnt.SourceHandler, period_us: u
 fn nodePublish(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: u64, context: ?*anyopaque) !void {
     // Bind with an ephemeral port (0); the OS fills in the real port, which we read back
     // from the socket.
-    const addr: net.IpAddress = try .parse(bindText(), 0);
-
-    var server = try addr.listen(io, .{ .reuse_address = false });
+    // Port 0 unless this node was given a range, in which case the registry says which.
+    // Asked only when a range is configured HERE, so a node without one behaves exactly as
+    // it always has: no extra round trip, and no dependency on a registry existing before a
+    // publisher can bind.
+    var server = listenForPublisher(topic) catch |err| {
+        // Already explained by listenForPublisher, which knows which of the several
+        // reasons it was. A stack trace here would read as a fault in qnnt rather than as
+        // the configuration problem it is.
+        if (err != error.ShuttingDown) {
+            std.debug.print("publisher {s}: not started\n", .{topic});
+        }
+        return;
+    };
     defer server.deinit(io);
 
     // Tracked so shutdown can break the accept loop below.

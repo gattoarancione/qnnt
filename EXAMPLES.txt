@@ -385,6 +385,66 @@ Notes worth having before deploying this:
   advertised publisher port can read that topic. Port-translating NAT without
   forwarding cannot work either way, since inbound connections are impossible.
 
+  MAKING THE DATA PLANE FORWARDABLE: QNNT_PUBLISHER_PORTS
+
+  Federation crosses a firewall easily because it needs one well-known port per
+  host. The data plane does not, and the reason is that a publisher binds port 0
+  and takes whatever the OS gives it -- nobody can forward a port they cannot
+  predict. So the directory reaches the far side and the frames do not.
+
+    QNNT_PUBLISHER_PORTS=2300-2399
+
+  Publishers then take their listening ports from that range, and one rule covers
+  every topic on the host. Unset -- the default -- is port 0 and today's
+  behaviour exactly: no extra round trip, and no dependency on a registry
+  existing before a publisher can bind.
+
+  THE REGISTRY ARBITRATES. Several processes on one host share the range and only
+  the registry sees them all, so a publisher asks it (`port <topic>`) rather than
+  picking for itself. Two publishers choosing "the first free port" would race;
+  choosing by hash would collide. The answer is a port, 0 for "no range here,
+  take what you like", or a refusal when the range is full.
+
+  THE ANSWER IS STICKY, and that matters more than it looks. A federated entry is
+  served for up to 30 seconds after a peer learned it, and each hop restarts that
+  clock, so a remote subscriber can hold a dead publisher's address for a while.
+  The data connection carries no topic name -- a subscriber cannot tell it reached
+  the wrong publisher -- so handing a recycled port to a DIFFERENT topic would
+  deliver one topic's frames under another's name, silently. Stickiness comes from
+  the directory itself: a topic's entry holds its port, so a restarting publisher
+  reclaims its own, and a stale entry still points where it always meant.
+  Allocation is round-robin for the same reason: a freed port is the LAST to be
+  handed out again, so reuse takes a full lap of the range.
+
+  Three things to get right:
+
+    * SET IT ON EVERY NODE ON THE HOST, tools included. The range describes the
+      machine's firewall, so it is a property of the machine. A node without it
+      takes an ephemeral port and is unreachable through that firewall while
+      looking healthy everywhere else -- and `qnnt-ls` and `qnnt-cat` start real
+      nodes that can win the registry election. A registry holding the role
+      without a range answers every publisher "take what you like" and quietly
+      un-forwards the whole host. `status` reports `publisher-ports` so this is
+      visible rather than inferred. The mirror carries the range to standbys, so
+      the role can MOVE to an unconfigured node safely; it cannot help when such a
+      node wins the election in the first place, having had nothing to mirror.
+
+    * FORWARD PORTS 1:1. A peer records the address it reached us on, which
+      handles a multi-homed host for free -- but it substitutes the HOST only, and
+      the port travels verbatim. A rule that shifts ports (external 12300 ->
+      internal 2300) tells the far side 2300, and it will dial 2300. This works
+      perfectly over WireGuard, which is routed and translates nothing, and fails
+      against a port-shifting NAT.
+
+    * A FULL RANGE REFUSES. The publisher does not start, and says so. Falling
+      back to an ephemeral port would produce a publisher that works on its own
+      host and is unreachable from the network the range exists for.
+
+  This makes qnnt configurable into a firewall or WireGuard setup. It does NOT
+  make it traverse NAT: it helps for publishers ON the gateway host, whose ports
+  the forwarded range actually reaches. Publishers deeper in the network still
+  need routing and forwarding at each level.
+
   Language support is the same everywhere -- C, C++, Python and Zig all read the
   same QNNT_* variables and expose the same setters. Python:
 
