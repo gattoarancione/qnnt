@@ -33,11 +33,29 @@ struct Frame {
     bool ext{};
     bool rtr{};
     bool err{};
+    /// CAN FD rather than classic CAN. NOT derivable from the length: eight bytes or fewer
+    /// is legal in both formats, and the two are different frames to a controller.
+    bool fd{};
+    /// Bit rate switch, and the transmitter's error state. Both belong to the FD data phase
+    /// and mean nothing on a classic frame.
+    bool brs{};
+    bool esi{};
+    /// The payload LENGTH in bytes. 0-8 for classic CAN; for CAN FD one of `fd_lengths`.
     std::uint8_t dlc{};
     std::vector<std::uint8_t> data;
     std::int64_t us{};
-    TLD_DEFINE_MAP(id, ext, rtr, err, dlc, data, us)
+    TLD_DEFINE_MAP(id, ext, rtr, err, fd, brs, esi, dlc, data, us)
 };
+
+/// The payload lengths CAN FD can express. Mirrors fd_lengths in examples/can/frame.zig:
+/// there is nothing between 8 and 12, or 24 and 32.
+inline constexpr std::uint8_t fd_lengths[] = {0, 1, 2, 3, 4, 5, 6, 7, 8,
+                                              12, 16, 20, 24, 32, 48, 64};
+
+[[nodiscard]] inline bool validFdLength(std::uint8_t len)
+{
+    return std::find(std::begin(fd_lengths), std::end(fd_lengths), len) != std::end(fd_lengths);
+}
 
 /// `can/<bus>/<gateway>` split into its two names. Empty `bus` means the topic is not one
 /// of ours -- the station subscribes to a glob, and a glob can match more than intended if
@@ -92,19 +110,27 @@ struct Origin {
     return out;
 }
 
-/// "E" extended, "R" remote, "!" error -- and nothing at all for an ordinary data frame,
+/// "E" extended, "R" remote, "F" CAN FD, "B" bit rate switch, "P" error-passive
+/// transmitter, "!" error frame -- nothing at all for an ordinary classic data frame,
 /// which is most of them.
+///
+/// F is not decoration. A reader has to be able to tell an 8-byte FD frame from an 8-byte
+/// classic one, and nothing else on the row says which it is.
 [[nodiscard]] inline std::string formatFlags(const Frame& f)
 {
     std::string out;
     if (f.ext) out += 'E';
     if (f.rtr) out += 'R';
+    if (f.fd) out += 'F';
+    if (f.brs) out += 'B';
+    if (f.esi) out += 'P';
     if (f.err) out += '!';
     return out;
 }
 
-/// "A1 0A 0D" or "a1 0a0d" or "A1,0A,0D" -> bytes. False when it is not hex, or too long
-/// for a classic CAN frame.
+/// "A1 0A 0D" or "a1 0a0d" or "A1,0A,0D" -> bytes. False when it is not hex, or longer
+/// than a CAN FD frame can carry. Whether that LENGTH is one CAN FD can express is a
+/// separate question, asked by validFdLength; this one is about the text.
 ///
 /// Separators are ignored rather than required, because the text being pasted in comes from
 /// a candump line, a datasheet or a colleague's message, and each punctuates differently.
@@ -125,7 +151,7 @@ struct Origin {
         if (hi < 0) { hi = v; continue; }
         out.push_back(static_cast<std::uint8_t>((hi << 4) | v));
         hi = -1;
-        if (out.size() > 8) return false;
+        if (out.size() > 64) return false;
     }
     return hi < 0;  // a trailing half-byte is a typo, not a value
 }
@@ -202,8 +228,13 @@ private:
 struct IdRow {
     std::uint32_t id{};
     bool ext{};
+    /// Part of the row's KEY, not just something to display: the same identifier sent as
+    /// classic and as FD is two conversations, exactly as standard and extended are.
+    bool fd{};
     bool rtr{};
     bool err{};
+    bool brs{};
+    bool esi{};
     std::string gateway;   // the last gateway to publish it
     std::vector<std::uint8_t> data;
     std::uint8_t dlc{};
@@ -218,11 +249,15 @@ struct IdRow {
 [[nodiscard]] inline std::size_t rowFor(std::vector<IdRow>& rows, const Frame& f)
 {
     const auto it = std::find_if(rows.begin(), rows.end(), [&](const IdRow& r) {
-        return r.id == f.id && r.ext == f.ext;
+        return r.id == f.id && r.ext == f.ext && r.fd == f.fd;
     });
     if (it != rows.end()) return static_cast<std::size_t>(it - rows.begin());
 
-    rows.push_back(IdRow{f.id, f.ext, f.rtr, f.err, {}, {}, 0, {}});
+    IdRow row;
+    row.id = f.id;
+    row.ext = f.ext;
+    row.fd = f.fd;
+    rows.push_back(row);
     return rows.size() - 1;
 }
 

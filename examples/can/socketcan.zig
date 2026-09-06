@@ -22,6 +22,9 @@ pub const Error = error{
     NoSuchInterface,
     /// The interface exists but is down.
     InterfaceDown,
+    /// An FD frame arrived for a socket the kernel would not enable FD on. Relaying it
+    /// would mean sending it as classic, which is a different frame.
+    NoFdSupport,
     SocketFailed,
     BindFailed,
     ReadFailed,
@@ -32,6 +35,10 @@ const can_raw = 1;
 const sol_can_raw = 100 + can_raw;
 const can_raw_err_filter = 2;
 const can_raw_recv_own_msgs = 4;
+const can_raw_fd_frames = 5;
+/// The `flags` byte of a canfd_frame.
+const canfd_brs: u8 = 0x01;
+const canfd_esi: u8 = 0x02;
 /// Every error class the controller can report. The default is 0 -- no error frames at all
 /// -- so a gateway that wants to relay bus health has to ask.
 const can_err_mask: u32 = 0x1FFF_FFFF;
@@ -58,6 +65,24 @@ const can_frame = extern struct {
     data: [8]u8 align(8) = @splat(0),
 };
 
+/// struct canfd_frame. 72 bytes, and the same first five: an FD frame differs from a
+/// classic one in its length, its flags byte -- where the classic struct has padding -- and
+/// sixty-four bytes of payload instead of eight.
+const canfd_frame = extern struct {
+    can_id: u32,
+    len: u8,
+    flags: u8 = 0,
+    _res0: u8 = 0,
+    _res1: u8 = 0,
+    data: [64]u8 align(8) = @splat(0),
+};
+
+/// What the kernel puts on the wire for each, and the only thing that distinguishes them on
+/// a socket carrying both: a read returns exactly one of these two sizes, and which one it
+/// is IS the answer to "was that CAN FD".
+const can_mtu = @sizeOf(can_frame);
+const canfd_mtu = @sizeOf(canfd_frame);
+
 /// struct ifreq, written out rather than taken from std: the standard one is a pair of
 /// anonymous unions, and the two fields we need are far clearer named.
 const ifreq_index = extern struct {
@@ -73,6 +98,13 @@ const ifreq_index = extern struct {
 // offset by a byte, and every value looks plausible.
 comptime {
     std.debug.assert(@sizeOf(can_frame) == 16);
+    std.debug.assert(@sizeOf(canfd_frame) == 72);
+    std.debug.assert(@offsetOf(canfd_frame, "can_id") == 0);
+    std.debug.assert(@offsetOf(canfd_frame, "len") == 4);
+    std.debug.assert(@offsetOf(canfd_frame, "flags") == 5);
+    std.debug.assert(@offsetOf(canfd_frame, "data") == 8);
+    std.debug.assert(can_raw_fd_frames == 5);
+    std.debug.assert(frame.max_data == 64);
     std.debug.assert(@offsetOf(can_frame, "can_id") == 0);
     std.debug.assert(@offsetOf(can_frame, "len") == 4);
     std.debug.assert(@offsetOf(can_frame, "data") == 8);
@@ -97,6 +129,11 @@ pub const Bus = struct {
     fd: c_int,
     /// The interface name, for messages. Borrowed from the caller's arguments.
     iface: []const u8,
+    /// Whether the kernel agreed to deliver CAN FD frames on this socket. False is not an
+    /// error: a kernel or an interface without FD still carries classic traffic perfectly
+    /// well, and refusing to run would take a working gateway off the air over a feature
+    /// its bus may never use.
+    fd_frames: bool,
 
     /// Open `iface` and bind to it, with a read timeout so the reader can notice a
     /// shutdown request instead of blocking in the kernel for ever.
@@ -133,6 +170,16 @@ pub const Bus = struct {
         var err_mask: u32 = can_err_mask;
         _ = std.c.setsockopt(fd, sol_can_raw, can_raw_err_filter, &err_mask, @sizeOf(u32));
 
+        // Ask for CAN FD. On a socket with this set the kernel delivers BOTH formats and
+        // the read size says which arrived; without it, FD frames on the wire are not
+        // delivered at all -- not truncated, simply absent.
+        //
+        // It can legitimately fail on an older kernel, so the answer is recorded rather
+        // than insisted on. Transmitting FD additionally needs the interface MTU at 72,
+        // which is the link's business and not this socket's.
+        var on: c_int = 1;
+        const fd_ok = std.c.setsockopt(fd, sol_can_raw, can_raw_fd_frames, &on, @sizeOf(c_int)) == 0;
+
         var tv: posix.timeval = .{
             .sec = @intCast(read_timeout_ms / 1000),
             .usec = @intCast((read_timeout_ms % 1000) * 1000),
@@ -149,7 +196,7 @@ pub const Bus = struct {
             };
         }
 
-        return .{ .fd = fd, .iface = iface };
+        return .{ .fd = fd, .iface = iface, .fd_frames = fd_ok };
     }
 
     pub fn close(self: *Bus) void {
@@ -168,31 +215,68 @@ pub const Bus = struct {
     /// same eight bytes of a leftover pointer, with a correct identifier and a correct
     /// length in front of it.
     pub fn read(self: *const Bus, payload: *[frame.max_data]u8) Error!?frame.Frame {
-        var raw: can_frame = .{ .can_id = 0, .len = 0 };
-        const n = std.c.read(self.fd, @ptrCast(&raw), @sizeOf(can_frame));
+        // One buffer, big enough for either format. The kernel fills as much as the frame
+        // needs and tells us how much by what it returns.
+        var raw: canfd_frame = .{ .can_id = 0, .len = 0 };
+        const n = std.c.read(self.fd, @ptrCast(&raw), canfd_mtu);
         if (n < 0) {
             return switch (posix.errno(n)) {
                 .AGAIN, .INTR => null,
                 else => Error.ReadFailed,
             };
         }
-        // A short read is not a frame. CAN_RAW delivers whole frames or nothing, so this
-        // means the socket is not what we think it is.
-        if (n != @sizeOf(can_frame)) return Error.ReadFailed;
 
+        // THE READ SIZE IS THE FORMAT. A CAN_RAW socket with FD enabled delivers both, and
+        // this is the only thing that distinguishes them: an eight-byte FD frame and an
+        // eight-byte classic frame are otherwise identical, and they are not the same frame
+        // to a controller. Anything that is neither size is not a frame at all.
+        const kind: frame.Kind = switch (n) {
+            can_mtu => .classic,
+            canfd_mtu => .{
+                .fd = true,
+                .brs = (raw.flags & canfd_brs) != 0,
+                .esi = (raw.flags & canfd_esi) != 0,
+            },
+            else => return Error.ReadFailed,
+        };
+
+        // The classic struct has three reserved bytes where the FD one keeps its flags and
+        // the first of its payload, so a classic frame's eight bytes start at the same
+        // offset either way -- `data` is at offset 8 in both.
         payload.* = raw.data;
-        return frame.fromRaw(raw.can_id, raw.len, payload);
+        return frame.fromRaw(raw.can_id, raw.len, payload, kind);
     }
 
     /// Write one frame. The caller must have checked `frame.writable` first: this is the
     /// kernel boundary, not the policy boundary.
+    ///
+    /// The size written is what tells the kernel which format to transmit, exactly as the
+    /// size read told us which arrived.
     pub fn write(self: *const Bus, f: frame.Frame) Error!void {
+        if (f.fd) {
+            // An FD frame will not go onto an interface whose MTU is still 16: the write
+            // fails with EMSGSIZE. `ip link set <if> mtu 72` is what the link needs, and
+            // examples/can/start-gateway.sh does it.
+            if (!self.fd_frames) return Error.NoFdSupport;
+
+            var raw: canfd_frame = .{ .can_id = frame.rawId(f), .len = f.dlc };
+            if (f.brs) raw.flags |= canfd_brs;
+            if (f.esi) raw.flags |= canfd_esi;
+            const n = @min(f.data.data.len, raw.data.len);
+            @memcpy(raw.data[0..n], f.data.data[0..n]);
+
+            if (std.c.write(self.fd, @ptrCast(&raw), canfd_mtu) != canfd_mtu) {
+                return Error.WriteFailed;
+            }
+            return;
+        }
+
         var raw: can_frame = .{ .can_id = frame.rawId(f), .len = f.dlc };
         const n = @min(f.data.data.len, raw.data.len);
         @memcpy(raw.data[0..n], f.data.data[0..n]);
 
-        const written = std.c.write(self.fd, @ptrCast(&raw), @sizeOf(can_frame));
-        if (written != @sizeOf(can_frame)) {
+        const written = std.c.write(self.fd, @ptrCast(&raw), can_mtu);
+        if (written != can_mtu) {
             // ENOBUFS is the normal one: the interface's transmit queue is full, which on a
             // real bus means the gateway is offering more than the wire can carry.
             return Error.WriteFailed;
@@ -320,4 +404,91 @@ test "the read timeout returns rather than blocking for ever" {
     // only chance to notice it has been asked to shut down.
     var payload: [frame.max_data]u8 = undefined;
     try testing.expect((try bus.read(&payload)) == null);
+}
+
+test "a CAN FD frame round-trips with its length, its flags and all 64 bytes" {
+    var tx = try openOrSkip();
+    defer tx.close();
+    var rx = try openOrSkip();
+    defer rx.close();
+
+    if (!tx.fd_frames) {
+        std.debug.print("skipping: kernel would not enable CAN_RAW_FD_FRAMES\n", .{});
+        return error.SkipZigTest;
+    }
+
+    var payload: [frame.max_data]u8 = undefined;
+    for (&payload, 0..) |*b, i| b.* = @intCast(i);  // every byte different
+
+    try tx.write(.{
+        .id = 0x321, .ext = false, .rtr = false, .err = false,
+        .fd = true, .brs = true, .esi = false,
+        .dlc = 64, .data = .{ .data = &payload }, .us = 0,
+    });
+
+    var got_buf: [frame.max_data]u8 = undefined;
+    const got = (try rx.read(&got_buf)) orelse return error.TestUnexpectedResult;
+
+    try testing.expect(got.fd);
+    try testing.expect(got.brs);
+    try testing.expect(!got.esi);
+    try testing.expectEqual(@as(u32, 0x321), got.id);
+    try testing.expectEqual(@as(u8, 64), got.dlc);
+    // All 64, not the first 8: a classic-sized read would have truncated here silently.
+    try testing.expectEqualSlices(u8, &payload, got.data.data);
+}
+
+test "classic and FD frames are told apart on the same socket" {
+    var tx = try openOrSkip();
+    defer tx.close();
+    var rx = try openOrSkip();
+    defer rx.close();
+
+    if (!tx.fd_frames) return error.SkipZigTest;
+
+    // The same identifier and the same eight-byte payload, sent both ways. Nothing in the
+    // bytes distinguishes them; only the size the kernel delivers does, which is precisely
+    // the thing this asserts.
+    const eight = [_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    try tx.write(.{
+        .id = 0x111, .ext = false, .rtr = false, .err = false, .fd = false,
+        .dlc = 8, .data = .{ .data = &eight }, .us = 0,
+    });
+    try tx.write(.{
+        .id = 0x111, .ext = false, .rtr = false, .err = false, .fd = true,
+        .dlc = 8, .data = .{ .data = &eight }, .us = 0,
+    });
+
+    var buf: [frame.max_data]u8 = undefined;
+    const first = (try rx.read(&buf)) orelse return error.TestUnexpectedResult;
+    try testing.expect(!first.fd);
+    try testing.expectEqualSlices(u8, &eight, first.data.data);
+
+    var buf2: [frame.max_data]u8 = undefined;
+    const second = (try rx.read(&buf2)) orelse return error.TestUnexpectedResult;
+    try testing.expect(second.fd);
+    try testing.expectEqualSlices(u8, &eight, second.data.data);
+}
+
+test "an FD length classic CAN cannot express survives" {
+    var tx = try openOrSkip();
+    defer tx.close();
+    var rx = try openOrSkip();
+    defer rx.close();
+
+    if (!tx.fd_frames) return error.SkipZigTest;
+
+    // 12 bytes: the first length above 8 that CAN FD allows, and one no classic frame can
+    // carry. If anything on the path fell back to classic this would come back as 8.
+    const twelve = [_]u8{ 0xA, 0xB, 0xC, 0xD, 0xE, 0xF, 1, 2, 3, 4, 5, 6 };
+    try tx.write(.{
+        .id = 0x222, .ext = true, .rtr = false, .err = false, .fd = true,
+        .dlc = 12, .data = .{ .data = &twelve }, .us = 0,
+    });
+
+    var buf: [frame.max_data]u8 = undefined;
+    const got = (try rx.read(&buf)) orelse return error.TestUnexpectedResult;
+    try testing.expect(got.fd and got.ext);
+    try testing.expectEqual(@as(u8, 12), got.dlc);
+    try testing.expectEqualSlices(u8, &twelve, got.data.data);
 }

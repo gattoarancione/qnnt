@@ -2005,7 +2005,11 @@ kernel produced it -- so it runs on a mac against gateways on any number of Linu
              its own rate. A gateway that has stopped shows here and nowhere else.
     centre   the bus: one row per CAN identifier, sorted by rate, with the latest payload
              and which gateway last carried it.
-    bottom   send: compose a frame and put it on the bus.
+    bottom   send: compose a frame -- classic or FD -- and put it on the bus.
+
+The flag column reads E extended, R remote, F CAN FD, B bit rate switch, P error-passive
+transmitter, ! error frame. F is not decoration: an eight-byte FD frame and an eight-byte
+classic frame differ in nothing else a row shows, and they are different frames.
 
 Three of its decisions are worth knowing.
 
@@ -2015,8 +2019,8 @@ Three of its decisions are worth knowing.
     counters; the model is rebuilt at 10 Hz.
   * A ROW PER IDENTIFIER, NOT A SCROLLING LOG. A bus repeats a handful of identifiers
     endlessly, so a scroll shows the fastest and hides the rest. Standard and extended
-    identifiers with the same number stay on separate rows, because they are different
-    frames to every controller on the bus.
+    identifiers with the same number stay on separate rows, and so do classic and FD ones,
+    because each pair is two conversations to every controller on the bus.
   * SENDING IS REAL. The station publishes on `can/<bus>/<its own name>` exactly as a
     gateway does, so every gateway on that bus writes the frame to its local interface. It
     is a participant, not an observer, which is why the payload box refuses a malformed
@@ -2132,5 +2136,25 @@ null pointer outright instead of reading (null, 0) as the empty buffer it means 
 threw, and in the station an uncaught exception took the window down. The three writers now
 accept it.
 
-CLASSIC CAN ONLY. CAN FD carries up to 64 bytes and needs CAN_RAW_FD_FRAMES, which this
-gateway does not set. It refuses an over-long frame rather than truncating it.
+CLASSIC CAN AND CAN FD, on the same bus and the same socket. The gateway sets
+CAN_RAW_FD_FRAMES, which makes the kernel deliver both formats -- and the SIZE OF THE READ
+is the only thing that distinguishes them, because an eight-byte FD frame and an eight-byte
+classic frame are otherwise identical and are different frames to a controller. 16 bytes is
+classic, 72 is FD. The same rule runs backwards on transmit: the size written is what tells
+the kernel which to send.
+
+So `fd` is carried on the wire as a field of its own rather than inferred from the length,
+alongside `brs` (the data phase ran at the faster bitrate) and `esi` (the transmitter was
+error-passive). Both belong to the FD data phase, and a classic frame carrying either is
+refused: it describes something that will not happen. CAN FD has no remote frames, so `fd`
+and `rtr` together are refused for the same reason.
+
+CAN FD lengths are not arbitrary. The four-bit code has sixteen values, which mean 0-8, 12,
+16, 20, 24, 32, 48 and 64 -- there is nothing between 8 and 12, or 24 and 32. A frame
+claiming 13 bytes is malformed, not a short 16-byte frame, and is refused rather than padded
+up: three bytes nobody wrote would go onto the bus.
+
+An FD frame will not leave an interface whose MTU is still 16 -- the write fails with
+EMSGSIZE. `ip link set vcan0 mtu 72` is what the link needs, and
+examples/can/start-gateway.sh does it. A vcan at MTU 72 carries classic frames unchanged, so
+it costs nothing.

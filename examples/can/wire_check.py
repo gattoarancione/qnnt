@@ -23,17 +23,24 @@ sys.path.insert(0, "python")
 import qnnt
 
 
-def can_frame(tag: int, seq: int, us: int) -> dict:
+def can_frame(tag: int, seq: int, us: int, fd: bool = False) -> dict:
     """The fields of examples/can/frame.zig's Frame, by the same names."""
+    head = bytes([tag, seq & 0xFF, (seq >> 8) & 0xFF, 0x0A, 0x0D, 0xDE, 0xAD, 0xBE])
+    # Every other frame is CAN FD, with a 12-byte payload -- the first length classic CAN
+    # cannot express, so anything that quietly downgraded it would come back as 8.
+    data = head + bytes([0x11, 0x22, 0x33, 0x44]) if fd else head
     return {
         "id": 0x100 + (tag & 0xFF),
         "ext": False,
         "rtr": False,
         "err": False,
-        "dlc": 8,
+        "fd": fd,
+        "brs": fd,          # an FD frame whose data phase switched bitrate
+        "esi": False,
+        "dlc": len(data),
         # 0x0A and 0x0D in the payload on purpose: a CAN payload is arbitrary bytes, and a
         # text topic would split and rejoin these frames into garbage.
-        "data": bytes([tag, seq & 0xFF, (seq >> 8) & 0xFF, 0x0A, 0x0D, 0xDE, 0xAD, 0xBE]),
+        "data": data,
         "us": us,
     }
 
@@ -75,7 +82,8 @@ def main() -> int:
         seq, end = 0, time.time() + seconds
         while time.time() < end:
             for bus, topic in mine.items():
-                node.publish(topic, qnnt.tld.dumps(can_frame(tag, seq, int(time.time() * 1e6))))
+                node.publish(topic, qnnt.tld.dumps(
+                    can_frame(tag, seq, int(time.time() * 1e6), fd=bool(seq % 2))))
             seq += 1
             time.sleep(0.02)  # 50 Hz per bus
 
@@ -89,8 +97,12 @@ def main() -> int:
                     frame = msg.value()
                     # Enough of the shape to catch a rename or a type change, which is the
                     # failure this would otherwise miss entirely.
-                    assert set(frame) == {"id", "ext", "rtr", "err", "dlc", "data", "us"}
+                    assert set(frame) == {"id", "ext", "rtr", "err", "fd", "brs", "esi",
+                                          "dlc", "data", "us"}
                     assert isinstance(frame["data"], bytes) and len(frame["data"]) == frame["dlc"]
+                    # An FD frame here carries 12 bytes, which classic CAN cannot express,
+                    # so a path that downgraded it would arrive as 8 and fail this.
+                    assert frame["dlc"] == (12 if frame["fd"] else 8)
                 except Exception:
                     malformed += 1
                     continue

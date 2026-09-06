@@ -280,6 +280,15 @@ void canStation()
     check(can::formatFlags(flagged) == "E!", "flags concatenate");
     check(can::formatFlags(can::Frame{}).empty(), "an ordinary frame has no flags");
 
+    // F is what distinguishes an 8-byte FD frame from an 8-byte classic one. Nothing else
+    // on the row does, so its absence would make the two indistinguishable on screen.
+    can::Frame fd_frame;
+    fd_frame.fd = true;
+    fd_frame.brs = true;
+    check(can::formatFlags(fd_frame) == "FB", "an FD frame says so, with its bitrate switch");
+    fd_frame.esi = true;
+    check(can::formatFlags(fd_frame) == "FBP", "and an error-passive transmitter");
+
     // -- the inject box. This one puts frames on a real bus, so what it refuses matters
     // more than what it accepts.
     std::vector<std::uint8_t> bytes;
@@ -290,7 +299,20 @@ void canStation()
     check(can::parseHex("", bytes) && bytes.empty(), "empty is a valid empty payload");
     check(!can::parseHex("12 3", bytes), "an odd digit count is refused, not padded");
     check(!can::parseHex("zz", bytes), "non-hex is refused");
-    check(!can::parseHex("0011223344556677 88", bytes), "more than 8 bytes is refused");
+    // 64 bytes is the CAN FD limit and the parser's; whether a LENGTH is one FD can
+    // express is validFdLength's question, not this one's.
+    check(can::parseHex(std::string(128, 'A'), bytes) && bytes.size() == 64,
+          "64 bytes parses");
+    check(!can::parseHex(std::string(130, 'A'), bytes), "more than 64 bytes is refused");
+
+    // The lengths CAN FD can express. There is nothing between 8 and 12, or 24 and 32:
+    // padding a 13-byte payload up to 16 would put three bytes on a bus nobody wrote.
+    for (const std::uint8_t n : {0, 1, 8, 12, 16, 20, 24, 32, 48, 64}) {
+        check(can::validFdLength(n), "a legal FD length is accepted");
+    }
+    for (const std::uint8_t n : {9, 10, 11, 13, 17, 25, 33, 49, 63, 65}) {
+        check(!can::validFdLength(n), "an illegal FD length is refused");
+    }
 
     // -- the rate. The property that matters is that it can FALL: a count-since-start
     // average would report a dead gateway's last healthy rate for ever.
@@ -317,6 +339,13 @@ void canStation()
     f.ext = true;
     check(can::rowFor(rows, f) == 1 && rows.size() == 2,
           "standard and extended ids with the same number stay apart");
+
+    // And so do classic and FD. The same identifier carried both ways is two
+    // conversations, and merging them would interleave one row from two sources.
+    f.ext = false;
+    f.fd = true;
+    check(can::rowFor(rows, f) == 2 && rows.size() == 3,
+          "classic and FD with the same identifier stay apart");
 }
 
 /// The CAN wire format across the language boundary, pinned to bytes packed by Zig from
@@ -333,9 +362,15 @@ void canBoundary()
     check(f.ext, "ext crosses as true");
     check(!f.rtr, "rtr crosses as false");
     check(!f.err, "err crosses as false");
-    check(f.dlc == 8, "dlc crosses");
+    check(f.fd, "fd crosses as true");
+    check(f.brs, "brs crosses as true");
+    check(!f.esi, "esi crosses as false");
+    check(f.dlc == 12, "dlc crosses");
     check(f.us == 1700000000123456LL, "us crosses");
-    check(f.data == std::vector<std::uint8_t>({0xA1, 0x0A, 0x0D, 0x00, 0xFF, 0xDE, 0xAD, 0x5A}),
+    // Twelve bytes: the first length classic CAN cannot express, so a path that quietly
+    // downgraded this frame could not have produced it.
+    check(f.data == std::vector<std::uint8_t>({0xA1, 0x0A, 0x0D, 0x00, 0xFF, 0xDE, 0xAD,
+                                               0x5A, 0x11, 0x22, 0x33, 0x44}),
           "the payload crosses byte for byte, 0x0A and 0x0D included");
 
     // An empty payload is a legal CAN frame -- DLC 0, and every RTR frame -- and it has to
@@ -352,6 +387,19 @@ void canBoundary()
     check(empty_back.id == 0x400 && empty_back.dlc == 0 && empty_back.data.empty(),
           "and unpacks back to an empty payload");
 
+    // 64 bytes through the encoder, which is eight times what classic CAN could carry and
+    // the case a fixed 8-byte buffer anywhere on the path would truncate.
+    can::Frame big;
+    big.id = 0x500;
+    big.fd = true;
+    big.brs = true;
+    big.dlc = 64;
+    big.data.resize(64);
+    for (std::size_t i = 0; i < big.data.size(); ++i) big.data[i] = std::uint8_t(i);
+    const auto big_back = qnnt::tld::unpack<can::Frame>(qnnt::tld::pack(big));
+    check(big_back.fd && big_back.brs && big_back.dlc == 64, "a 64-byte FD frame round-trips");
+    check(big_back.data == big.data, "with all 64 bytes intact");
+
     // The same hole, reached through a string rather than a buffer.
     can::Frame rtr;
     rtr.id = 0x201;
@@ -363,8 +411,8 @@ void canBoundary()
 
     // And the station's own rendering of it, so the golden also pins what reaches a screen.
     check(can::formatId(f.id, f.ext) == "0x01ABCDEF", "the golden frame renders its id");
-    check(can::formatData(f.data) == "A1 0A 0D 00 FF DE AD 5A", "and its payload");
-    check(can::formatFlags(f) == "E", "and its flags");
+    check(can::formatData(f.data) == "A1 0A 0D 00 FF DE AD 5A 11 22 33 44", "and its payload");
+    check(can::formatFlags(f) == "EFB", "and its flags");
 }
 
 } // namespace

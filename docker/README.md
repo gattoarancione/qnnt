@@ -311,8 +311,8 @@ zig build can -Dtarget=x86_64-linux-gnu     # Intel, or --platform linux/amd64
 docker/can.sh
 ```
 
-Four hosts, each with its own `vcan0` and `vcan1`, bridged so that a frame put on one
-appears on all the others. Two logical buses ride the same mesh and never mix, and one host
+Four hosts, each with its own `vcan0` and `vcan1` (at MTU 72, so they carry CAN FD as well
+as classic frames), bridged so that a frame put on one appears on all the others. Two logical buses ride the same mesh and never mix, and one host
 bridges only the first — it is federated with hosts carrying the second and must never see
 any of it. Full documentation in EXAMPLES.txt section 21.
 

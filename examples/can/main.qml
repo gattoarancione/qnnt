@@ -221,7 +221,7 @@ Window {
                       margins: 14; topMargin: 10 }
             spacing: 12
             Text { text: "ID";     color: root.dim; font.pixelSize: 11; Layout.preferredWidth: 92 }
-            Text { text: "";       color: root.dim; font.pixelSize: 11; Layout.preferredWidth: 24 }
+            Text { text: "";       color: root.dim; font.pixelSize: 11; Layout.preferredWidth: 44 }
             Text { text: "DLC";    color: root.dim; font.pixelSize: 11; Layout.preferredWidth: 32 }
             Text { text: "DATA";   color: root.dim; font.pixelSize: 11; Layout.fillWidth: true }
             Text { text: "FROM";   color: root.dim; font.pixelSize: 11; Layout.preferredWidth: 80 }
@@ -272,7 +272,7 @@ Window {
                         color: root.mine
                         font.pixelSize: 12
                         font.family: "Menlo"
-                        Layout.preferredWidth: 24
+                        Layout.preferredWidth: 44
                     }
                     Text {
                         text: modelData.dlc
@@ -362,18 +362,47 @@ Window {
                                     leftPadding: extBox.indicator.width + 4
                                     verticalAlignment: Text.AlignVCenter }
             }
+            // rtr and fd are mutually exclusive: CAN FD has no remote frames. Each
+            // disables the other rather than letting a combination be composed that no
+            // controller could transmit; station.cpp guards it again behind this.
             CheckBox {
                 id: rtrBox
                 text: "rtr"
-                contentItem: Text { text: rtrBox.text; color: root.dim; font.pixelSize: 12
+                enabled: !fdBox.checked
+                contentItem: Text { text: rtrBox.text
+                                    color: rtrBox.enabled ? root.dim : Qt.darker(root.dim, 1.6)
+                                    font.pixelSize: 12
                                     leftPadding: rtrBox.indicator.width + 4
+                                    verticalAlignment: Text.AlignVCenter }
+            }
+            CheckBox {
+                id: fdBox
+                text: "fd"
+                enabled: !rtrBox.checked
+                contentItem: Text { text: fdBox.text
+                                    color: fdBox.enabled ? root.dim : Qt.darker(root.dim, 1.6)
+                                    font.pixelSize: 12
+                                    leftPadding: fdBox.indicator.width + 4
+                                    verticalAlignment: Text.AlignVCenter }
+            }
+            // The bit rate switch belongs to the FD data phase, so it is only offered when
+            // there is one.
+            CheckBox {
+                id: brsBox
+                text: "brs"
+                enabled: fdBox.checked
+                contentItem: Text { text: brsBox.text
+                                    color: brsBox.enabled ? root.dim : Qt.darker(root.dim, 1.6)
+                                    font.pixelSize: 12
+                                    leftPadding: brsBox.indicator.width + 4
                                     verticalAlignment: Text.AlignVCenter }
             }
 
             TextField {
                 id: dataField
                 text: "DE AD BE EF"
-                placeholderText: "payload, hex"
+                placeholderText: fdBox.checked ? "payload, hex -- 0-8, 12, 16, 20, 24, 32, 48 or 64 bytes"
+                                               : "payload, hex -- up to 8 bytes"
                 Layout.fillWidth: true
                 color: "#e6e9ef"
                 font.family: "Menlo"
@@ -386,7 +415,8 @@ Window {
                 text: "Send to " + (station.selectedBus || "...")
                 enabled: station.selectedBus !== ""
                 onClicked: station.send(station.selectedBus, idField.text,
-                                        extBox.checked, rtrBox.checked, dataField.text)
+                                        extBox.checked, rtrBox.checked, fdBox.checked,
+                                        brsBox.checked, dataField.text)
                 contentItem: Text {
                     text: parent.text
                     color: parent.enabled ? "#12141a" : root.dim

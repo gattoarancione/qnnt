@@ -216,8 +216,8 @@ public Q_SLOTS:
 
     /// Publish a frame as if this station were a gateway on `bus`. Every gateway subscribed
     /// to that bus writes it to its local interface, so this reaches real hardware.
-    void send(const QString& bus, const QString& id_text, bool ext, bool rtr,
-              const QString& data_hex)
+    void send(const QString& bus, const QString& id_text, bool ext, bool rtr, bool fd,
+              bool brs, const QString& data_hex)
     {
         bool ok = false;
         // Base 0, so 0x123 and 291 both work and neither is guessed at.
@@ -232,16 +232,31 @@ public Q_SLOTS:
 
         std::vector<std::uint8_t> data;
         if (!can::parseHex(data_hex.toStdString(), data)) {
-            return fail(QStringLiteral("payload is not 0-8 bytes of hex"));
+            return fail(QStringLiteral("payload is not hex, or is over 64 bytes"));
+        }
+        const auto len = std::uint8_t(data.size());
+        if (fd && !can::validFdLength(len)) {
+            // Padding to the next legal size would put bytes on a real bus that nobody
+            // wrote, so the length is refused and the legal ones are named.
+            return fail(QStringLiteral("CAN FD has no %1-byte frame; use 0-8, 12, 16, 20, "
+                                       "24, 32, 48 or 64").arg(len));
+        }
+        if (!fd && len > 8) {
+            return fail(QStringLiteral("classic CAN carries at most 8 bytes -- tick FD"));
         }
 
         can::Frame f;
         f.id = id;
         f.ext = ext;
-        f.rtr = rtr;
         f.err = false;  // never injectable: an error frame describes a bus, and this is not one
-        f.dlc = std::uint8_t(rtr ? data.size() : data.size());
-        f.data = rtr ? std::vector<std::uint8_t>{} : data;
+        f.fd = fd;
+        // CAN FD has no remote frames, so the two cannot both be set; the view disables one
+        // when the other is ticked, and this is the guard behind it.
+        f.rtr = rtr && !fd;
+        f.brs = fd && brs;
+        f.esi = false;  // the transmitter's own state, not something a sender asserts
+        f.dlc = len;
+        f.data = f.rtr ? std::vector<std::uint8_t>{} : data;
         // The C entry point: the Qt wrapper does not surface a clock, and this stamp has
         // to be the same one a gateway would use.
         f.us = qnnt_now_micros();
@@ -303,6 +318,8 @@ private Q_SLOTS:
         auto& row = bus.rows[can::rowFor(bus.rows, f)];
         row.rtr = f.rtr;
         row.err = f.err;
+        row.brs = f.brs;
+        row.esi = f.esi;
         row.dlc = f.dlc;
         row.data = f.data;
         row.gateway = origin.gateway;
@@ -312,13 +329,18 @@ private Q_SLOTS:
     }
 
 private:
+    /// The row's flags, through the same function a single frame uses, so the table and
+    /// anything else that prints a frame cannot disagree about what "F" means.
     static std::string rowFlags(const can::IdRow& row)
     {
-        std::string out;
-        if (row.ext) out += 'E';
-        if (row.rtr) out += 'R';
-        if (row.err) out += '!';
-        return out;
+        can::Frame f;
+        f.ext = row.ext;
+        f.rtr = row.rtr;
+        f.err = row.err;
+        f.fd = row.fd;
+        f.brs = row.brs;
+        f.esi = row.esi;
+        return can::formatFlags(f);
     }
 
     void fail(const QString& why)

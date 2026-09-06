@@ -24,6 +24,10 @@ ARGS=()
 for spec in "$@"; do
   iface="${spec#*=}"
   ip link add dev "$iface" type vcan 2>/dev/null
+  # MTU 72 carries a CAN FD frame; the default 16 carries only classic, and an FD write to
+  # it fails with EMSGSIZE. A vcan at 72 still carries classic frames unchanged, so this
+  # costs nothing and is what a real FD-capable interface would be set to.
+  ip link set "$iface" mtu 72 2>/dev/null
   ip link set up "$iface" || { echo "start-gateway.sh: cannot bring up $iface"; exit 3; }
   ARGS+=(--bus "$spec")
 done

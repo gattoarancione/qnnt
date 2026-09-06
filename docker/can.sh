@@ -119,7 +119,9 @@ run_socket_tests() {
   echo "== the SocketCAN layer =="
   local out
   out=$(docker run --rm --cap-add NET_ADMIN --entrypoint bash qnnt-fed -c '
-      ip link add dev vcantest type vcan && ip link set up vcantest &&
+      ip link add dev vcantest type vcan &&
+      ip link set vcantest mtu 72 &&
+      ip link set up vcantest &&
       /qnnt/bin/qnnt-can-test' 2>&1)
   if echo "$out" | grep -q "All .* tests passed"; then
     check "socket round trip, 29-bit ids, and no read-back of our own writes" 1
@@ -169,6 +171,11 @@ run_full() {
     >/dev/null 2>&1
   $CAN exec -T alpha python3 /qnnt/examples/can/traffic.py send vcan1 --count 20 --tag 0xB1 \
     >/dev/null 2>&1
+  # CAN FD: 64 bytes with the bit rate switch set. Eight times what classic CAN carries, so
+  # anything on the path that fell back to a classic frame arrives as 8 bytes and fails the
+  # check below rather than looking like a slightly short frame.
+  $CAN exec -T alpha python3 /qnnt/examples/can/traffic.py send vcan0 --count 20 --tag 0xF1 \
+    --fd --brs --len 64 >/dev/null 2>&1
   wait   # for the watchers to finish their 8 seconds and write their summaries
 
   count_tag() { grep -o "0x$2=[0-9]*" "/tmp/can-$1.log" 2>/dev/null | tail -1 | cut -d= -f2; }
@@ -199,6 +206,20 @@ run_full() {
   # 4.
   check "the host outside the cluster key saw nothing" \
     "$([ -z "$z" ] && echo 1 || echo 0)" "(zulu saw ${z:-0} frames)"
+
+  # CAN FD. A frame that arrived as 8 bytes instead of 64, or without its F and B flags,
+  # was downgraded somewhere on the path -- which is the failure worth catching, because a
+  # downgraded frame still looks like a frame.
+  fd_at() { grep -c '\[64\]' "/tmp/can-$1.log" 2>/dev/null || echo 0; }
+  brs_at() { grep -c 'FB ' "/tmp/can-$1.log" 2>/dev/null || echo 0; }
+  local fd_b fd_c brs_b
+  fd_b=$(fd_at bravo-pt); fd_c=$(fd_at charlie-pt); brs_b=$(brs_at bravo-pt)
+
+  check "64-byte CAN FD frames crossed the mesh whole" \
+    "$([ "${fd_b:-0}" = "20" ] && [ "${fd_c:-0}" = "20" ] && echo 1 || echo 0)" \
+    "(bravo ${fd_b:-0}, charlie ${fd_c:-0} of 20)"
+  check "and kept their FD and bit-rate-switch flags" \
+    "$([ "${brs_b:-0}" = "20" ] && echo 1 || echo 0)" "(bravo saw ${brs_b:-0} of 20 flagged FB)"
 
   $CAN down -v --remove-orphans >/dev/null 2>&1
 }
