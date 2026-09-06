@@ -90,6 +90,22 @@ When federation is enabled, these sockets bind 0.0.0.0. That is required for a r
 subscriber to reach them and is not a bug, but it does mean enabling federation moves every
 topic's payload from loopback to every interface.
 
+QNNT_PUBLISHER_PORTS deserves a note here, because it is the one setting whose whole purpose
+is to make this plane reachable through a firewall. It takes publisher ports from a fixed
+range instead of letting the OS choose, so that a forwarding rule can name them -- see
+EXAMPLES.txt section 7.
+
+It changes nothing about what is exposed. The endpoint was never a secret: it is in the
+directory and federation hands it to every peer, and an ephemeral port is not a defence, it
+is only a port you could not have forwarded on purpose. What the range changes is how easy
+it is to expose these sockets DELIBERATELY, and the exposure is the whole of section 4:
+forwarding that range into a network you do not trust gives everyone who can reach it every
+message published on that host, with no authentication and no way for the publisher to know.
+
+So the range is for the inside of a tunnel, or for a segment you already trust. It makes
+qnnt fit a WireGuard or firewall topology; it does not make section 6 optional. If you find
+yourself forwarding it to the internet, the thing to reach for is section 9.
+
 Subscribers are equally unprotected in the other direction: a subscription connects to
 whatever address the registry returned and reads it as authoritative. A peer that can write
 to the directory can therefore redirect a topic's subscribers to a host of its choosing --

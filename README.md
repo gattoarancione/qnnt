@@ -174,6 +174,10 @@ topic; the registry assigns from the range, stickily, so a restarting publisher 
 its own port. Forward **1:1** — the port travels verbatim through federation even though
 the host is substituted. See EXAMPLES.txt §7.
 
+**It does not make those sockets safe to expose.** The data plane authenticates nobody:
+whoever reaches a publisher port reads every message on that topic. The range is for the
+inside of a tunnel, or a segment you already trust — `SECURITY.txt`.
+
 ## Examples
 
 | Path | What it shows |
@@ -189,6 +193,15 @@ the host is substituted. See EXAMPLES.txt §7.
 | `examples/cpp_logic_test.cpp` | The Qt-free C++ logic, 165 checks |
 
 Full walkthroughs, with the reasoning behind each decision: **`EXAMPLES.txt`**.
+
+## Documentation
+
+| File | What it is |
+|---|---|
+| `EXAMPLES.txt` | Every example and subsystem, with the reasoning behind each decision |
+| `SECURITY.txt` | The threat model: what qnnt protects, what it does not, and which gaps are decisions. **Read §6 before deploying anything.** |
+| `BENCHMARK.txt` | Measured throughput and latency on real hosts and links, with the conditions for each figure |
+| `docker/README.md` | The container harnesses, and why they exist |
 
 ## Testing
 

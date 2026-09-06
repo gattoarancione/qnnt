@@ -458,6 +458,11 @@ Notes worth having before deploying this:
   the forwarded range actually reaches. Publishers deeper in the network still
   need routing and forwarding at each level.
 
+  AND IT DOES NOT MAKE THE DATA PLANE SAFE TO EXPOSE. A forwarded range is a hole
+  punched straight to sockets that authenticate nobody: whoever reaches them reads
+  every message on that host. The range is for the inside of a tunnel, or a segment
+  you already trust. SECURITY.txt section 4.
+
   `docker/federation.sh ports` checks it across six real hosts -- see section 20.
 
   Language support is the same everywhere -- C, C++, Python and Zig all read the
