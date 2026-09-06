@@ -156,6 +156,42 @@ struct Origin {
     return hi < 0;  // a trailing half-byte is a typo, not a value
 }
 
+/// The bounds on a repeat period, in milliseconds.
+///
+/// One millisecond is a thousand frames a second, roughly what a full 500 kbit/s bus
+/// carries, and reproducing that load is a real thing to want.
+///
+/// The achieved rate is the machine's to give, not this station's to promise. Measured by
+/// an independent subscriber over a four-second window, on a quiet laptop: a 10 ms period
+/// delivered 101 frames/s and a 2 ms period 504 frames/s -- both exact -- while a 1 ms
+/// period delivered about 894, an actual period nearer 1.12 ms. So the shortest setting is
+/// the one where the request and the result part company, and the row's own rate column is
+/// what actually went out. Believe that, not the box.
+///
+/// Zero is not a period. Qt reads a zero-interval timer as "whenever the event loop is
+/// idle", which is a busy loop that would saturate a core and flood the mesh rather than
+/// pace anything.
+inline constexpr int min_period_ms = 1;
+inline constexpr int max_period_ms = 60000;
+
+/// "100" -> 100 milliseconds. Zero when the text is not a period this station will honour.
+///
+/// Refused rather than clamped: a period outside the bounds is a typo, and quietly
+/// substituting a different one reports a load the bus is not carrying.
+[[nodiscard]] inline int parsePeriodMs(const std::string& text)
+{
+    if (text.empty()) return 0;
+    long value = 0;
+    for (const char c : text) {
+        if (c == ' ' || c == '\t') continue;
+        if (c < '0' || c > '9') return 0;
+        value = value * 10 + (c - '0');
+        if (value > max_period_ms) return 0;
+    }
+    if (value < min_period_ms) return 0;
+    return static_cast<int>(value);
+}
+
 /// Frames per second over a sliding window.
 ///
 /// A count-since-start average is useless on a bus: it cannot fall, so a gateway that died
@@ -241,24 +277,28 @@ struct IdRow {
     Rate rate;
 };
 
-/// Where a row for `f` belongs in `rows`, inserting one if this identifier is new.
+/// Whether `f` belongs on the row `r`.
 ///
-/// Keyed on the identifier AND on `ext`, because 0x123 standard and 0x123 extended are
-/// different frames to every controller on the bus, and merging them would show one
-/// conversation as two interleaved ones.
-[[nodiscard]] inline std::size_t rowFor(std::vector<IdRow>& rows, const Frame& f)
+/// The identifier alone is not the identity. 0x123 standard, 0x123 extended and 0x123 sent
+/// as CAN FD are three different frames to every controller on the bus, and folding them
+/// into one row would show three conversations interleaved as one.
+[[nodiscard]] inline bool sameRow(const IdRow& r, const Frame& f)
 {
-    const auto it = std::find_if(rows.begin(), rows.end(), [&](const IdRow& r) {
-        return r.id == f.id && r.ext == f.ext && r.fd == f.fd;
-    });
-    if (it != rows.end()) return static_cast<std::size_t>(it - rows.begin());
+    return r.id == f.id && r.ext == f.ext && r.fd == f.fd;
+}
 
-    IdRow row;
-    row.id = f.id;
-    row.ext = f.ext;
-    row.fd = f.fd;
-    rows.push_back(row);
-    return rows.size() - 1;
+/// Where a new row for `f` goes, so the table stays ordered by identifier.
+///
+/// Ordered rather than sorted on every repaint, and by IDENTIFIER rather than by rate. Rate
+/// ordering looked right in a screenshot and is unusable in motion: live rates cross
+/// constantly, so rows swap places under the pointer several times a second. cansniffer
+/// orders by identifier for the same reason -- the rate is a column you read, not a
+/// position you chase.
+[[nodiscard]] inline bool rowPrecedes(const IdRow& a, const IdRow& b)
+{
+    if (a.id != b.id) return a.id < b.id;
+    if (a.ext != b.ext) return !a.ext;
+    return !a.fd && b.fd;
 }
 
 }  // namespace can

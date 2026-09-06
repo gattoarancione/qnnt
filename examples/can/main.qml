@@ -33,6 +33,19 @@ Window {
     readonly property color mine: "#ffc75a"       // this station's own traffic
     readonly property color dim: "#7f8794"
 
+    // Every control in the send box, handed over in one call. Called whenever any of them
+    // changes WHILE a repeat is running, so editing the payload mid-repeat changes what is
+    // being sent instead of being ignored until it is toggled off and on again.
+    function applyRepeat() {
+        station.setRepeat(repeatBox.checked, station.selectedBus, idField.text,
+                          extBox.checked, rtrBox.checked, fdBox.checked, brsBox.checked,
+                          dataField.text, periodField.text)
+    }
+
+    function reapply() {
+        if (repeatBox.checked) applyRepeat()
+    }
+
     function rateText(r) {
         if (r <= 0) return "--"
         return r < 10 ? r.toFixed(1) + "/s" : Math.round(r) + "/s"
@@ -169,11 +182,13 @@ Window {
                             Layout.fillWidth: true
                             spacing: 6
 
+
                             Rectangle {
                                 width: 7; height: 7; radius: 4
                                 color: modelData.stale ? root.warn
                                      : modelData.self ? root.mine : root.ok
                             }
+
                             Text {
                                 text: modelData.name
                                 color: modelData.stale ? root.warn : "#c8cdd6"
@@ -347,6 +362,7 @@ Window {
             TextField {
                 id: idField
                 text: "0x123"
+                onTextChanged: root.reapply()
                 placeholderText: "id"
                 Layout.preferredWidth: 100
                 color: "#e6e9ef"
@@ -358,6 +374,7 @@ Window {
             CheckBox {
                 id: extBox
                 text: "ext"
+                onToggled: root.reapply()
                 contentItem: Text { text: extBox.text; color: root.dim; font.pixelSize: 12
                                     leftPadding: extBox.indicator.width + 4
                                     verticalAlignment: Text.AlignVCenter }
@@ -368,6 +385,7 @@ Window {
             CheckBox {
                 id: rtrBox
                 text: "rtr"
+                onToggled: root.reapply()
                 enabled: !fdBox.checked
                 contentItem: Text { text: rtrBox.text
                                     color: rtrBox.enabled ? root.dim : Qt.darker(root.dim, 1.6)
@@ -378,6 +396,7 @@ Window {
             CheckBox {
                 id: fdBox
                 text: "fd"
+                onToggled: root.reapply()
                 enabled: !rtrBox.checked
                 contentItem: Text { text: fdBox.text
                                     color: fdBox.enabled ? root.dim : Qt.darker(root.dim, 1.6)
@@ -390,6 +409,7 @@ Window {
             CheckBox {
                 id: brsBox
                 text: "brs"
+                onToggled: root.reapply()
                 enabled: fdBox.checked
                 contentItem: Text { text: brsBox.text
                                     color: brsBox.enabled ? root.dim : Qt.darker(root.dim, 1.6)
@@ -401,6 +421,7 @@ Window {
             TextField {
                 id: dataField
                 text: "DE AD BE EF"
+                onTextChanged: root.reapply()
                 placeholderText: fdBox.checked ? "payload, hex -- 0-8, 12, 16, 20, 24, 32, 48 or 64 bytes"
                                                : "payload, hex -- up to 8 bytes"
                 Layout.fillWidth: true
@@ -409,6 +430,44 @@ Window {
                 enabled: !rtrBox.checked   // a remote request carries no data
                 background: Rectangle { color: root.card; radius: 4
                                         border.width: 1; border.color: root.panelEdge }
+            }
+
+            // The repeat, and its period. Almost every message on a vehicle bus is
+            // periodic, so this is what a receiver under test is actually written against;
+            // a single frame only proves the path works.
+            CheckBox {
+                id: repeatBox
+                text: "every"
+                enabled: station.selectedBus !== ""
+                onToggled: root.applyRepeat()
+                contentItem: Text { text: repeatBox.text
+                                    color: repeatBox.enabled ? root.dim : Qt.darker(root.dim, 1.6)
+                                    font.pixelSize: 12
+                                    leftPadding: repeatBox.indicator.width + 4
+                                    verticalAlignment: Text.AlignVCenter }
+            }
+
+            TextField {
+                id: periodField
+                text: "100"
+                placeholderText: "ms"   // 1-60000; see parsePeriodMs in frames.hpp
+                Layout.preferredWidth: 62
+                color: "#e6e9ef"
+                font.family: "Menlo"
+                horizontalAlignment: TextInput.AlignRight
+                onTextChanged: root.reapply()
+                background: Rectangle { color: root.card; radius: 4
+                                        border.width: 1; border.color: root.panelEdge }
+            }
+            Text { text: "ms"; color: root.dim; font.pixelSize: 12 }
+
+            // The station unticks this itself when a period or a frame is refused, so the
+            // box never shows a repeat that is not running.
+            Binding {
+                target: repeatBox
+                property: "checked"
+                value: station.repeating
+                restoreMode: Binding.RestoreNone
             }
 
             Button {

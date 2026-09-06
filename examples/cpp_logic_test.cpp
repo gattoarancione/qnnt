@@ -314,6 +314,22 @@ void canStation()
         check(!can::validFdLength(n), "an illegal FD length is refused");
     }
 
+    // -- the repeat period. This one paces frames onto a real bus, so a value it cannot
+    // actually keep is refused rather than rounded into one it can.
+    check(can::parsePeriodMs("100") == 100, "a plain period parses");
+    check(can::parsePeriodMs(" 20 ") == 20, "surrounding space is ignored");
+    check(can::parsePeriodMs("1") == 1, "1 ms is accepted -- a thousand frames a second");
+    check(can::parsePeriodMs("60000") == 60000, "and the ceiling");
+
+    // Zero is not a period: Qt reads a zero-interval timer as "whenever idle", which is a
+    // busy loop rather than a pace.
+    check(can::parsePeriodMs("0") == 0, "zero is refused");
+    check(can::parsePeriodMs("60001") == 0, "above the ceiling is refused");
+    check(can::parsePeriodMs("") == 0, "empty is refused");
+    check(can::parsePeriodMs("10ms") == 0, "a unit suffix is refused rather than guessed");
+    check(can::parsePeriodMs("-5") == 0, "a negative is refused");
+    check(can::parsePeriodMs("1e3") == 0, "and so is anything not plain digits");
+
     // -- the rate. The property that matters is that it can FALL: a count-since-start
     // average would report a dead gateway's last healthy rate for ever.
     can::Rate r;
@@ -327,25 +343,37 @@ void canStation()
     check(r.stale(12000, 5000), "silence past the threshold reads as stale");
     check(r.total() == 10, "and the total still says what was seen");
 
-    // -- per-identifier rows, which is what a CAN tool shows instead of a scroll.
-    std::vector<can::IdRow> rows;
+    // -- per-identifier rows, which is what a CAN tool shows instead of a scroll. What
+    // makes a row is not the identifier alone.
+    can::IdRow row;
+    row.id = 0x123;
     can::Frame f;
     f.id = 0x123;
-    check(can::rowFor(rows, f) == 0 && rows.size() == 1, "a new identifier makes a row");
-    check(can::rowFor(rows, f) == 0 && rows.size() == 1, "the same identifier reuses it");
+    check(can::sameRow(row, f), "the same identifier lands on the same row");
 
-    // The same number as an EXTENDED identifier is a different frame to every controller
-    // on the bus, so merging the two would draw one conversation as two interleaved ones.
+    // A different frame to every controller on the bus, so folding them into one row would
+    // show two conversations interleaved as one.
     f.ext = true;
-    check(can::rowFor(rows, f) == 1 && rows.size() == 2,
-          "standard and extended ids with the same number stay apart");
-
-    // And so do classic and FD. The same identifier carried both ways is two
-    // conversations, and merging them would interleave one row from two sources.
+    check(!can::sameRow(row, f), "an extended id with the same number is a different row");
     f.ext = false;
     f.fd = true;
-    check(can::rowFor(rows, f) == 2 && rows.size() == 3,
-          "classic and FD with the same identifier stay apart");
+    check(!can::sameRow(row, f), "the same id sent as CAN FD is a different row");
+    f.fd = false;
+    f.id = 0x124;
+    check(!can::sameRow(row, f), "and so is a different number");
+
+    // Ordering is by identifier, and stable: rate ordering swaps rows under the pointer
+    // several times a second, because live rates cross constantly.
+    can::IdRow lo, hi;
+    lo.id = 0x100;
+    hi.id = 0x200;
+    check(can::rowPrecedes(lo, hi) && !can::rowPrecedes(hi, lo), "lower identifiers come first");
+    hi.id = 0x100;
+    hi.ext = true;
+    check(can::rowPrecedes(lo, hi), "standard before extended at the same number");
+    hi.ext = false;
+    hi.fd = true;
+    check(can::rowPrecedes(lo, hi), "classic before FD at the same number");
 }
 
 /// The CAN wire format across the language boundary, pinned to bytes packed by Zig from

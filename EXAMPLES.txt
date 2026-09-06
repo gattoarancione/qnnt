@@ -2003,9 +2003,10 @@ kernel produced it -- so it runs on a mac against gateways on any number of Linu
 
     left     the mesh: each bus, and under it every gateway publishing to that bus, with
              its own rate. A gateway that has stopped shows here and nowhere else.
-    centre   the bus: one row per CAN identifier, sorted by rate, with the latest payload
-             and which gateway last carried it.
-    bottom   send: compose a frame -- classic or FD -- and put it on the bus.
+    centre   the bus: one row per CAN identifier, in identifier order, with the latest
+             payload, its rate, and which gateway last carried it.
+    bottom   send: compose a frame -- classic or FD -- and put it on the bus, once or
+             every N milliseconds.
 
 The flag column reads E extended, R remote, F CAN FD, B bit rate switch, P error-passive
 transmitter, ! error frame. F is not decoration: an eight-byte FD frame and an eight-byte
@@ -2013,19 +2014,45 @@ classic frame differ in nothing else a row shows, and they are different frames.
 
 Three of its decisions are worth knowing.
 
-  * THE SCREEN IS REPAINTED ON A TIMER, NOT ON A FRAME. A CAN bus at 500 kbit/s carries a
+  * THE SCREEN IS REFRESHED ON A TIMER, NOT ON A FRAME. A CAN bus at 500 kbit/s carries a
     few thousand frames a second and a mesh carries the sum of all of them. Touching a QML
     model per frame would spend the machine on layout and still show a blur. Frames update
-    counters; the model is rebuilt at 10 Hz.
+    counters; the view is refreshed at 10 Hz.
+
+    REFRESHED, not rebuilt. The first version handed QML a freshly built list every tick,
+    which resets a ListView and destroys every delegate with it -- measured at twelve
+    rebuilds a second per row. A click's press and its release then almost never landed on
+    the same item, so the bus list could not be clicked at all. The lists are stable QObjects
+    now: a tick updates their properties in place, and a list changes identity only when a
+    bus or an identifier actually appears. Same measurement afterwards: 3 rather than 204.
   * A ROW PER IDENTIFIER, NOT A SCROLLING LOG. A bus repeats a handful of identifiers
     endlessly, so a scroll shows the fastest and hides the rest. Standard and extended
     identifiers with the same number stay on separate rows, and so do classic and FD ones,
     because each pair is two conversations to every controller on the bus.
+
+    Ordered by identifier, not by rate. Rate ordering reads well in a screenshot and is
+    unusable in motion: live rates cross constantly, so rows swap places while you are
+    looking at them. cansniffer orders by identifier for the same reason -- the rate is a
+    column you read, not a position you chase.
   * SENDING IS REAL. The station publishes on `can/<bus>/<its own name>` exactly as a
     gateway does, so every gateway on that bus writes the frame to its local interface. It
     is a participant, not an observer, which is why the payload box refuses a malformed
     value rather than padding it: "12 3" is a typo, and guessing whether it meant 0x03 or
     0x30 puts a frame nobody wrote onto real hardware.
+
+    Ticking `every` sends it at a fixed period instead of once, which is what a bus
+    actually carries -- almost every message on a vehicle bus is periodic, and a receiver
+    under test is written against the pace, not against a single frame. The period is
+    1-60000 ms -- 1 ms being roughly a full 500 kbit/s bus -- and a value outside that is
+    REFUSED rather than clamped, since quietly substituting one reports a load the bus is
+    not carrying. The sender uses a precise timer, but the achieved rate is the machine's
+    to give: measured by an independent subscriber, 10 ms delivered 101 frames/s and 2 ms
+    delivered 504, both exact, while 1 ms delivered about 894 rather than 1000. The row's
+    own rate column is what actually went out, and at the shortest periods that is the
+    number to believe. Everything is validated once when the
+    repeat starts, so the timer does no parsing; editing a field while it runs restarts it
+    on the new value, and a publish that fails stops it rather than retrying into a fault
+    every period. Measured with an independent reader: 101 frames in 5 s at 50 ms.
 
 Its own topic matches its own pattern, so the station appears in its own gateway list --
 marked, because a reader who did not know that would think a gateway had duplicated.
