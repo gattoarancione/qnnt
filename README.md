@@ -1,1 +1,218 @@
-# qnnt-2
+# qnnt
+
+A pub/sub library for machines that have to talk to each other and to their own
+processes, without a broker. Zig core, with C, C++/Qt and Python on the same
+implementation.
+
+Three sentences of mental model:
+
+1. A **host-local registry** holds a directory of `topic -> tcp://host:port`.
+2. A **publisher** registers its endpoint there; a **subscriber** resolves the topic
+   and connects **straight to the publisher**. Data never goes through the registry.
+3. **Federation** copies directories between hosts, so a subscriber can resolve a
+   topic published on another machine — and then still connects directly to it.
+
+That split is the whole design: the registry is a control plane, and the only thing
+on the data path is the two ends of a TCP connection.
+
+```
+  registry (loopback, 2222)          federation (2223, between hosts)
+        │  directory                        │  directory copies
+   ┌────┴────┐                              │
+publisher   subscriber ──── TCP ────► publisher   ← the data plane
+```
+
+## Quick start
+
+```sh
+zig build                       # everything; Zig 0.16
+zig build test                  # 281 tests
+
+zig build run-0                 # a node publishing test/topic-a and test/topic-b
+zig build ls -- --tree          # what is published
+zig build cat -- test/topic-a   # read it
+```
+
+## Key concepts
+
+| Concept | What it means |
+|---|---|
+| **Registry** | Host-local directory on port 2222. Listens on **loopback only** — it carries the human interface and destructive commands. Elected by whichever node binds the port first. |
+| **Directory** | `topic -> endpoint`, plus origin, version, subscriber counts. Refreshed by publishers every 2 s; entries expire when refreshes stop. |
+| **Topic** | A `/`-separated name. No hierarchy is enforced; the separator is a convention the tools and globs understand. |
+| **Direct data plane** | Subscribers dial publishers. The registry never carries a message. |
+| **Federation** | Registries exchange directories over port 2223, gated by `QNNT_CLUSTER_KEY`. Entries carry their origin and version so merges converge without a coordinator. |
+| **Warm standby** | Every node keeps a mirrored copy of the directory, so registry takeover is ~0.2 s instead of a rebuild. |
+| **Node id** | A random per-process id. Identity for merge rules — never parsed as an address. |
+
+## Features
+
+- Publish/subscribe with no broker and no central process
+- **Text** (newline-delimited) or **TLD frames** (arbitrary bytes) per topic
+- **Glob subscriptions** — `subscribePattern("bus/*")` joins matching topics as they appear
+- **Callback or queue** delivery; the queue is what the managed-runtime bindings use
+- **Events**: subscriber connected/disconnected, publisher connected/disconnected/stale/resumed
+- **Federation** across hosts, any topology, with observed-address substitution
+- **Registry failover** with a warm directory mirror
+- **Forwardable publisher ports** (`QNNT_PUBLISHER_PORTS`) for firewall and WireGuard setups
+- Realtime options on Linux: `SCHED_FIFO` priority, `mlockall`
+- One implementation: every binding calls the same Zig core
+
+## TLD, and what it is for
+
+**TLD (Type-Length-Data)** is the binary format qnnt uses for structured payloads. A
+frame is one header byte — high nibble type, low nibble modifier — then an optional
+length and the data.
+
+It exists because a topic carrying arbitrary bytes cannot be newline-delimited: a CAN
+payload or a depth frame contains `0x0A` as freely as any other byte. So framing is a
+property of the **topic**, chosen when subscribing:
+
+| | Use |
+|---|---|
+| `subscribe` | newline-delimited text |
+| `subscribeFrames` | TLD frames — length-prefixed, any bytes |
+
+Decoding is **zero-copy and allocation-free**: `decode` returns a frame borrowing your
+bytes, and containers are walked with iterators. `lib/tld.zig` has no dependency on the
+rest of qnnt and can be used on its own.
+
+Structs map to TLD by name in every language — `TLD_DEFINE_MAP(a, b, c)` in C++,
+`@typeInfo` in Zig, dicts in Python. Cross-language agreement is pinned by **golden
+frames** in `testdata/`: bytes packed by Zig, unpacked and checked by the other side, so
+a renamed field fails a test instead of silently arriving as a default.
+
+## The four languages
+
+Same core, same wire, same `QNNT_*` variables.
+
+| | Zig | C | C++ / Qt | Python |
+|---|---|---|---|---|
+| start | `Qnnt.run()` | `qnnt_init()` | `node->start()` | `qnnt.Node()` |
+| publish | `runPublisher` / `publish` | `qnnt_publisher_start` / `qnnt_publish` | `addPublisher` / `publish` | `publisher` / `publish` |
+| subscribe (text) | `subscribe` | `qnnt_subscribe` | `addSubscriber` | `subscribe` |
+| subscribe (frames) | `subscribeFrames` | `qnnt_subscribe_frames` | `addSubscriber(…, Frames)` | `subscribe(…, frames=True)` |
+| subscribe (glob) | `subscribePattern` | `qnnt_subscribe_pattern` | `addSubscriberPattern` | `subscribe_pattern` |
+| receive | handler callback | callback or `qnnt_poll` | `messageAvailable` signal | `poll()` / `stream()` |
+| pack a struct | `tld.packTo` | encoder calls | `publishPacked` | `publish_object` |
+| match a topic | `qnnt.topics.globMatch` | `qnnt_topic_matches` | `qnnt_topic_matches` | `topic_matches` |
+| config | `configureFromEnvironment` | `qnnt_configure_from_environment` | `configureFromEnvironment` | automatic |
+
+Notes that matter:
+
+- **Python and Qt use the queue**, not callbacks. Crossing into a managed runtime per
+  message costs far more than the copy, and no library thread ever enters your runtime.
+- **Glob subscription is a separate call**, never `subscribe` noticing a `*`. It costs a
+  registry poll and one connection per match, and nobody who does not ask for it pays.
+- `*` **crosses `/`** here, unlike a shell glob: `lidar/*` matches `lidar/helios32/scan`.
+
+## Tools
+
+```sh
+qnnt-ls                       # every topic, one per line — for a pipe
+qnnt-ls --tree                # grouped by '/' segment, for eyes
+qnnt-ls 'lidar/*'             # globs. QUOTE THEM.
+qnnt-ls --subs test/topic-a   # who is subscribed, as the registry reports it
+
+qnnt-cat test/topic-a         # TLD frames to stdout
+qnnt-cat --text 'bus/*'       # text topics, several at once
+qnnt-cat --dump 'can/*' > cap # capture with times and topics
+qnnt-cat --restore < cap      # replay at the recorded pace
+qnnt-cat --publish t < file   # the other direction
+
+qnnt-ls 'test/*' | xargs qnnt-cat --text     # they compose
+```
+
+Data goes to stdout and notices to stderr, so a redirect carries only payload.
+
+The registry speaks a plain line protocol on 2222 — `nc 127.0.0.1 2222`, then:
+
+```
+list · sub <topic> · subs <topic> · pub <topic> <uri> · unpub <topic>
+epoch · mirror · port <topic> · peers · status · ping · help · quit
+```
+
+## Configuration
+
+All optional, all read by `configureFromEnvironment()` — an explicit call, never implicit.
+
+| Variable | Meaning |
+|---|---|
+| `QNNT_REGISTRY_PORT` | Host-local registry port (default 2222) |
+| `QNNT_REGISTRY_ROLE` | `candidate` (default) or `client` — a client is never elected |
+| `QNNT_REGISTRY_MIRROR` | `1` (default) or `0` — keep a warm directory copy |
+| `QNNT_ADVERTISE_ADDR` | The address remote subscribers should dial |
+| `QNNT_BIND_ADDR` | What publisher sockets bind |
+| `QNNT_PUBLISHER_PORTS` | `low-high` — take publisher ports from a forwardable range |
+| `QNNT_CLUSTER_KEY` | Enables federation; required for it |
+| `QNNT_FEDERATION_PORT` | Federation's port (default 2223, `0` disables) |
+| `QNNT_PEERS` | `host[:port],…` to dial; names are resolved through libc |
+| `QNNT_RT_PRIORITY` | `SCHED_FIFO` priority for workers (Linux) |
+| `QNNT_LOCK_MEMORY` | `1` to pin pages with `mlockall` (Linux) |
+| `QNNT_MAX_FRAME_BYTES` | Largest TLD frame published or accepted (default 16 MiB) |
+
+## Network topologies
+
+The registry is host-local, so "a host" means "a registry". Federation is what joins them,
+and the shape is entirely `QNNT_PEERS`.
+
+| Shape | `QNNT_PEERS` | Good for |
+|---|---|---|
+| **Single host** | — | Processes on one machine. No federation, no configuration. |
+| **Star** | leaves name the hub | Simple; the hub is a single point of failure. |
+| **Ring** | each names the next | Cheap; convergence pays one relay hop per link. |
+| **Mesh** | each names all others | No relay hop, no host on the path between two others. What a broadcast bus looks like. |
+| **Hybrid** | a meshed core, leaves onto it | Realistic: a core that must not partition, cheap edges. |
+
+All four are checked across six containers by `docker/federation.sh`, including a real
+partition (`docker network disconnect`) and latency/loss with `tc netem`.
+
+**Through a firewall or NAT.** Federation crosses one easily — one well-known port per
+host. The data plane does not, because publishers bind ephemeral ports nobody can forward.
+Set `QNNT_PUBLISHER_PORTS=2300-2399` on every node on the host and one rule covers every
+topic; the registry assigns from the range, stickily, so a restarting publisher reclaims
+its own port. Forward **1:1** — the port travels verbatim through federation even though
+the host is substituted. See EXAMPLES.txt §7.
+
+## Examples
+
+| Path | What it shows |
+|---|---|
+| `examples/mesh/` | The same struct published by five languages, each verifying the other four |
+| `examples/can/` | A **CAN gateway mesh**: SocketCAN bridged across hosts on topic patterns, classic and CAN FD, with a Qt station |
+| `examples/dirigera/` | An IKEA DIRIGERA hub: TLS + OAuth bridge, and a QML control station |
+| `examples/ugv/` | A real robot over Socket.IO, with a QML pilot and a watchdog |
+| `examples/zed/` | A depth camera: shared memory, a bridge, a QML viewer |
+| `examples/lidar/` | Two LiDAR protocols behind one topic shape |
+| `examples/federation/` | Every topology, on loopback |
+| `examples/registry/` | Registry failover, measured |
+| `examples/cpp_logic_test.cpp` | The Qt-free C++ logic, 165 checks |
+
+Full walkthroughs, with the reasoning behind each decision: **`EXAMPLES.txt`**.
+
+## Testing
+
+```sh
+zig build test                      # 281 unit tests, incl. federation merge logic
+zig build cpp-logic                 # C++ logic and cross-language golden frames
+zig build python-demo               # the Python package against the built library
+
+docker/colima.sh                    # a Linux VM (Docker Desktop's kernel lacks CAN)
+docker/federation.sh                # topologies, partition, across six real hosts
+docker/federation.sh netem          # …with latency and packet loss
+docker/federation.sh ports          # …with a forwardable publisher port range
+docker/can.sh                       # the CAN gateway mesh on real vcan interfaces
+```
+
+`docker/README.md` covers the container harnesses and why they exist.
+
+## Layout
+
+```
+lib/          the library: qnnt.zig, federation.zig, tld.zig, topics.zig, env.zig
+src/          the tools: qnnt-ls, qnnt-cat
+include/      qnnt.h, qnnt_tld.h, qnnt_tld.hpp, qnnt_qt.hpp
+python/       the Python package
+examples/     see the table above
+docker/       multi-host harnesses
+```
