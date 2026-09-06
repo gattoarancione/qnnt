@@ -211,6 +211,31 @@ The script checks first and says so, but the usual causes:
 * **Too small a VM.** colima's 2 CPU / 2 GB default cannot hold six nodes. `docker/colima.sh`
   asks for 4 and 6.
 
+## The publisher port range
+
+```sh
+docker/federation.sh ports
+```
+
+Federation crosses a firewall because it needs one well-known port per host. The data plane
+does not — a publisher takes whatever ephemeral port the OS gives it, and nobody can forward
+a port they cannot predict. `QNNT_PUBLISHER_PORTS` fixes that half; this mode checks it
+where only real hosts can:
+
+- the endpoint a **peer** would dial carries a port from the range — that is the number a
+  forwarding rule is written against, and it has to survive the trip through federation;
+- five hosts run the **same** range at once without interfering.
+
+The second one is subtler than it looks, and the first version of this check was worthless.
+Every site landing on 2300 proves nothing: each allocates at startup, before federation has
+taught it anything, so a broken allocator gives the same answer. I found that by breaking
+the accounting on purpose and watching the check still pass.
+
+It now spreads alpha across 2301–2303, waits until bravo has *learned* those entries, and
+only then asks bravo for a new port. Bravo should answer 2301 — its own next free, a port it
+can plainly see alpha using. With peers' entries wrongly counted it answers 2304, which is
+what the broken build produces.
+
 ## Latency and packet loss
 
 ```bash

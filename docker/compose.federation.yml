@@ -30,6 +30,10 @@ x-site: &site
   environment: &site-env
     QNNT_CLUSTER_KEY: ${QNNT_CLUSTER_KEY:-federation-demo}
     QNNT_LIBRARY: /qnnt/lib/libqnnt_c.so
+    # Empty unless docker/federation.sh's `ports` mode sets it, and an empty QNNT_*
+    # variable is read as absent -- so every other mode runs on ephemeral publisher ports
+    # exactly as it always has.
+    QNNT_PUBLISHER_PORTS: ${PUBLISHER_PORTS:-}
 
 services:
   alpha:

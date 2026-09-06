@@ -5,6 +5,7 @@
 #   docker/federation.sh ring             # one topology
 #   docker/federation.sh mesh partition   # and cut a host out of it
 #   docker/federation.sh netem            # latency and packet loss
+#   docker/federation.sh ports            # publisher ports from a forwardable range
 #
 # Six containers on a bridge network, each a host with its own address, all on the default
 # ports. What this reaches that examples/federation/topologies.py cannot:
@@ -266,6 +267,119 @@ netem_run() {
   $COMPOSE down --remove-orphans >/dev/null 2>&1
 }
 
+# -- the publisher port range ----------------------------------------------------------
+#
+# Federation crosses a firewall because it needs one well-known port per host. The data
+# plane does not, because a publisher takes whatever ephemeral port the OS gives it, and
+# nobody can forward a port they cannot predict. QNNT_PUBLISHER_PORTS makes that half
+# forwardable too.
+#
+# What only real hosts can show, and a single machine cannot:
+#
+#   * the endpoint a PEER would dial carries a port from the range. That is the number
+#     that has to appear in a forwarding rule, and it travels through federation.
+#   * two hosts run the SAME range at the same time without interfering. The allocator
+#     decides what is free from the directory, which holds every peer's entries too --
+#     counting those would make each host report itself out of ports while all of them
+#     were free, and with one registry per machine that cannot be reproduced locally.
+
+# The port `viewer` would dial for `subject`'s topic, or empty.
+port_at() {
+  resolve_at "$1" "$2" | sed -n 's|^tcp://[^:]*:\([0-9]*\).*|\1|p'
+}
+
+# What this container's registry would assign a topic. The publisher's side of the
+# handshake, asked by hand.
+ask_port() {
+  $COMPOSE exec -T "$1" sh -c "printf 'port $2\n' | nc -q1 127.0.0.1 2222" 2>/dev/null \
+    | tr -d '\r' | grep -E '^[0-9]+$' | head -1
+}
+
+in_range() {
+  [ -n "$1" ] || return 1
+  [ "$1" -ge "$PORT_LOW" ] 2>/dev/null && [ "$1" -le "$PORT_HIGH" ] 2>/dev/null
+}
+
+ports_run() {
+  PORT_LOW=2300
+  PORT_HIGH=2309
+  export PUBLISHER_PORTS="$PORT_LOW-$PORT_HIGH"
+
+  echo
+  echo "================================================================"
+  echo " publisher port range $PUBLISHER_PORTS, on a mesh"
+  echo "================================================================"
+  set_topology mesh
+  $COMPOSE down --remove-orphans >/dev/null 2>&1
+  $COMPOSE up -d --wait >/dev/null 2>&1 || $COMPOSE up -d >/dev/null 2>&1
+  sleep 12
+
+  # 1. Every host put its own publisher inside the range.
+  local own_ok=1 own_detail=""
+  for s in $LINKED; do
+    local p; p=$(port_at "$s" "$s")
+    in_range "$p" || { own_ok=0; own_detail="$own_detail $s:${p:-none}"; }
+  done
+  check "every host's publisher took a port from the range" "$own_ok" "$own_detail"
+
+  # 2. THE ONE THAT MATTERS: what a peer would dial is a range port, not an ephemeral one.
+  #    A forwarding rule is written against this number.
+  local fed_ok=1 fed_detail=""
+  for viewer in $LINKED; do
+    for subject in $LINKED; do
+      [ "$viewer" = "$subject" ] && continue
+      local p; p=$(port_at "$viewer" "$subject")
+      in_range "$p" || { fed_ok=0; fed_detail="$fed_detail $viewer->$subject:${p:-none}"; }
+    done
+  done
+  check "the port a PEER would dial is in the range, so it is forwardable" "$fed_ok" "$fed_detail"
+
+  # 3. Hosts do not eat each other's ranges.
+  #
+  #    Every site landing on the same low port is NOT evidence of this: each allocates at
+  #    startup, before federation has taught it anything, so a broken allocator would give
+  #    the same answer. The first version of this check did exactly that and passed with
+  #    the accounting deliberately broken.
+  #
+  #    So spread alpha across several slots, wait until bravo has LEARNED them, and only
+  #    then ask bravo for a new port. Alpha's 2301-2303 are in bravo's directory by that
+  #    point; if they counted as holding a port on bravo, bravo would skip past them.
+  local ports=""
+  for s in $LINKED; do ports="$ports $(port_at "$s" "$s")"; done
+  echo "  each host's own publisher port:$ports"
+
+  for i in 1 2 3; do
+    $COMPOSE exec -d -T alpha python3 examples/federation/node.py "fed/fill$i/beacon" \
+      >/dev/null 2>&1
+  done
+
+  local waited=0 learned=0
+  while [ "$waited" -lt 60 ]; do
+    learned=1
+    for i in 1 2 3; do
+      topics_at bravo | grep -q "fed/fill$i/beacon" || learned=0
+    done
+    [ "$learned" = "1" ] && break
+    sleep 2
+    waited=$((waited + 2))
+  done
+  check "bravo learned the three extra topics alpha placed in its own range" "$learned"
+
+  # Bravo holds one local port (2300), so its next free is 2301 -- the very port alpha is
+  # using and bravo can see. An allocator counting peers' entries would answer 2304.
+  local next; next=$(ask_port bravo "fed/probe/new")
+  check "a host allocates around ITS OWN ports, not its peers'" \
+    "$([ "$next" = "2301" ] && echo 1 || echo 0)" \
+    "(bravo offered ${next:-none}; 2301 is its own next free, 2304 means it counted alpha's)"
+
+  # 4. And it is still a working mesh, not just a well-numbered one.
+  matrix
+  observed_addresses
+
+  $COMPOSE down --remove-orphans >/dev/null 2>&1
+  unset PUBLISHER_PORTS
+}
+
 run_topology() {
   local name="$1"
   echo
@@ -316,6 +430,8 @@ WHAT="${1:-star ring mesh hybrid}"
 EXTRA="${2:-}"
 if [ "$WHAT" = "netem" ]; then
   netem_run
+elif [ "$WHAT" = "ports" ]; then
+  ports_run
 else
   for t in $WHAT; do run_topology "$t" "$EXTRA"; done
 fi

@@ -445,6 +445,8 @@ Notes worth having before deploying this:
   the forwarded range actually reaches. Publishers deeper in the network still
   need routing and forwarding at each level.
 
+  `docker/federation.sh ports` checks it across six real hosts -- see section 20.
+
   Language support is the same everywhere -- C, C++, Python and Zig all read the
   same QNNT_* variables and expose the same setters. Python:
 
