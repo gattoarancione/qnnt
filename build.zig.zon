@@ -2,7 +2,11 @@
     .name = .qnnt,
     .version = "0.0.1",
     .fingerprint = 0x1c980dc35fd520b6,
-    .minimum_zig_version = "0.15.0",
+    // 0.16, not 0.15: the library is written against the `std.Io` rework -- Io.Threaded,
+    // Io.Mutex, the Writer/Reader vtables -- and `main` takes std.process.Init.Minimal.
+    // None of that exists in 0.15, so declaring 0.15 bought a wall of compile errors
+    // instead of one sentence saying which compiler to use.
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",

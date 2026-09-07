@@ -22,10 +22,50 @@ on the data path is the two ends of a TCP connection.
 publisher   subscriber ──── TCP ────► publisher   ← the data plane
 ```
 
+## Requirements
+
+**Zig 0.16 is the only hard requirement.** It builds the library, both tools, the C and C++
+bindings, the Zig examples and the whole test suite, on macOS and Linux, with nothing else
+installed. `build.zig.zon` declares it, so an older compiler is told rather than left to
+produce errors.
+
+Everything below is needed only for the part of the tree that names it. A missing one
+never breaks the rest of the build.
+
+| For | You need | Notes |
+|---|---|---|
+| The library, tools, tests | **Zig 0.16** | Nothing else. macOS or Linux. |
+| The QML stations (`can-station`, `dirigera-home`, `ugv-pilot`, the viewers) | **Qt 6** | Pass the kit: `zig build can-station -Dqt=/Users/you/Qt/6.10.3/macos`. Developed against 6.10.3. Without `-Dqt=` these steps simply are not built. |
+| The Python binding | **Python 3.10+** | `python/pyproject.toml` declares it. Finds the freshly built library by itself from a checkout. |
+| The DIRIGERA bridge | **OpenSSL 3** | `-Ddirigera-openssl=/opt/homebrew/opt/openssl@3`. The hub speaks TLS 1.2 with ECDSA, which Zig's std TLS does not offer. |
+| The multi-host harnesses | **Docker**, plus `nc` and `python3` | `docker/federation.sh`, `docker/can.sh`. Linux binaries are cross-compiled on the host: `zig build -Dtarget=aarch64-linux-gnu`. |
+| The CAN gateway | **Linux with `vcan`** | `CONFIG_CAN` + `CONFIG_CAN_VCAN`. The gateway is Linux-only; the *station* that watches it is not. |
+| Realtime options | **Linux** | `QNNT_RT_PRIORITY`, `QNNT_LOCK_MEMORY`. Refused elsewhere, with a reason. |
+
+### On a Mac, prefer colima over Docker Desktop
+
+Docker Desktop's LinuxKit kernel is built **without any CAN subsystem** — `ip link add type
+vcan` fails there however many capabilities you grant, so `docker/can.sh` cannot run on it
+at all. ([linuxkit#3486](https://github.com/linuxkit/linuxkit/pull/3486) has proposed the
+kernel options since March 2020 and is still open.)
+
+colima boots an ordinary Ubuntu kernel, where CAN is a loadable module, and every other
+harness behaves identically. One command sets it up:
+
+```sh
+brew install colima
+docker/colima.sh              # start the VM, load the CAN modules, select the context
+docker/colima.sh stop         # when you are done
+```
+
+Run it again after every `colima start` — kernel modules do not survive a VM restart, and
+that is all it does the second time. The two runtimes keep **separate image stores**, so
+rebuild after switching contexts. Details and the traps in `docker/README.md`.
+
 ## Quick start
 
 ```sh
-zig build                       # everything; Zig 0.16
+zig build                       # the library, the tools, the Zig examples
 zig build test                  # 281 tests
 
 zig build run-0                 # a node publishing test/topic-a and test/topic-b
