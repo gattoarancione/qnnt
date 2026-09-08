@@ -410,3 +410,51 @@ test "containsHeaderValue matches case-insensitively on the name only" {
     // The value itself is case-sensitive: base64 is.
     try testing.expect(!containsHeaderValue(head, "sec-websocket-accept", "S3PPLMBITXAQ9KYGZZHZRBK+XOO="));
 }
+
+test "readFrame consumes the header before the payload, so a failed read is not resumable" {
+    // Pinning an assumption something else depends on, not asserting a virtue.
+    //
+    // readFrame `take`s the header and then `take`s the payload, so a read that fails
+    // between the two leaves the header CONSUMED. Calling it again would read payload bytes
+    // as a header and desynchronise the stream, silently.
+    //
+    // examples/dirigera/bridge.zig relies on exactly that being detectable: it compares the
+    // reader's seek position before and after, and only retries a timed-out read when
+    // nothing was consumed. If readFrame is ever changed to peek the whole frame before
+    // consuming it, this test fails -- and that guard can then be simplified away.
+    const truncated = [_]u8{ 0x81, 0x08, 'o', 'n', 'l', 'y' }; // claims 8 bytes, carries 4
+    var reader: Io.Reader = .fixed(&truncated);
+    var sink: [64]u8 = undefined;
+    var writer: Io.Writer = .fixed(&sink);
+    var buf: [64]u8 = undefined;
+    var dropped: u64 = 0;
+    var masker: Masker = .init(@splat(7));
+
+    try testing.expectError(
+        error.ProtocolError,
+        readFrame(&reader, &writer, &masker, &buf, &dropped),
+    );
+    // The header is gone. This is the hazard, stated as a fact.
+    try testing.expect(reader.seek > 0);
+}
+
+test "a whole frame leaves nothing behind, so the next read starts at a boundary" {
+    // The other half of what the bridge's guard assumes: a SUCCESSFUL frame consumes
+    // exactly itself, so seek lands on the start of the next frame rather than inside it.
+    const two = [_]u8{ 0x81, 0x01, 'a', 0x81, 0x01, 'b' };
+    var reader: Io.Reader = .fixed(&two);
+    var sink: [64]u8 = undefined;
+    var writer: Io.Writer = .fixed(&sink);
+    var buf: [64]u8 = undefined;
+    var dropped: u64 = 0;
+    var masker: Masker = .init(@splat(7));
+
+    const first = (try readFrame(&reader, &writer, &masker, &buf, &dropped)).?;
+    try testing.expectEqualStrings("a", first.payload);
+    const after_first = reader.seek;
+
+    const second = (try readFrame(&reader, &writer, &masker, &buf, &dropped)).?;
+    try testing.expectEqualStrings("b", second.payload);
+    try testing.expect(reader.seek > after_first);
+    try testing.expectEqual(@as(u64, 0), dropped);
+}

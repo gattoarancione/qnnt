@@ -194,6 +194,19 @@ pub const Connection = struct {
         return &c.reader_state.interface;
     }
 
+    /// Whether the last read failed because it timed out rather than because the connection
+    /// went away. Lets a caller keep a SHORT receive timeout -- so it notices a shutdown
+    /// promptly -- without treating every quiet interval as a dropped connection.
+    pub fn timedOut(c: *const Connection) bool {
+        return c.reader_state.timed_out;
+    }
+
+    /// The receive timeout, changeable after connecting: a handshake wants a short one and a
+    /// long-lived event stream wants to slice a long idle period into short waits.
+    pub fn setReadTimeout(c: *Connection, ms: u32) void {
+        setReceiveTimeout(c.stream.socket.handle, ms);
+    }
+
     pub fn writer(c: *Connection) *Io.Writer {
         return &c.writer_state.interface;
     }
@@ -204,6 +217,15 @@ pub const Connection = struct {
 const Reader = struct {
     interface: Io.Reader,
     ssl: *SSL,
+    /// Set when the last failed read was SO_RCVTIMEO firing rather than the connection
+    /// breaking.
+    ///
+    /// `Io.Reader.Error` is a fixed, small error set, so a timeout has to arrive as
+    /// `error.ReadFailed` like any other failure -- and a caller that cannot tell them
+    /// apart has to choose between reconnecting on every quiet moment or waiting out a long
+    /// deadline. The event stream chose the latter and waited five minutes; on shutdown that
+    /// meant five minutes of ignoring Ctrl-C. This flag is how the caller tells.
+    timed_out: bool = false,
 
     fn readVec(io_r: *Io.Reader, data: [][]u8) Io.Reader.Error!usize {
         const self: *Reader = @alignCast(@fieldParentPtr("interface", io_r));
@@ -215,13 +237,18 @@ const Reader = struct {
         if (dest.len == 0) return 0;
 
         // One slice, because SSL_read cannot scatter. A short read is always allowed.
+        self.timed_out = false;
         const n = SSL_read(self.ssl, dest.ptr, @intCast(@min(dest.len, std.math.maxInt(c_int))));
         if (n <= 0) return switch (SSL_get_error(self.ssl, n)) {
             // A clean close, and how a response body ends here: the hub answers
             // `Connection: close`.
             SSL_ERROR_ZERO_RETURN => error.EndOfStream,
-            // With a blocking socket these mean SO_RCVTIMEO fired.
-            SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE => error.ReadFailed,
+            // With a blocking socket these mean SO_RCVTIMEO fired. Recorded before the
+            // error is returned, because the error cannot carry it.
+            SSL_ERROR_WANT_READ, SSL_ERROR_WANT_WRITE => blk: {
+                self.timed_out = true;
+                break :blk error.ReadFailed;
+            },
             SSL_ERROR_SYSCALL => if (n == 0) error.EndOfStream else error.ReadFailed,
             else => error.ReadFailed,
         };

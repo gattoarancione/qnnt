@@ -491,10 +491,11 @@ fn eventLoop() void {
     defer allocator.free(frame_buf);
 
     while (!qnnt.stopRequested()) {
-        // A long read timeout, not the REST one: an idle event stream is normal -- nothing
-        // in the house is changing -- so a short deadline would reconnect constantly. If
-        // this does fire, reconnecting is harmless.
-        const connection = client.connect(authority, 300_000) catch |err| {
+        // Connected with a long read timeout for the handshake, then dropped to a short one
+        // for the stream itself -- see below. An idle event stream is normal (nothing in the
+        // house is changing), so the LENGTH of the idle period this tolerates has not
+        // changed; only the size of each individual wait has.
+        const connection = client.connect(authority, event_connect_timeout_ms) catch |err| {
             markEventLink(false);
             std.debug.print("dirigera-bridge: event stream connect failed ({t})\n", .{err});
             _ = qnnt.sleepMs(3000);
@@ -526,8 +527,31 @@ fn eventLoop() void {
         markEventLink(true);
         std.debug.print("dirigera-bridge: event stream up\n", .{});
 
+        // NOW the short timeout. A house can be quiet for hours, and this loop must
+        // tolerate that -- but it must not spend one uninterruptible five-minute read doing
+        // it, because that is five minutes of ignoring a shutdown. So the same total
+        // patience is spent in short waits, and a wait that expires is not an error: it is
+        // "nothing happened yet", and the only question it raises is whether we have been
+        // asked to stop.
+        //
+        // This needs `timedOut()` to tell an expired wait from a broken connection; without
+        // it the two are the same error and a short timeout would reconnect on every quiet
+        // moment. See tls_openssl.Reader.timed_out.
+        connection.setReadTimeout(event_read_slice_ms);
+
         var dropped: u64 = 0;
+        var idle_ms: u64 = 0;
         while (!qnnt.stopRequested()) {
+            // `readFrame` CONSUMES as it goes: it takes the two header bytes, then the
+            // payload. So a timeout that lands between the two leaves the header gone, and
+            // simply calling it again would read payload bytes as a header and desynchronise
+            // the stream silently -- which is worse than the slow shutdown this is fixing.
+            //
+            // The reader's seek position says which happened. Unchanged means the frame was
+            // never started and the next attempt begins at the same boundary; moved means a
+            // frame was half-consumed, and the only safe answer is a new connection.
+            const seek_before = connection.reader().seek;
+
             const frame = ws.readFrame(
                 connection.reader(),
                 connection.writer(),
@@ -535,9 +559,34 @@ fn eventLoop() void {
                 frame_buf,
                 &dropped,
             ) catch |err| {
-                std.debug.print("dirigera-bridge: event stream ended ({t})\n", .{err});
+                const timed_out = connection.timedOut();
+                const untouched = connection.reader().seek == seek_before;
+
+                if (timed_out and untouched) {
+                    idle_ms += event_read_slice_ms;
+                    // Silence for this long is a stream that has gone away without saying
+                    // so -- a hub that rebooted, or a route that changed. Reconnecting is
+                    // harmless and is how it comes back.
+                    if (idle_ms >= event_idle_limit_ms) {
+                        std.debug.print(
+                            "dirigera-bridge: no events for {d}s, reconnecting\n",
+                            .{event_idle_limit_ms / 1000},
+                        );
+                        break;
+                    }
+                    continue;
+                }
+                if (timed_out) {
+                    std.debug.print(
+                        "dirigera-bridge: event stream timed out mid-frame, reconnecting\n",
+                        .{},
+                    );
+                } else {
+                    std.debug.print("dirigera-bridge: event stream ended ({t})\n", .{err});
+                }
                 break;
             } orelse break; // the hub closed
+            idle_ms = 0;
             handleEvent(frame.payload, dropped);
         }
 
@@ -548,6 +597,18 @@ fn eventLoop() void {
         _ = qnnt.sleepMs(1000);
     }
 }
+
+/// The handshake's read timeout. Generous, because it is one exchange and a slow hub is
+/// not a broken one.
+const event_connect_timeout_ms: u32 = 15_000;
+
+/// One wait on the event stream. Short, so a shutdown is noticed within one of them.
+const event_read_slice_ms: u32 = 1000;
+
+/// Total silence tolerated before reconnecting, unchanged from the five minutes this loop
+/// always allowed -- now spent as 300 waits of a second rather than one wait of five
+/// minutes.
+const event_idle_limit_ms: u64 = 300_000;
 
 fn markEventLink(up: bool) void {
     shared.mutex.lockUncancelable(bridge_io);
