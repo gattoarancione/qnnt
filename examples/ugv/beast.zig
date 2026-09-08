@@ -67,9 +67,27 @@ pub const Limits = struct {
     tilt_max_deg: f32 = 90,
 };
 
+/// The robot's UI action codes, from the `code:` section of its config.
+///
+/// These are a SECOND command vocabulary, unrelated to the `T` numbers. A `T` command is
+/// JSON the firmware interprets; a code is a number the robot's Python side maps to an
+/// action, and its web UI sends it as `{"A":<code>,"B":0,"C":0}` on the /ctrl namespace.
+/// Both lights are here rather than in `Commands` for that reason.
+///
+/// Defaults are this robot's, so the bridge works before `/config` has been read -- and are
+/// overwritten by the robot's own values when it has been, exactly as the T numbers are.
+pub const Codes = struct {
+    /// Cycle the chassis light. NOT a level: the robot offers no absolute set, so its own
+    /// UI sends this repeatedly and reads the resulting brightness back from telemetry.
+    base_ct: u32 = 10410,
+    /// Cycle the head light, the one on the pan-tilt assembly.
+    head_ct: u32 = 10409,
+};
+
 pub const Config = struct {
     fields: Fields = .{},
     commands: Commands = .{},
+    codes: Codes = .{},
     limits: Limits = .{},
     name_buf: [64]u8 = undefined,
     name_len: usize = 0,
@@ -157,6 +175,12 @@ pub fn parseConfig(yaml: []const u8) Config {
                 if (parseF32(value)) |v| c.limits.slow_speed = v;
             } else if (std.mem.eql(u8, key, "max_rate")) {
                 if (parseF32(value)) |v| c.limits.max_rate = v;
+            }
+        } else if (std.mem.eql(u8, section, "code")) {
+            if (std.mem.eql(u8, key, "base_ct")) {
+                c.codes.base_ct = std.fmt.parseInt(u32, value, 10) catch c.codes.base_ct;
+            } else if (std.mem.eql(u8, key, "head_ct")) {
+                c.codes.head_ct = std.fmt.parseInt(u32, value, 10) catch c.codes.head_ct;
             }
         } else if (std.mem.eql(u8, section, "cmd_config")) {
             if (std.mem.eql(u8, key, "cmd_movition_ctrl")) {
@@ -264,6 +288,29 @@ pub fn gimbalCommand(
 /// Both tracks to zero. Held as its own function rather than `driveCommand(0, 0)` because
 /// the watchdog has to be able to build it when nothing else in the process is healthy --
 /// no config, no allocator, no floating-point formatting of a caller's value.
+/// Which light. The robot has exactly these two, and only cycles them.
+pub const Light = enum { base, head };
+
+/// The /ctrl argument that cycles a light.
+///
+/// Returned ALREADY QUOTED AND ESCAPED, which looks wrong until you see what the robot's UI
+/// does: `socket.send(JSON.stringify({A,B,C}))`. In Socket.IO, `send` is `emit("message",
+/// x)`, and `JSON.stringify` makes x a STRING -- so the packet carries a string argument
+/// whose contents happen to be JSON, not a nested object:
+///
+///     42/ctrl,["message","{\"A\":10410,\"B\":0,\"C\":0}"]
+///
+/// Emitting the object unquoted would be a different packet, and the robot's handler reads
+/// its argument with json.loads. So the quoting belongs to the protocol, not to formatting,
+/// and it is produced here where it can be tested rather than escaped at the call site.
+pub fn lightCommand(buf: []u8, codes: Codes, which: Light) ![]const u8 {
+    const code = switch (which) {
+        .base => codes.base_ct,
+        .head => codes.head_ct,
+    };
+    return std.fmt.bufPrint(buf, "\"{{\\\"A\\\":{d},\\\"B\\\":0,\\\"C\\\":0}}\"", .{code});
+}
+
 pub fn stopCommand(buf: []u8, commands: Commands) ![]const u8 {
     return std.fmt.bufPrint(buf, "{{\"T\":{d},\"L\":0,\"R\":0}}", .{commands.movition_ctrl});
 }
@@ -382,4 +429,38 @@ test "a telemetry field the firmware omits reads as zero, not as another field's
     try testing.expectApproxEqAbs(@as(f32, 12.01), t.voltage, 0.001);
     try testing.expectEqual(@as(f32, 0), t.pan_deg);
     try testing.expectEqual(@as(f32, 0), t.cpu_temp_c);
+}
+
+test "a light command is the argument the robot's own UI sends" {
+    var buf: [128]u8 = undefined;
+
+    // Quoted and escaped: the packet carries a JSON *string*, because the UI calls
+    // socket.send(JSON.stringify(...)) and Socket.IO's send is emit("message", x).
+    const base = try lightCommand(&buf, .{}, .base);
+    try testing.expectEqualStrings("\"{\\\"A\\\":10410,\\\"B\\\":0,\\\"C\\\":0}\"", base);
+
+    var buf2: [128]u8 = undefined;
+    const head = try lightCommand(&buf2, .{}, .head);
+    try testing.expectEqualStrings("\"{\\\"A\\\":10409,\\\"B\\\":0,\\\"C\\\":0}\"", head);
+
+    // The robot's own codes win over the built-in defaults, like the T numbers do.
+    var buf3: [128]u8 = undefined;
+    const custom = try lightCommand(&buf3, .{ .base_ct = 20001 }, .base);
+    try testing.expectEqualStrings("\"{\\\"A\\\":20001,\\\"B\\\":0,\\\"C\\\":0}\"", custom);
+}
+
+test "the light codes are read from the robot's config" {
+    // The `code:` section, which the bridge previously ignored entirely.
+    const yaml =
+        \\code:
+        \\  base_ct: 10410
+        \\  base_of: 10407
+        \\  head_ct: 10409
+        \\cmd_config:
+        \\  cmd_movition_ctrl: 1
+        \\
+    ;
+    const cfg = parseConfig(yaml);
+    try testing.expectEqual(@as(u32, 10410), cfg.codes.base_ct);
+    try testing.expectEqual(@as(u32, 10409), cfg.codes.head_ct);
 }

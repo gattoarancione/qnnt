@@ -179,6 +179,12 @@ pub fn build(b: *Build) void {
 
     const ugv_step = b.step("ugv", "Build the UGV Beast bridge, and the GUI with -Dqt=...");
 
+    const ugv_mjpeg_mod = b.createModule(.{
+        .root_source_file = b.path("examples/ugv/mjpeg.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const ugv_bridge_mod = b.createModule(.{
         .root_source_file = b.path("examples/ugv/bridge.zig"),
         .target = target,
@@ -187,6 +193,10 @@ pub fn build(b: *Build) void {
     ugv_bridge_mod.addImport("sio", ugv_sio_mod);
     ugv_bridge_mod.addImport("beast", ugv_beast_mod);
     ugv_bridge_mod.addImport("qnnt", qnnt_lib_mod);
+    ugv_bridge_mod.addImport("wire", wire_mod);
+    // The MJPEG reader: its own module because it is pure byte handling with tests of its
+    // own, and the bridge is the only thing here that does network I/O for video.
+    ugv_bridge_mod.addImport("mjpeg", ugv_mjpeg_mod);
     ugv_bridge_mod.linkLibrary(qnnt_lib);
 
     const ugv_bridge = b.addExecutable(.{ .name = "ugv-bridge", .root_module = ugv_bridge_mod });
@@ -777,6 +787,7 @@ pub fn build(b: *Build) void {
         "examples/dirigera/ws.zig",
         "examples/ugv/sio.zig",
         "examples/ugv/beast.zig",
+        "examples/ugv/mjpeg.zig",
         "examples/can/frame.zig",
     }) |src| {
         // Skipped without -Ddirigera-openssl, since it cannot link. See below.

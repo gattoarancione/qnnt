@@ -41,11 +41,14 @@
 //! because the operator should know and because the GUI scales its controls from it.
 
 const std = @import("std");
+const Io = std.Io;
 const qnnt_mod = @import("qnnt");
 const qnnt = qnnt_mod.Qnnt;
 const tld = qnnt_mod.Tld;
 const sio = @import("sio");
 const beast = @import("beast");
+const wire = @import("wire");
+const mjpeg = @import("mjpeg");
 
 const allocator = std.heap.page_allocator;
 
@@ -92,6 +95,26 @@ const TelemetryFrame = struct {
     motion_mode: bool,
 };
 
+/// One camera frame, as the robot produced it.
+///
+/// The JPEG is passed through untouched rather than decoded and re-encoded here: the bridge
+/// has no reason to look at the pixels, a re-encode would cost quality and CPU on a board
+/// that has neither to spare, and every consumer already has a JPEG decoder.
+const CameraFrame = struct {
+    seq: u64,
+    t_us: u64,
+    bytes: u32,
+    jpeg: tld.Bytes,
+};
+
+/// Cycle a light. Not a level: the robot offers no absolute set for either of them, so this
+/// is a request to advance one step, exactly what pressing the button on its own UI does.
+/// Either or both in one frame; a frame with neither set does nothing.
+const LightCommand = struct {
+    base: bool = false,
+    head: bool = false,
+};
+
 const StatusFrame = struct {
     t_us: u64,
     /// Commands are reaching the robot.
@@ -116,6 +139,11 @@ const StatusFrame = struct {
     commands_sent: u64,
     commands_failed: u64,
     telemetry_frames: u64,
+    /// The video stream is connected and frames are arriving.
+    video_link: bool,
+    video_frames: u64,
+    /// Frames the reader abandoned: a desynchronised stream, or one larger than it carries.
+    video_dropped: u64,
     /// Failed polls. Non-zero with a healthy `link` means the robot takes commands but the
     /// telemetry session has dropped.
     telemetry_errors: u64,
@@ -136,6 +164,16 @@ const Shared = struct {
 
     left: f32 = 0,
     right: f32 = 0,
+
+    /// A light cycle waiting to go out. A FLAG, not a count: pressing the button twice
+    /// before the next cycle should not queue two steps, and a setpoint resent every cycle
+    /// -- which is what drive is -- would strobe the light continuously.
+    light_base: bool = false,
+    light_head: bool = false,
+
+    video_link: bool = false,
+    video_frames: u64 = 0,
+    video_dropped: u64 = 0,
     /// When a drive command last arrived. The watchdog's input.
     last_drive_us: i64 = 0,
     /// No drive command has ever arrived. Distinct from a stale one: at startup the robot
@@ -170,6 +208,11 @@ const Shared = struct {
 var shared: Shared = .{};
 var deadman_ms: u64 = 500;
 
+/// On by default: the video is the point of a camera robot. `--no-video` turns it off, for
+/// a headless controller that wants the telemetry and none of the bandwidth -- the stream is
+/// about 17 KB a frame, which is most of what this bridge moves.
+var video_enabled: bool = true;
+
 /// The robot's limits, and the lock over them.
 ///
 /// This robot's Wi-Fi reboots without notice, so `GET /config` can fail at startup and
@@ -189,6 +232,14 @@ fn currentRules() struct { commands: beast.Commands, limits: beast.Limits, from_
         .limits = config.limits,
         .from_robot = config.from_robot,
     };
+}
+
+/// The robot's UI action codes, copied out under the lock like the rules above. The config
+/// is replaced wholesale when `/config` is read, so a reader must not hold a pointer in.
+fn currentCodes() beast.Codes {
+    config_mutex.lockUncancelable(qnnt_mod.io);
+    defer config_mutex.unlock(qnnt_mod.io);
+    return config.codes;
 }
 
 /// The robot's name into a caller-owned buffer, because `Config.name()` borrows from the
@@ -261,6 +312,10 @@ fn openSession(client: *sio.Client, authority: []const u8, reply: *std.ArrayList
     refreshConfig(authority);
 }
 
+var topic_lights_buf: [128]u8 = undefined;
+var topic_camera_buf: [128]u8 = undefined;
+var topic_lights: []const u8 = "";
+var topic_camera: []const u8 = "";
 var topic_drive_buf: [128]u8 = undefined;
 var topic_gimbal_buf: [128]u8 = undefined;
 var topic_telemetry_buf: [128]u8 = undefined;
@@ -275,6 +330,19 @@ var topic_status: []const u8 = "";
 /// Stores the setpoint and returns. Deliberately does no I/O: this runs on qnnt's
 /// subscriber thread, and an HTTP round trip here would stall delivery of the *next*
 /// command behind the robot's response to this one.
+fn onLights(topic: []const u8, frame: tld.Frame, context: ?*anyopaque) void {
+    _ = topic;
+    _ = context;
+    const cmd = tld.unpack(LightCommand, frame, null) catch |err| return reject("lights", err);
+    if (!cmd.base and !cmd.head) return;
+
+    shared.mutex.lockUncancelable(qnnt_mod.io);
+    defer shared.mutex.unlock(qnnt_mod.io);
+    // Set, never incremented: see the note on the fields.
+    if (cmd.base) shared.light_base = true;
+    if (cmd.head) shared.light_head = true;
+}
+
 fn onDrive(topic: []const u8, frame: tld.Frame, context: ?*anyopaque) void {
     _ = topic;
     _ = context;
@@ -353,6 +421,7 @@ fn outputLoop(rate_hz: u32, heartbeat_ms: u64) void {
     // A command must fail fast: the next cycle carries a fresher setpoint than a retry of
     // this one would, and a blocked send here would also stall the watchdog below.
     client.timeout_ms = 1500;
+    client.cancel = qnnt.stopRequested;
 
     var reply: std.ArrayList(u8) = .empty;
     defer reply.deinit(allocator);
@@ -436,6 +505,10 @@ fn outputLoop(rate_hz: u32, heartbeat_ms: u64) void {
             } else |_| {}
         }
 
+        // After the setpoints, so a light press never delays a drive command -- and once
+        // per pass, so holding the button does not strobe the light.
+        sendPendingLights(&client, &reply);
+
         _ = qnnt.sleepUs(tick_us);
     }
 
@@ -443,6 +516,176 @@ fn outputLoop(rate_hz: u32, heartbeat_ms: u64) void {
     if (beast.stopCommand(&cmd_buf, currentRules().commands)) |stop| {
         sendJson(&client, stop, &reply);
     } else |_| {}
+}
+
+/// Pull the robot's MJPEG stream and republish each frame on the camera topic.
+///
+/// Its own thread and its own TCP connection, not the Socket.IO session: this is a single
+/// long-lived HTTP response that never completes, and putting it on the session's transport
+/// would block the one poll the transport allows.
+///
+/// The bridge stays the only thing that talks to the robot, so a station -- local or across
+/// a federation link -- gets the video from a topic like everything else, and does not need
+/// to be able to reach the robot at all.
+fn videoLoop(authority: []const u8) void {
+    // One frame buffer for the life of the loop. Heap rather than stack because it is
+    // 512 KiB and a worker stack is not.
+    const frame_buf = allocator.alloc(u8, mjpeg.max_frame_bytes) catch {
+        std.debug.print("ugv-bridge: no memory for the video buffer, video disabled\n", .{});
+        return;
+    };
+    defer allocator.free(frame_buf);
+    var reader = mjpeg.Reader.init(frame_buf);
+
+    var pack: std.ArrayList(u8) = .empty;
+    defer pack.deinit(allocator);
+
+    var seq: u64 = 0;
+    var announced_failure = false;
+
+    while (!qnnt.stopRequested()) {
+        // A reconnect restarts the stream, so neither the chunk state nor a half-assembled
+        // frame may carry over into it.
+        reader.reset();
+
+        const address = wire.parseAuthority(authority) catch {
+            std.debug.print("ugv-bridge: video: '{s}' is not an address:port\n", .{authority});
+            return;
+        };
+        var stream = wire.connectWithDeadline(address, 3000) catch {
+            if (!announced_failure) {
+                announced_failure = true;
+                std.debug.print(
+                    "ugv-bridge: video: cannot reach {s}, retrying quietly\n",
+                    .{authority},
+                );
+            }
+            markVideoLink(false);
+            qnnt.sleepMs(2000);
+            if (qnnt.stopRequested()) return;
+            continue;
+        };
+        defer stream.close(qnnt_mod.io);
+
+        var req_buf: [256]u8 = undefined;
+        const request = std.fmt.bufPrint(
+            &req_buf,
+            "GET /video_feed HTTP/1.1\r\nHost: {s}\r\nConnection: close\r\n\r\n",
+            .{authority},
+        ) catch return;
+
+        var writer = stream.writer(qnnt_mod.io, &.{});
+        writer.interface.writeAll(request) catch {
+            markVideoLink(false);
+            qnnt.sleepMs(1000);
+            if (qnnt.stopRequested()) return;
+            continue;
+        };
+        writer.interface.flush() catch {};
+
+        announced_failure = false;
+
+        // EVERY read here is bounded, and the reason is the one sio.Client documents at
+        // length: a read with no deadline on a path that has gone away sits there until TCP
+        // gives up, about fifteen minutes on macOS. Worse than the delay, it goes through
+        // `Io`, so it holds an `Io.Threaded` pool thread for all of that -- and once the
+        // pool is starved the whole node stalls, registry and shutdown included. The first
+        // version of this loop used an unbounded reader and did exactly that: the bridge
+        // stopped answering Ctrl-C when the robot's Wi-Fi dropped.
+        //
+        // `SO_RCVTIMEO` is not the fix either: the timeout surfaces as EAGAIN and
+        // `Io.Threaded`'s read path treats EAGAIN as a bug and panics. `receiveTimeout` is
+        // the supported way, and it is what the Socket.IO client already uses.
+        //
+        // Short, so shutdown is noticed within one of them; a timeout is NOT an error,
+        // because this stream is genuinely slow -- measured at gaps of 2.5 s between frames
+        // -- and treating a gap as a failure would reconnect continuously.
+        const read_ms = 500;
+        const silent_limit_ms = 15000;
+        const deadline: Io.Timeout = .{ .duration = .{
+            .raw = .fromMilliseconds(read_ms),
+            .clock = .awake,
+        } };
+
+        var chunk: [16 * 1024]u8 = undefined;
+        var silent_ms: u64 = 0;
+        // How much of "\r\n\r\n" has been matched, so the header/body split survives a
+        // read boundary falling inside it.
+        var header_match: u8 = 0;
+        var in_body = false;
+
+        stream_loop: while (!qnnt.stopRequested()) {
+            const message = stream.socket.receiveTimeout(qnnt_mod.io, &chunk, deadline) catch |err| {
+                switch (err) {
+                    error.Timeout => {
+                        silent_ms += read_ms;
+                        // Nothing at all for this long is a stream that has stopped, not a
+                        // slow one. Reconnecting is how it comes back after the robot's
+                        // camera restarts.
+                        if (silent_ms >= silent_limit_ms) break :stream_loop;
+                        continue :stream_loop;
+                    },
+                    else => break :stream_loop,
+                }
+            };
+            if (message.data.len == 0) break :stream_loop; // the robot closed
+            silent_ms = 0;
+
+            var data = message.data;
+
+            if (!in_body) {
+                // Walk the header bytes looking for the blank line. Byte at a time because
+                // it may straddle two reads, and the cost is a few hundred bytes once.
+                var i: usize = 0;
+                while (i < data.len) {
+                    const c = data[i];
+                    i += 1;
+                    const want: u8 = if (header_match == 0 or header_match == 2) '\r' else '\n';
+                    header_match = if (c == want) header_match + 1 else if (c == '\r') 1 else 0;
+                    if (header_match == 4) {
+                        in_body = true;
+                        markVideoLink(true);
+                        break;
+                    }
+                }
+                data = data[i..];
+                if (!in_body) continue :stream_loop;
+            }
+
+            var at: usize = 0;
+            while (at < data.len) {
+                at += reader.push(data[at..]);
+                const jpeg = reader.take() orelse continue;
+
+                seq += 1;
+                const out: CameraFrame = .{
+                    .seq = seq,
+                    .t_us = @intCast(qnnt.nowMicros()),
+                    .bytes = @intCast(jpeg.len),
+                    .jpeg = .{ .data = jpeg },
+                };
+                tld.packTo(allocator, &pack, out) catch continue;
+                qnnt.publish(topic_camera, pack.items) catch {};
+
+                shared.mutex.lockUncancelable(qnnt_mod.io);
+                defer shared.mutex.unlock(qnnt_mod.io);
+                shared.video_frames += 1;
+                shared.video_dropped = reader.oversized;
+            }
+        }
+
+        markVideoLink(false);
+        // The robot's Wi-Fi drops and its camera restarts; reconnecting is normal, not an
+        // error, so this is quiet after the first failure.
+        qnnt.sleepMs(1000);
+            if (qnnt.stopRequested()) return;
+    }
+}
+
+fn markVideoLink(up: bool) void {
+    shared.mutex.lockUncancelable(qnnt_mod.io);
+    defer shared.mutex.unlock(qnnt_mod.io);
+    shared.video_link = up;
 }
 
 /// The watchdog: replace a setpoint nobody is refreshing with a stop.
@@ -487,6 +730,48 @@ fn sendJson(client: *sio.Client, json: []const u8, reply: *std.ArrayList(u8)) vo
     shared.link = true;
 }
 
+/// One /ctrl command. The robot's UI action codes go here rather than on /json, and as a
+/// STRING argument -- see beast.lightCommand for why the quoting is part of the protocol.
+fn sendCtrl(client: *sio.Client, arg: []const u8, reply: *std.ArrayList(u8)) void {
+    const current = currentSession();
+    client.emit(&current, ns_ctrl, "message", arg, reply) catch {
+        shared.mutex.lockUncancelable(qnnt_mod.io);
+        defer shared.mutex.unlock(qnnt_mod.io);
+        shared.commands_failed += 1;
+        return;
+    };
+    shared.mutex.lockUncancelable(qnnt_mod.io);
+    defer shared.mutex.unlock(qnnt_mod.io);
+    shared.commands_sent += 1;
+}
+
+/// Send any light cycle that has been requested since the last pass, and clear it.
+///
+/// Taken under the lock and sent outside it: `sendCtrl` does network I/O, and holding the
+/// state lock across that would stall every handler for the length of an HTTP round trip.
+fn sendPendingLights(client: *sio.Client, reply: *std.ArrayList(u8)) void {
+    var base = false;
+    var head = false;
+    {
+        shared.mutex.lockUncancelable(qnnt_mod.io);
+        defer shared.mutex.unlock(qnnt_mod.io);
+        base = shared.light_base;
+        head = shared.light_head;
+        shared.light_base = false;
+        shared.light_head = false;
+    }
+    if (!base and !head) return;
+
+    const codes = currentCodes();
+    var buf: [96]u8 = undefined;
+    if (base) {
+        if (beast.lightCommand(&buf, codes, .base)) |arg| sendCtrl(client, arg, reply) else |_| {}
+    }
+    if (head) {
+        if (beast.lightCommand(&buf, codes, .head)) |arg| sendCtrl(client, arg, reply) else |_| {}
+    }
+}
+
 // -- the telemetry loop ------------------------------------------------------------------
 
 /// Holds the single long poll the transport allows, on its own thread. Blocks for as long as
@@ -498,6 +783,8 @@ fn pollLoop(authority: []const u8) void {
     // say, bounded by its own 25 s ping interval. So this deadline is for a dead path, not
     // for a quiet robot.
     client.timeout_ms = 35_000;
+    // So a shutdown is not made to wait out the long poll: see sio.Client.cancel.
+    client.cancel = qnnt.stopRequested;
 
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(allocator);
@@ -623,6 +910,9 @@ fn publishStatus() !void {
         .commands_sent = shared.commands_sent,
         .commands_failed = shared.commands_failed,
         .telemetry_frames = shared.telemetry_frames,
+        .video_link = shared.video_link,
+        .video_frames = shared.video_frames,
+        .video_dropped = shared.video_dropped,
         .telemetry_errors = shared.telemetry_errors,
         .clamped = shared.clamped,
         .rejected = shared.rejected,
@@ -642,6 +932,7 @@ fn fetchConfig(authority: []const u8) beast.Config {
     defer client.deinit();
     // Startup, so a slow answer is better than a wrong assumption -- but not unbounded.
     client.timeout_ms = 5000;
+    client.cancel = qnnt.stopRequested;
 
     var body: std.ArrayList(u8) = .empty;
     defer body.deinit(allocator);
@@ -658,9 +949,16 @@ fn usage() void {
         \\  --topic <prefix>    topic prefix (default ugv/beast)
         \\  --rate <hz>         command rate, which is also the heartbeat (default 10)
         \\  --deadman <ms>      stop if no drive command arrives for this long (default 500)
+        \\  --no-video          do not pull the robot's MJPEG stream (about 17 KB a frame)
         \\
-        \\Publishes <prefix>/telemetry and <prefix>/status, subscribes <prefix>/drive and
-        \\<prefix>/gimbal.
+        \\Publishes <prefix>/telemetry, <prefix>/status and <prefix>/camera; subscribes
+        \\<prefix>/drive, <prefix>/gimbal and <prefix>/lights.
+        \\
+        \\<prefix>/camera carries the robot's own JPEG frames, passed through untouched.
+        \\<prefix>/lights takes {{base, head}} booleans and CYCLES those lights -- the robot
+        \\offers no absolute level for either, so this is one step per frame, exactly what
+        \\its own web UI sends. The resulting brightness comes back as base_light and
+        \\led_mode on the telemetry topic.
         \\
         \\Drive commands are {{left, right}} in [-1, 1], a fraction of full scale. The robot's
         \\own max_speed from GET /config is what that fraction is of; the bridge publishes it
@@ -704,6 +1002,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 std.debug.print("ugv-bridge: --heartbeat must be 20..2000 ms\n", .{});
                 return;
             }
+        } else if (std.mem.eql(u8, arg, "--no-video")) {
+            video_enabled = false;
         } else if (std.mem.eql(u8, arg, "--deadman")) {
             const text = args.next() orelse return usage();
             deadman_ms = std.fmt.parseInt(u64, text, 10) catch return usage();
@@ -719,6 +1019,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
     }
 
+    topic_lights = try std.fmt.bufPrint(&topic_lights_buf, "{s}/lights", .{prefix});
+    topic_camera = try std.fmt.bufPrint(&topic_camera_buf, "{s}/camera", .{prefix});
     topic_drive = try std.fmt.bufPrint(&topic_drive_buf, "{s}/drive", .{prefix});
     topic_gimbal = try std.fmt.bufPrint(&topic_gimbal_buf, "{s}/gimbal", .{prefix});
     topic_telemetry = try std.fmt.bufPrint(&topic_telemetry_buf, "{s}/telemetry", .{prefix});
@@ -765,6 +1067,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     };
 
     // Publishers before subscribers, so nothing attaches to a topic that never appears.
+    if (video_enabled and !qnnt.runPublisher(topic_camera, null, null, null)) {
+        std.debug.print("ugv-bridge: could not publish {s}\n", .{topic_camera});
+        return;
+    }
     if (!qnnt.runPublisher(topic_telemetry, null, null, null) or
         !qnnt.runPublisher(topic_status, null, null, null))
     {
@@ -774,6 +1080,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Frame delivery, not text: the commands are TLD objects. A text subscription waits
     // for a newline delimiter that binary TLD never contains, so the handler is never
     // called and nothing anywhere reports why.
+    if (!qnnt.subscribeFrames(topic_lights, onLights, null)) {
+        std.debug.print("ugv-bridge: could not subscribe to {s}\n", .{topic_lights});
+        return;
+    }
     if (!qnnt.subscribeFrames(topic_drive, onDrive, null) or
         !qnnt.subscribeFrames(topic_gimbal, onGimbal, null))
     {
@@ -809,6 +1119,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     const output = try std.Thread.spawn(.{}, outputLoop, .{ rate_hz, heartbeat_ms });
     const poll = try std.Thread.spawn(.{}, pollLoop, .{authority});
+    // Its own thread: one long-lived HTTP response that never completes, which cannot share
+    // a transport with the one poll Socket.IO allows.
+    var video: ?std.Thread = null;
+    if (video_enabled) video = try std.Thread.spawn(.{}, videoLoop, .{authority});
 
     // Telemetry as it arrives; status on a timer, so a subscriber that attaches late still
     // learns the robot's limits without waiting for one of them to change.
@@ -828,6 +1142,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     output.join();
     poll.join();
+    if (video) |v| v.join();
     publish_buf.deinit(allocator);
     std.debug.print("ugv-bridge: stopped, robot sent a stop\n", .{});
 }

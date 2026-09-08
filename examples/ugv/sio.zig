@@ -74,6 +74,16 @@ pub const Client = struct {
     /// the next one can be tried, while a long poll legitimately waits out the server's
     /// ping interval.
     timeout_ms: u32 = 2000,
+
+    /// Asked between bounded reads whether to give up early. Optional, and null keeps the
+    /// old behaviour exactly.
+    ///
+    /// It exists because a deadline and a shutdown are different things. The long poll
+    /// legitimately waits 35 s -- the robot holds the request open until it has something to
+    /// say -- but a process asked to stop must not wait that out. Without this the bridge
+    /// ignored Ctrl-C for 38 seconds after the robot's Wi-Fi dropped, which is
+    /// indistinguishable from a hang.
+    cancel: ?*const fn () bool = null,
     /// The raw response, headers and chunk framing included. Reused so a round trip at
     /// 10 Hz does not allocate.
     raw: std.ArrayList(u8) = .empty,
@@ -138,9 +148,10 @@ pub const Client = struct {
         out: *std.ArrayList(u8),
     ) !void {
         const address = wire.parseAuthority(authority) catch return error.Rejected;
-        const deadline = c.timeout();
 
-        var stream = wire.connectWithDeadline(address, c.timeout_ms) catch |err| return switch (err) {
+        // Capped separately: a connect that cannot be made fails quickly, and inheriting a
+        // long poll's 35 s read budget would make an unreachable robot take 35 s to say so.
+        var stream = wire.connectWithDeadline(address, @min(c.timeout_ms, 3000)) catch |err| return switch (err) {
             error.Timeout => error.Timeout,
             else => error.Rejected,
         };
@@ -171,12 +182,32 @@ pub const Client = struct {
         // -- the response, to EOF ---------------------------------------------------
         c.raw.clearRetainingCapacity();
         var chunk: [4096]u8 = undefined;
+
+        // Sliced rather than one long wait. The budget is still `timeout_ms`; it is simply
+        // spent in pieces, so `cancel` gets a look in between them. A read that returns
+        // Timeout here is not a failure -- it means "nothing yet", which is the normal
+        // state of a long poll.
+        const slice_ms: u32 = @min(c.timeout_ms, 250);
+        const slice: Io.Timeout = .{ .duration = .{
+            .raw = .fromMilliseconds(slice_ms),
+            .clock = .awake,
+        } };
+        var waited: u32 = 0;
+
         while (true) {
-            const message = stream.socket.receiveTimeout(c.io, &chunk, deadline) catch |err|
-                return switch (err) {
-                    error.Timeout => error.Timeout,
-                    else => error.Rejected,
-                };
+            const message = stream.socket.receiveTimeout(c.io, &chunk, slice) catch |err| {
+                switch (err) {
+                    error.Timeout => {
+                        if (c.cancel) |stop| {
+                            if (stop()) return error.Cancelled;
+                        }
+                        waited += slice_ms;
+                        if (waited >= c.timeout_ms) return error.Timeout;
+                        continue;
+                    },
+                    else => return error.Rejected,
+                }
+            };
             // The server closed, which is how every response here ends.
             if (message.data.len == 0) break;
             c.raw.appendSlice(c.allocator, message.data) catch return error.Rejected;

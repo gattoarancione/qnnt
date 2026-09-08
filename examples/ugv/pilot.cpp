@@ -35,6 +35,10 @@
 #include <QGuiApplication>
 #include <QObject>
 #include <QQmlApplicationEngine>
+#include <QQuickPaintedItem>
+#include <QPainter>
+#include <QImage>
+#include <QColor>
 #include <QQmlContext>
 #include <QTimer>
 #include <QUrl>
@@ -60,6 +64,80 @@ struct GimbalCmd {
     quint16 speed{};
     quint16 accel{};
     TLD_DEFINE_MAP(pan, tilt, speed, accel)
+};
+
+/// One camera frame, as the bridge republished it. Mirrors CameraFrame in bridge.zig.
+/// The live view. A painted item holding one decoded frame, which is the same shape the
+/// depth-camera viewer uses -- and the reason not to use an Image with an image provider is
+/// that the provider would decode on the render thread and the frame arrives on this one.
+///
+/// It holds ONE frame. A queue would only add latency: a frame that arrives while the
+/// previous one is still on screen is newer, and showing the newer one is the whole job.
+class VideoView : public QQuickPaintedItem
+{
+    Q_OBJECT
+    // Registered explicitly in main() rather than with QML_ELEMENT, which would need the
+    // qmlregistration header and a qt_add_qml_module build this example does not use.
+
+public:
+    VideoView() { setFillColor(QColor{"#0a0c10"}); }
+
+    /// Called from the frame handler with the JPEG exactly as the robot produced it.
+    void offer(const QByteArray& jpeg)
+    {
+        QImage decoded;
+        // Decoding here rather than in paint(): paint runs on the render thread and would
+        // block the UI for the length of a JPEG decode, every frame.
+        if (!decoded.loadFromData(jpeg, "JPEG")) {
+            ++m_undecodable;
+            return;
+        }
+        m_image = std::move(decoded);
+        ++m_shown;
+        update();
+    }
+
+    [[nodiscard]] quint64 shown() const { return m_shown; }
+    [[nodiscard]] quint64 undecodable() const { return m_undecodable; }
+    [[nodiscard]] QSize frameSize() const { return m_image.size(); }
+
+    void paint(QPainter* painter) override
+    {
+        if (m_image.isNull()) return;
+        // Fitted, never stretched: a robot camera's aspect ratio is information -- an
+        // operator judging a gap by eye must not be judging a distorted one.
+        const QSizeF box = size();
+        const QSizeF scaled = QSizeF{m_image.size()}.scaled(box, Qt::KeepAspectRatio);
+        const QRectF target{
+            (box.width() - scaled.width()) / 2,
+            (box.height() - scaled.height()) / 2,
+            scaled.width(),
+            scaled.height(),
+        };
+        painter->setRenderHint(QPainter::SmoothPixmapTransform, true);
+        painter->drawImage(target, m_image);
+    }
+
+private:
+    QImage m_image;
+    quint64 m_shown{0};
+    quint64 m_undecodable{0};
+};
+
+struct CameraFrame {
+    quint64 seq{};
+    quint64 t_us{};
+    quint32 bytes{};
+    std::vector<std::uint8_t> jpeg;
+    TLD_DEFINE_MAP(seq, t_us, bytes, jpeg)
+};
+
+/// Cycle a light. Mirrors LightCommand in bridge.zig: a step, not a level, because the
+/// robot offers no absolute set for either light.
+struct LightCommand {
+    bool base{};
+    bool head{};
+    TLD_DEFINE_MAP(base, head)
 };
 
 struct TelemetryFrame {
@@ -104,10 +182,14 @@ struct StatusFrame {
     quint64 telemetry_errors{};
     quint64 clamped{};
     quint64 rejected{};
+    bool video_link{};
+    quint64 video_frames{};
+    quint64 video_dropped{};
     TLD_DEFINE_MAP(t_us, link, telemetry_link, limits_from_robot, robot, max_speed,
                    pan_min_deg, pan_max_deg, tilt_min_deg, tilt_max_deg, commanded_left,
                    commanded_right, deadman, since_command_ms, commands_sent,
-                   commands_failed, telemetry_frames, telemetry_errors, clamped, rejected)
+                   commands_failed, telemetry_frames, telemetry_errors, clamped, rejected,
+                   video_link, video_frames, video_dropped)
 };
 
 /// How often the setpoint goes out. Must be comfortably inside the bridge's --deadman
@@ -128,6 +210,13 @@ class Pilot : public QObject
     Q_OBJECT
 
     // -- what the operator is asking for --------------------------------------------
+    /// What the pad drives: false the rover, true the camera arm.
+    ///
+    /// One control for both, rather than a pad for the rover and a row of preset buttons for
+    /// the arm. The presets could only jump to fixed angles, which is not how you aim a
+    /// camera -- you aim it by looking at the picture and moving until it is right, and that
+    /// is exactly what the pad already affords.
+    Q_PROPERTY(bool cameraMode READ cameraMode WRITE setCameraMode NOTIFY modeChanged)
     Q_PROPERTY(double throttle MEMBER m_throttle NOTIFY inputChanged)
     Q_PROPERTY(double left READ left NOTIFY inputChanged)
     Q_PROPERTY(double right READ right NOTIFY inputChanged)
@@ -147,6 +236,12 @@ class Pilot : public QObject
     Q_PROPERTY(double maxSpeed READ maxSpeed NOTIFY statusChanged)
     Q_PROPERTY(QString linkDetail READ linkDetail NOTIFY statusChanged)
     Q_PROPERTY(QString commandStats READ commandStats NOTIFY statusChanged)
+    Q_PROPERTY(bool videoLink READ videoLink NOTIFY statusChanged)
+    Q_PROPERTY(QString videoStats READ videoStats NOTIFY videoChanged)
+    /// 0-255 as the robot reports them, so the button can show what actually happened
+    /// rather than what was asked for.
+    Q_PROPERTY(int baseLight READ baseLight NOTIFY telemetryChanged)
+    Q_PROPERTY(int ledMode READ ledMode NOTIFY telemetryChanged)
 
     Q_PROPERTY(double voltage READ voltage NOTIFY telemetryChanged)
     Q_PROPERTY(double batteryFraction READ batteryFraction NOTIFY telemetryChanged)
@@ -176,6 +271,8 @@ public:
         node->addPublisher(topic("gimbal"));
         node->addSubscriber(topic("telemetry"), qnnt::QnntNode::Delivery::Frames);
         node->addSubscriber(topic("status"), qnnt::QnntNode::Delivery::Frames);
+        node->addSubscriber(topic("camera"), qnnt::QnntNode::Delivery::Frames);
+        node->addPublisher(topic("lights"));
         connect(node, &qnnt::QnntNode::frameAvailable, this, &Pilot::onFrame);
 
         // The fixed-rate output. See note 1 in the file header: this runs whether or not
@@ -262,6 +359,29 @@ public Q_SLOTS:
     void setKey(const QString& key, bool down)
     {
         const QString k = key.toLower();
+
+        // In camera mode the same keys nudge the arm. A NUDGE per key-down, not a held
+        // rate: the gimbal command is an absolute angle, so a rate would need a timer of
+        // its own here and would drift against whatever the arm actually reached. A step
+        // per press is also what an operator wants when framing a shot.
+        if (m_camera_mode) {
+            if (!down) return;
+            constexpr double step = 5.0;
+            double pan = m_aim_pan;
+            double tilt = m_aim_tilt;
+            if (k == QStringLiteral("a") || k == QStringLiteral("left")) pan -= step;
+            else if (k == QStringLiteral("d") || k == QStringLiteral("right")) pan += step;
+            else if (k == QStringLiteral("w") || k == QStringLiteral("up")) tilt += step;
+            else if (k == QStringLiteral("s") || k == QStringLiteral("down")) tilt -= step;
+            else return;
+
+            m_aim_pan = std::clamp(pan, panMin(), panMax());
+            m_aim_tilt = std::clamp(tilt, tiltMin(), tiltMax());
+            aimGimbal(m_aim_pan, m_aim_tilt);
+            Q_EMIT inputChanged();
+            return;
+        }
+
         if (k == QStringLiteral("w") || k == QStringLiteral("up")) m_fwd = down;
         else if (k == QStringLiteral("s") || k == QStringLiteral("down")) m_back = down;
         else if (k == QStringLiteral("a") || k == QStringLiteral("left")) m_leftward = down;
@@ -280,19 +400,85 @@ public Q_SLOTS:
     }
 
     /// The drag pad: -1..1 in each axis, y positive forward.
+    [[nodiscard]] bool cameraMode() const { return m_camera_mode; }
+
+    /// The axes' travel, as the robot reported it. Falling back to the conservative built-in
+    /// range rather than to zero: a zero range would make the pad inert and look broken,
+    /// where a small range simply aims less far until the status frame arrives.
+    [[nodiscard]] double panMin() const {
+        return m_have_status and m_status.pan_min_deg != 0 ? m_status.pan_min_deg : -180.0;
+    }
+    [[nodiscard]] double panMax() const {
+        return m_have_status and m_status.pan_max_deg != 0 ? m_status.pan_max_deg : 180.0;
+    }
+    [[nodiscard]] double tiltMin() const {
+        return m_have_status and m_status.tilt_min_deg != 0 ? m_status.tilt_min_deg : -30.0;
+    }
+    [[nodiscard]] double tiltMax() const {
+        return m_have_status and m_status.tilt_max_deg != 0 ? m_status.tilt_max_deg : 90.0;
+    }
+
+    /// Switching mode STOPS THE ROVER first, always, in both directions.
+    ///
+    /// Leaving for the camera while a track command stands would drive the robot with a
+    /// control that is no longer pointed at it -- the operator's hand is on the pad, the pad
+    /// now means "pan", and the rover keeps the last thing it was told. The deadman would
+    /// catch it in half a second, but a mode switch should not depend on a watchdog.
+    void setCameraMode(bool on)
+    {
+        if (on == m_camera_mode) return;
+        releaseAll();
+        m_camera_mode = on;
+        Q_EMIT modeChanged();
+        Q_EMIT inputChanged();
+    }
+
     void setPad(double x, double y)
     {
+        const double cx = std::clamp(x, -1.0, 1.0);
+        const double cy = std::clamp(y, -1.0, 1.0);
+
+        if (m_camera_mode) {
+            // The pad's position IS the aim, scaled to the axes' travel as the robot
+            // reported it -- so the pad's edge is the axis's limit rather than an arbitrary
+            // angle, and the same gesture means the same thing on a differently-built robot.
+            const double pan = cx >= 0 ? cx * panMax() : -cx * panMin();
+            const double tilt = cy >= 0 ? cy * tiltMax() : -cy * tiltMin();
+            m_aim_pan = pan;
+            m_aim_tilt = tilt;
+            aimGimbal(pan, tilt);
+            Q_EMIT inputChanged();
+            return;
+        }
+
         m_pad_active = true;
-        m_pad_x = std::clamp(x, -1.0, 1.0);
-        m_pad_y = std::clamp(y, -1.0, 1.0);
+        m_pad_x = cx;
+        m_pad_y = cy;
         recompute();
     }
 
+    /// Let go.
+    ///
+    /// The two modes differ here on purpose. The rover springs back to stopped, because a
+    /// vehicle that keeps moving when you release the control is the one failure this whole
+    /// bridge is built to prevent. The camera HOLDS its aim, because a camera that snapped
+    /// back to centre every time you let go could never be pointed at anything.
     void releasePad()
     {
+        if (m_camera_mode) return;
         m_pad_active = false;
         m_pad_x = m_pad_y = 0.0;
         recompute();
+    }
+
+    /// Centre the arm. What the pad's middle means, as a button, because reaching the exact
+    /// middle by hand is fiddly and centring is the one aim worth having a shortcut for.
+    void centreGimbal()
+    {
+        m_aim_pan = 0;
+        m_aim_tilt = 0;
+        aimGimbal(0, 0);
+        Q_EMIT inputChanged();
     }
 
     /// Zero now, and drop the operator's input with it. Not merely "publish a zero": if the
@@ -308,6 +494,49 @@ public Q_SLOTS:
 
     /// An absolute pan-tilt target. The bridge clamps to the axes' travel, so out-of-range
     /// values here are reduced rather than refused.
+    /// Cycle a light. One press, one step -- the robot has no absolute level for either, so
+    /// the button reports what happened by way of the telemetry that comes back rather than
+    /// by assuming it worked.
+    void cycleBaseLight()
+    {
+        LightCommand cmd;
+        cmd.base = true;
+        qnnt::QnntNode::instance()->publishPacked(topic("lights"), cmd);
+    }
+
+    void cycleHeadLight()
+    {
+        LightCommand cmd;
+        cmd.head = true;
+        qnnt::QnntNode::instance()->publishPacked(topic("lights"), cmd);
+    }
+
+    /// Where the decoded frames go. Set once from QML, because the item is created there.
+    void bindVideo(VideoView* view) { m_video = view; }
+
+    [[nodiscard]] bool videoLink() const { return m_have_status and m_status.video_link; }
+    [[nodiscard]] int baseLight() const { return m_have_telemetry ? m_telemetry.base_light : 0; }
+    [[nodiscard]] int ledMode() const { return m_have_telemetry ? m_telemetry.led_mode : 0; }
+
+    /// What the video path is doing, end to end: what the bridge pulled off the robot, what
+    /// reached here, and what would not decode. Three numbers because they fail separately
+    /// -- a robot that stopped sending, a topic nobody is publishing, and a frame that
+    /// arrived corrupt are three different problems.
+    [[nodiscard]] QString videoStats() const
+    {
+        const quint64 bridged = m_have_status ? m_status.video_frames : 0;
+        const quint64 dropped = m_have_status ? m_status.video_dropped : 0;
+        const quint64 shown = m_video ? m_video->shown() : 0;
+        const quint64 bad = (m_video ? m_video->undecodable() : 0) + m_camera_errors;
+        const QSize dim = m_video ? m_video->frameSize() : QSize{};
+
+        QString out = QStringLiteral("%1 shown / %2 bridged").arg(shown).arg(bridged);
+        if (!dim.isEmpty()) out += QStringLiteral("  %1x%2").arg(dim.width()).arg(dim.height());
+        if (dropped) out += QStringLiteral("  %1 dropped at the bridge").arg(dropped);
+        if (bad) out += QStringLiteral("  %1 undecodable").arg(bad);
+        return out;
+    }
+
     void aimGimbal(double pan, double tilt)
     {
         GimbalCmd cmd;
@@ -320,6 +549,8 @@ Q_SIGNALS:
     void inputChanged();
     void statusChanged();
     void telemetryChanged();
+    void videoChanged();
+    void modeChanged();
 
 private Q_SLOTS:
     void onFrame(const QString& topic_name, const QByteArray& frame)
@@ -329,6 +560,22 @@ private Q_SLOTS:
             m_telemetry_at_ms = m_elapsed.elapsed();
             m_have_telemetry = true;
             Q_EMIT telemetryChanged();
+        } else if (topic_name == topic("camera")) {
+            // Decoded and drawn, or counted as undecodable -- never silently dropped: a
+            // camera that shows nothing and reports nothing is indistinguishable from a
+            // camera that is off.
+            try {
+                const auto cam = qnnt::QnntNode::unpacked<CameraFrame>(frame);
+                if (m_video) {
+                    m_video->offer(QByteArray{
+                        reinterpret_cast<const char*>(cam.jpeg.data()),
+                        int(cam.jpeg.size()),
+                    });
+                    Q_EMIT videoChanged();
+                }
+            } catch (...) {
+                ++m_camera_errors;
+            }
         } else if (topic_name == topic("status")) {
             m_status = qnnt::QnntNode::unpacked<StatusFrame>(frame);
             m_have_status = true;
@@ -389,6 +636,13 @@ private:
     StatusFrame m_status;
     bool m_have_telemetry{false};
     bool m_have_status{false};
+    bool m_camera_mode{false};
+    /// The last aim sent, so the view can show where the arm was pointed even though the
+    /// pad has sprung back visually.
+    double m_aim_pan{0};
+    double m_aim_tilt{0};
+    VideoView* m_video{nullptr};
+    quint64 m_camera_errors{0};
     qint64 m_telemetry_at_ms{0};
     QElapsedTimer m_elapsed;
 };
@@ -406,6 +660,10 @@ int main(int argc, char* argv[])
 
     Pilot pilot(prefix);
     if (!pilot.started()) return 1;
+
+    // Registered so main.qml can create the view; the pilot is handed the instance from
+    // there, because QML owns the item's lifetime.
+    qmlRegisterType<VideoView>("Qnnt.Ugv", 1, 0, "VideoView");
 
     QQmlApplicationEngine engine;
     engine.rootContext()->setContextProperty(QStringLiteral("pilot"), &pilot);

@@ -15,6 +15,7 @@ import QtQuick.Window
 // linking QtQuickControls2 just to call QQuickStyle::setStyle.
 import QtQuick.Controls.Basic
 import QtQuick.Layouts
+import Qnnt.Ugv
 
 Window {
     id: root
@@ -126,6 +127,136 @@ Window {
             Layout.fillHeight: true
             spacing: 14
 
+            // -- the live view and the lights -------------------------------------
+            //
+            // The video comes off a topic, not from the robot's web server: the bridge is
+            // the only thing that talks to the robot, so this works from anywhere the topic
+            // reaches -- including across a federation link, from a machine that cannot
+            // route to the robot at all.
+            Rectangle {
+                Layout.preferredWidth: 360
+                Layout.fillHeight: true
+                radius: 10
+                color: "#1c1f26"
+                border.width: 1
+                border.color: pilot.videoLink ? "#2a2f38" : root.warn
+
+                ColumnLayout {
+                    anchors.fill: parent
+                    anchors.margins: 12
+                    spacing: 8
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        Text {
+                            text: "CAMERA"
+                            color: root.dim
+                            font.pixelSize: 11
+                            font.bold: true
+                            font.letterSpacing: 1
+                        }
+                        Item { Layout.fillWidth: true }
+                        // The robot's own idea of its frame rate, from telemetry -- which is
+                        // not the same as what arrives here, and the difference is the point.
+                        Text {
+                            text: pilot.videoFps.toFixed(1) + " fps at the robot"
+                            color: root.dim
+                            font.pixelSize: 10
+                            font.family: "Menlo"
+                        }
+                    }
+
+                    VideoView {
+                        id: video
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        Component.onCompleted: pilot.bindVideo(video)
+
+                        // Until a frame arrives there is nothing to draw, and saying so beats
+                        // an empty black rectangle that looks like a working camera at night.
+                        Text {
+                            anchors.centerIn: parent
+                            visible: !pilot.videoLink
+                            text: pilot.link ? "no video from the bridge"
+                                             : "waiting for the bridge"
+                            color: root.dim
+                            font.pixelSize: 12
+                        }
+                    }
+
+                    Text {
+                        text: pilot.videoStats
+                        color: root.dim
+                        font.pixelSize: 10
+                        font.family: "Menlo"
+                        Layout.fillWidth: true
+                        elide: Text.ElideRight
+                    }
+
+                    // -- lights ---------------------------------------------------
+                    //
+                    // Each press CYCLES one light: the robot exposes no absolute level, so
+                    // the button cannot show a target, only what the robot reports back.
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 8
+
+                        Button {
+                            text: "Base light"
+                            Layout.fillWidth: true
+                            enabled: pilot.link
+                            onClicked: pilot.cycleBaseLight()
+                            contentItem: Text {
+                                text: parent.text
+                                color: parent.enabled ? "#12141a" : root.dim
+                                font.pixelSize: 12
+                                font.bold: true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                radius: 6
+                                implicitHeight: 30
+                                // Lit by how bright the robot says it is, so the control
+                                // reflects the light rather than the last click.
+                                color: !parent.enabled ? "#242832"
+                                     : parent.down ? Qt.darker(root.accent, 1.3)
+                                     : Qt.rgba(1, 0.78, 0.35, 0.25 + 0.75 * (pilot.baseLight / 255))
+                            }
+                        }
+
+                        Button {
+                            text: "Head light"
+                            Layout.fillWidth: true
+                            enabled: pilot.link
+                            onClicked: pilot.cycleHeadLight()
+                            contentItem: Text {
+                                text: parent.text
+                                color: parent.enabled ? "#12141a" : root.dim
+                                font.pixelSize: 12
+                                font.bold: true
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
+                            }
+                            background: Rectangle {
+                                radius: 6
+                                implicitHeight: 30
+                                color: !parent.enabled ? "#242832"
+                                     : parent.down ? Qt.darker(root.accent, 1.3)
+                                     : Qt.rgba(1, 0.78, 0.35, 0.25 + 0.75 * (pilot.ledMode > 0 ? 1 : 0))
+                            }
+                        }
+                    }
+
+                    Text {
+                        text: "base_light " + pilot.baseLight + "   led_mode " + pilot.ledMode
+                        color: root.dim
+                        font.pixelSize: 10
+                        font.family: "Menlo"
+                    }
+                }
+            }
+
             // -- the drive pad ----------------------------------------------------
             Rectangle {
                 Layout.preferredWidth: 420
@@ -133,18 +264,65 @@ Window {
                 radius: 10
                 color: "#1c1f26"
                 border.width: 2
-                border.color: pilot.deadman ? root.warn : "#2a2f38"
+                border.color: pilot.deadman ? root.warn
+                            : pilot.cameraMode ? "#ffc75a" : "#2a2f38"
 
                 ColumnLayout {
                     anchors.fill: parent
                     anchors.margins: 16
                     spacing: 10
 
+                    // What the pad drives. One control, switched, rather than a pad for the
+                    // rover and preset buttons for the arm: aiming a camera means watching
+                    // the picture and moving until it is right, which is what a pad is for.
+                    //
+                    // Switching STOPS THE ROVER, in the pilot, in both directions -- see
+                    // setCameraMode. Nothing here should be the only thing preventing that.
+                    RowLayout {
+                        Layout.alignment: Qt.AlignHCenter
+                        spacing: 0
+
+                        Repeater {
+                            model: [
+                                { label: "ROVER",  camera: false },
+                                { label: "CAMERA", camera: true }
+                            ]
+                            delegate: Button {
+                                required property var modelData
+                                text: modelData.label
+                                implicitWidth: 92
+                                onClicked: {
+                                    pilot.cameraMode = modelData.camera;
+                                    keys.forceActiveFocus();
+                                }
+                                contentItem: Text {
+                                    text: parent.text
+                                    color: pilot.cameraMode === modelData.camera
+                                           ? "#12141a" : root.dim
+                                    font.pixelSize: 11
+                                    font.bold: true
+                                    font.letterSpacing: 1
+                                    horizontalAlignment: Text.AlignHCenter
+                                    verticalAlignment: Text.AlignVCenter
+                                }
+                                background: Rectangle {
+                                    implicitHeight: 26
+                                    radius: 5
+                                    color: pilot.cameraMode === modelData.camera
+                                           ? root.accent : "#22262f"
+                                    border.width: 1
+                                    border.color: "#2f353f"
+                                }
+                            }
+                        }
+                    }
+
                     Text {
                         text: pilot.deadman ? "WATCHDOG STOPPED THE ROBOT"
-                                            : "drive -- WASD or arrows, or drag"
+                             : pilot.cameraMode ? "aim -- drag, or WASD / arrows. it holds where you leave it"
+                             : "drive -- WASD or arrows, or drag. springs back to stopped"
                         color: pilot.deadman ? root.warn : root.dim
-                        font.pixelSize: 12
+                        font.pixelSize: 11
                         font.bold: pilot.deadman
                         Layout.alignment: Qt.AlignHCenter
                     }
@@ -383,11 +561,15 @@ Window {
                     }
                 }
 
-                // -- gimbal -------------------------------------------------------
+                // -- the arm ------------------------------------------------------
                 //
-                // Present but inert on this machine: its /config reports module_type 0, so
-                // no pan-tilt module is configured and the robot ignores T:133. Left in
-                // place because the command path is complete and the robot is a "PT" model.
+                // No preset buttons any more: the pad aims it, with the switch above. What
+                // is left is centring, which is the pad's exact middle and fiddly to hit by
+                // hand -- so it gets a button and nothing else does.
+                //
+                // NOTE: on this robot /config reports module_type 0, so no pan-tilt module
+                // is configured and the firmware ignores T:133. The command path is
+                // complete and the angles come back as telemetry on a robot that has one.
                 Rectangle {
                     Layout.fillWidth: true
                     height: 78
@@ -399,43 +581,41 @@ Window {
                         anchors.margins: 14
                         spacing: 6
 
-                        Text {
-                            text: "pan-tilt"
-                            color: root.dim
-                            font.pixelSize: 12
-                        }
                         RowLayout {
                             Layout.fillWidth: true
-                            spacing: 8
-                            Repeater {
-                                model: [
-                                    { label: "left",   pan: -45, tilt: 0 },
-                                    { label: "centre", pan: 0,   tilt: 0 },
-                                    { label: "right",  pan: 45,  tilt: 0 },
-                                    { label: "up",     pan: 0,   tilt: 45 },
-                                    { label: "down",   pan: 0,   tilt: -20 }
-                                ]
-                                delegate: Button {
-                                    Layout.fillWidth: true
-                                    text: modelData.label
-                                    onClicked: {
-                                        pilot.aimGimbal(modelData.pan, modelData.tilt);
-                                        keys.forceActiveFocus();
-                                    }
-                                    background: Rectangle {
-                                        radius: 5
-                                        color: parent.pressed ? "#2f3947" : "#22262f"
-                                        border.width: 1
-                                        border.color: "#2f353f"
-                                    }
-                                    contentItem: Text {
-                                        text: parent.text
-                                        color: "white"
-                                        font.pixelSize: 11
-                                        horizontalAlignment: Text.AlignHCenter
-                                        verticalAlignment: Text.AlignVCenter
-                                    }
-                                }
+                            Text {
+                                text: "camera arm"
+                                color: root.dim
+                                font.pixelSize: 12
+                            }
+                            Item { Layout.fillWidth: true }
+                            Text {
+                                text: pilot.panDeg.toFixed(0) + "\u00b0 / " + pilot.tiltDeg.toFixed(0) + "\u00b0"
+                                color: root.dim
+                                font.pixelSize: 11
+                                font.family: "Menlo"
+                            }
+                        }
+
+                        Button {
+                            Layout.fillWidth: true
+                            text: "centre"
+                            onClicked: {
+                                pilot.centreGimbal();
+                                keys.forceActiveFocus();
+                            }
+                            background: Rectangle {
+                                radius: 5
+                                color: parent.pressed ? "#2f3947" : "#22262f"
+                                border.width: 1
+                                border.color: "#2f353f"
+                            }
+                            contentItem: Text {
+                                text: parent.text
+                                color: "white"
+                                font.pixelSize: 11
+                                horizontalAlignment: Text.AlignHCenter
+                                verticalAlignment: Text.AlignVCenter
                             }
                         }
                     }

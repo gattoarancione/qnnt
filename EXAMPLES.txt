@@ -1236,9 +1236,57 @@ on the end of them:
 
     sio.zig      Socket.IO over its HTTP long-polling transport
     beast.zig    the robot's command and telemetry vocabulary, read from the robot
-    bridge.zig   the qnnt node: two topics subscribed, two published
-    pilot.cpp    Qt/QML: drive pad, throttle, telemetry, watchdog indicator
+    mjpeg.zig    JPEG frames out of the robot's chunked multipart video stream
+    bridge.zig   the qnnt node: three topics subscribed, three published
+    pilot.cpp    Qt/QML: one movement pad, live video, lights, watchdog indicator
     main.qml     the interface
+
+    subscribes   <prefix>/drive   <prefix>/gimbal   <prefix>/lights
+    publishes    <prefix>/telemetry  <prefix>/status  <prefix>/camera
+
+VIDEO GOES OVER A TOPIC, not from the robot's web server. The bridge stays the only
+thing that talks to the robot, so the station works from anywhere the topic reaches --
+including across a federation link, from a machine that cannot route to the robot at
+all. `--no-video` turns it off for a controller that wants telemetry and none of the
+bandwidth; a frame is about 15-20 KB.
+
+The stream needs no multipart parser, which is worth knowing before you write one.
+`GET /video_feed` is `multipart/x-mixed-replace` inside `Transfer-Encoding: chunked`,
+and a part carries NO Content-Length -- so the end of a frame has to be found. Finding
+it via the next boundary would put every frame one frame behind. JPEG delimits itself
+instead: SOI (FF D8) to EOI (FF D9), unambiguous because a literal FF inside entropy-
+coded data is always stuffed as FF 00. That also skips the part headers for free, since
+they are ASCII and ASCII has no FF. The chunked layer, by contrast, must be decoded
+properly: its size lines are ASCII hex and would otherwise be spliced into a frame.
+
+THE LIGHTS CYCLE, they do not set. The robot exposes no absolute level for either the
+chassis light or the head light, so `<prefix>/lights` takes {{base, head}} booleans and
+each one advances that light a step -- exactly what pressing the button on the robot's
+own web UI does. The resulting brightness comes back as base_light and led_mode on the
+telemetry topic, so the buttons show what the robot reports rather than what was asked.
+
+They also go on a different channel from everything else: drive and gimbal are
+`{{"T":<n>,...}}` JSON on the /json namespace, while the lights are UI action codes on
+/ctrl, sent as `{{"A":<code>,"B":0,"C":0}}` -- and as a JSON *string*, because the UI
+calls socket.send(JSON.stringify(...)) and Socket.IO's send is emit("message", x). The
+codes come from the robot's own config, like the T numbers.
+
+ONE MOVEMENT CONTROL, SWITCHED. The pad drives the rover or aims the camera arm,
+selected by the ROVER/CAMERA switch above it. The alternative -- a pad for the rover and
+preset buttons for the arm -- could only jump the arm to fixed angles, and aiming a
+camera means watching the picture and moving until it is right, which is what a pad is
+for. Two deliberate differences between the modes:
+
+  * switching mode STOPS THE ROVER first, in both directions. Leaving for the camera
+    with a track command standing would drive the robot with a control no longer
+    pointed at it. The deadman would catch it in half a second; a mode switch should
+    not depend on a watchdog.
+  * the rover pad springs back to stopped when released, the camera pad HOLDS its aim.
+    A vehicle that keeps moving when you let go is the failure this bridge exists to
+    prevent; a camera that snapped back to centre could never be pointed at anything.
+
+Space still stops the rover in both modes -- it is a reflex, and it should not mean
+something else because a switch is set. Centring the arm is its own button.
 
     zig build ugv -Dqt=/path/to/Qt/6.10.3/macos
     ./zig-out/bin/ugv-bridge --host 192.168.50.5:5000   # terminal 1
