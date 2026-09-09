@@ -18,6 +18,7 @@
 const std = @import("std");
 const qnnt = @import("qnnt.zig");
 const allocator = @import("alloc.zig").allocator;
+const tld_abi = @import("tld_abi.zig");
 
 comptime {
     // Pull the codec's exports into this library as well.
@@ -323,16 +324,9 @@ const FrameFn = *const fn (
     user: ?*anyopaque,
 ) callconv(.c) void;
 
-/// Must match qnnt_tld_frame in qnnt_tld.h, and the struct of the same shape in tld_c.zig.
-const CFrame = extern struct {
-    type: u8,
-    mod: u8,
-    ext_code: i16,
-    data: [*]const u8,
-    data_len: usize,
-    raw: [*]const u8,
-    raw_len: usize,
-};
+/// The same struct the TLD library hands out, from the one file that declares it -- rather
+/// than a third copy kept in step by a comment. See lib/tld_abi.zig.
+const CFrame = tld_abi.Frame;
 
 const FrameBox = struct {
     callback: FrameFn,
