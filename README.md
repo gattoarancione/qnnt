@@ -42,6 +42,39 @@ never breaks the rest of the build.
 | The CAN gateway | **Linux with `vcan`** | `CONFIG_CAN` + `CONFIG_CAN_VCAN`. The gateway is Linux-only; the *station* that watches it is not. |
 | Realtime options | **Linux** | `QNNT_RT_PRIORITY`, `QNNT_LOCK_MEMORY`. Refused elsewhere, with a reason. |
 
+### On macOS SDK 27, patch Zig's bundled `float.h` first
+
+Every `-lc++` link fails on a Mac whose SDK is 27 or newer, which takes the four C++ steps
+(`node-cpp`, `tld-demo-cpp`, `tld-map-cpp`, `cpp-logic-test`) down with it:
+
+```
+error: sub-compilation of libcxx failed
+  .../__random/clamp_to_integral.h:47:58: use of undeclared identifier 'INFINITY'
+```
+
+Zig compiles its own libc++ with `-std=c++23`, and C++20 and later turn on
+`__has_feature(modules)`. SDK 27's `math.h` reacts by handing `INFINITY` and `NAN` off to
+`<float.h>` through `__need_infinity_nan` instead of defining them itself. The Clang that
+Xcode ships answers that; the `float.h` bundled with Zig 0.16.0 predates the split, so
+nothing defines `INFINITY` and libc++ will not compile. The nullability warnings that bury
+the real message are noise — they were always warnings.
+
+No supported knob reaches it: neither `--sysroot` nor `SDKROOT` moves the `-isystem` that
+the libc++ sub-compilation uses, and its `-std` is internal. So patch the header:
+
+```sh
+tools/patch-zig-float-h.sh
+```
+
+It wraps Zig's `float.h` in a `__need_infinity_nan` branch and leaves all 187 original
+lines untouched in the `#else`, so only SDK 27's `math.h` ever takes the new path. Note
+that it edits the toolchain, not this repo: the change is **machine-wide**, `brew upgrade
+zig` reverts it (re-run — it is idempotent and refreshes its own backup), and
+`mv float.h.qnnt-orig float.h` next to the header undoes it. Drop the script once Zig
+ships a Clang whose `float.h` honours the macro.
+
+Nothing else is affected. The Zig, C and Python sides build and test clean without it.
+
 ### On a Mac, prefer colima over Docker Desktop
 
 Docker Desktop's LinuxKit kernel is built **without any CAN subsystem** — `ip link add type
@@ -66,7 +99,7 @@ rebuild after switching contexts. Details and the traps in `docker/README.md`.
 
 ```sh
 zig build                       # the library, the tools, the Zig examples
-zig build test                  # 281 tests
+zig build test                  # 291 tests
 
 zig build run-0                 # a node publishing test/topic-a and test/topic-b
 zig build ls -- --tree          # what is published
@@ -91,6 +124,7 @@ zig build cat -- test/topic-a   # read it
 - **Text** (newline-delimited) or **TLD frames** (arbitrary bytes) per topic
 - **Glob subscriptions** — `subscribePattern("bus/*")` joins matching topics as they appear
 - **Callback or queue** delivery; the queue is what the managed-runtime bindings use
+- **Per-topic teardown** — `removePublisher` / `removeSubscriber` stop one topic, node stays up
 - **Events**: subscriber connected/disconnected, publisher connected/disconnected/stale/resumed
 - **Federation** across hosts, any topology, with observed-address substitution
 - **Registry failover** with a warm directory mirror
@@ -246,7 +280,7 @@ Full walkthroughs, with the reasoning behind each decision: **`EXAMPLES.txt`**.
 ## Testing
 
 ```sh
-zig build test                      # 281 unit tests, incl. federation merge logic
+zig build test                      # 291 unit tests, incl. federation merge logic
 zig build cpp-logic                 # C++ logic and cross-language golden frames
 zig build python-demo               # the Python package against the built library
 
