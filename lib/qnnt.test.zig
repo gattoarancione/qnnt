@@ -1028,3 +1028,300 @@ test "removing after deinit is refused, not a crash" {
     try testing.expect(!qnnt.removePublisher("test/remove/after"));
     try testing.expect(!qnnt.removeSubscriber("test/remove/after"));
 }
+
+// ---------------------------------------------------------------- request / reply
+
+fn echoHandler(_: []const u8, request: []const u8, _: ?*anyopaque) ?[]const u8 {
+    // Static, because the reply is written to the socket AFTER this returns.
+    const store = struct {
+        var buf: [4096]u8 = undefined;
+    };
+    if (request.len > store.buf.len) return null;
+    @memcpy(store.buf[0..request.len], request);
+    return store.buf[0..request.len];
+}
+
+fn refusingHandler(_: []const u8, _: []const u8, _: ?*anyopaque) ?[]const u8 {
+    return null;
+}
+
+fn rpcCountingHandler(_: []const u8, _: []const u8, context: ?*anyopaque) ?[]const u8 {
+    const seen: *usize = @ptrCast(@alignCast(context.?));
+    seen.* += 1;
+    return "ok";
+}
+
+/// Responders register asynchronously, like publishers, so wait rather than guess.
+fn waitForProcedure(name: []const u8, timeout_ms: usize) !void {
+    var out: [256]u8 = undefined;
+    var len: usize = 0;
+    var waited: usize = 0;
+    while (waited < timeout_ms) : (waited += 25) {
+        // Generous per-probe timeout: an absent procedure answers `no_procedure` at once,
+        // so this only ever costs time against a responder that is slow on purpose.
+        if (qnnt.request(name, "ping", 2000, &out, &len) == .ok) return;
+        qnnt.sleepMs(25);
+    }
+    return error.ProcedureNeverAppeared;
+}
+
+test "a request reaches the responder and the reply comes back" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.addResponder("test/rpc/echo", &echoHandler, null));
+    try waitForProcedure("test/rpc/echo", 3000);
+
+    var out: [256]u8 = undefined;
+    var len: usize = 0;
+    try testing.expectEqual(qnnt.RpcStatus.ok, qnnt.request("test/rpc/echo", "hello", 2000, &out, &len));
+    try testing.expectEqualStrings("hello", out[0..len]);
+}
+
+test "an empty request and an empty reply are carried, not confused with failure" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.addResponder("test/rpc/echo2", &echoHandler, null));
+    try waitForProcedure("test/rpc/echo2", 3000);
+
+    var out: [64]u8 = undefined;
+    var len: usize = 1;
+    // Zero bytes in, zero bytes out, and still `ok` -- the status byte is what carries the
+    // difference between "nothing" and "no answer", which a bare length cannot.
+    try testing.expectEqual(qnnt.RpcStatus.ok, qnnt.request("test/rpc/echo2", "", 2000, &out, &len));
+    try testing.expectEqual(@as(usize, 0), len);
+}
+
+test "a handler that declines is reported as refused, not as an empty reply" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.addResponder("test/rpc/no", &refusingHandler, null));
+
+    var out: [64]u8 = undefined;
+    var len: usize = 0;
+    var waited: usize = 0;
+    while (waited < 3000) : (waited += 25) {
+        if (qnnt.request("test/rpc/no", "x", 500, &out, &len) == .refused) break;
+        qnnt.sleepMs(25);
+    } else return error.ProcedureNeverAppeared;
+
+    try testing.expectEqual(qnnt.RpcStatus.refused, qnnt.request("test/rpc/no", "x", 2000, &out, &len));
+    try testing.expectEqual(@as(usize, 0), len);
+}
+
+test "an unknown procedure fails fast instead of waiting out the timeout" {
+    try startNode();
+    defer qnnt.deinit();
+
+    var out: [64]u8 = undefined;
+    var len: usize = 0;
+    const began = qnnt.nowMicros();
+    // A 10s timeout that must NOT be waited out: an unresolvable name is known immediately.
+    try testing.expectEqual(
+        qnnt.RpcStatus.no_procedure,
+        qnnt.request("test/rpc/nobody", "x", 10_000, &out, &len),
+    );
+    const elapsed_us = qnnt.nowMicros() - began;
+    try testing.expect(elapsed_us < 2_000_000);
+}
+
+test "a topic is not a procedure, and a procedure is not a topic" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.runPublisher("test/rpc/stream", &source, 1000, null));
+    try testing.expect(qnnt.addResponder("test/rpc/proc", &echoHandler, null));
+    try waitForProcedure("test/rpc/proc", 3000);
+
+    // Calling a topic is refused rather than connecting to a publisher and waiting for a
+    // reply that stream will never send.
+    var out: [64]u8 = undefined;
+    var len: usize = 0;
+    try testing.expectEqual(
+        qnnt.RpcStatus.no_procedure,
+        qnnt.request("test/rpc/stream", "x", 1000, &out, &len),
+    );
+
+    // And the mirror: resolving a procedure as a topic is an error, not an endpoint.
+    var buf: [256]u8 = undefined;
+    const reply = try qnnt.registryCommand("sub test/rpc/proc", &buf);
+    try testing.expect(std.mem.indexOf(u8, reply, "not a topic") != null);
+}
+
+test "requestBegin returns immediately and the reply is drained later" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.addResponder("test/rpc/async", &echoHandler, null));
+    try waitForProcedure("test/rpc/async", 3000);
+
+    const began = qnnt.nowMicros();
+    const id = qnnt.requestBegin("test/rpc/async", "deferred", 3000);
+    const call_us = qnnt.nowMicros() - began;
+
+    try testing.expect(id != 0);
+    // The whole point: the call returns without waiting for the round trip.
+    try testing.expect(call_us < 500_000);
+
+    var out: [8]qnnt.QueuedReply = undefined;
+    const replies = qnnt.pollReplies(&out, 5000);
+    try testing.expectEqual(@as(usize, 1), replies.len);
+    try testing.expectEqual(id, replies[0].id);
+    try testing.expectEqual(qnnt.RpcStatus.ok, replies[0].status);
+    try testing.expectEqualStrings("deferred", replies[0].data);
+    try testing.expectEqualStrings("test/rpc/async", replies[0].procedure);
+}
+
+test "a non-blocking request to nowhere completes with a status rather than hanging" {
+    try startNode();
+    defer qnnt.deinit();
+
+    const id = qnnt.requestBegin("test/rpc/missing", "x", 1000);
+    try testing.expect(id != 0);
+
+    var out: [4]qnnt.QueuedReply = undefined;
+    const replies = qnnt.pollReplies(&out, 5000);
+    try testing.expectEqual(@as(usize, 1), replies.len);
+    try testing.expectEqual(id, replies[0].id);
+    try testing.expectEqual(qnnt.RpcStatus.no_procedure, replies[0].status);
+}
+
+test "several requests in flight all come back, each matched by its own ticket" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.addResponder("test/rpc/many", &echoHandler, null));
+    try waitForProcedure("test/rpc/many", 3000);
+
+    var ids: [8]u64 = undefined;
+    var payloads: [8][2]u8 = undefined;
+    for (0..8) |i| {
+        payloads[i] = .{ 'a' + @as(u8, @intCast(i)), 0 };
+        ids[i] = qnnt.requestBegin("test/rpc/many", payloads[i][0..1], 5000);
+        try testing.expect(ids[i] != 0);
+    }
+
+    var seen: usize = 0;
+    var matched: [8]bool = @splat(false);
+    var waited: usize = 0;
+    while (seen < 8 and waited < 10000) : (waited += 50) {
+        var out: [8]qnnt.QueuedReply = undefined;
+        for (qnnt.pollReplies(&out, 50)) |reply| {
+            for (ids, 0..) |id, i| {
+                if (id != reply.id) continue;
+                try testing.expectEqual(qnnt.RpcStatus.ok, reply.status);
+                // The ticket identifies WHICH call, so the payload must be that call's.
+                try testing.expectEqualStrings(payloads[i][0..1], reply.data);
+                matched[i] = true;
+                seen += 1;
+            }
+        }
+    }
+    try testing.expectEqual(@as(usize, 8), seen);
+    for (matched) |m| try testing.expect(m);
+}
+
+test "removeResponder stops it answering and drops the registration" {
+    var calls: usize = 0;
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.addResponder("test/rpc/gone", &rpcCountingHandler, &calls));
+    try waitForProcedure("test/rpc/gone", 3000);
+    const answered = calls;
+    try testing.expect(answered > 0);
+
+    try testing.expect(qnnt.removeResponder("test/rpc/gone"));
+    try testing.expect(!qnnt.removeResponder("test/rpc/gone"));
+
+    var out: [64]u8 = undefined;
+    var len: usize = 0;
+    var waited: usize = 0;
+    while (waited < 3000) : (waited += 25) {
+        if (qnnt.request("test/rpc/gone", "x", 500, &out, &len) == .no_procedure) break;
+        qnnt.sleepMs(25);
+    } else return error.StillRegistered;
+
+    // The handler is not merely unreachable, it is not running: nothing more arrives.
+    const after = calls;
+    qnnt.sleepMs(200);
+    try testing.expectEqual(after, calls);
+}
+
+test "a responder can be removed and the name served again" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.addResponder("test/rpc/cycle", &echoHandler, null));
+    try waitForProcedure("test/rpc/cycle", 3000);
+    try testing.expect(qnnt.removeResponder("test/rpc/cycle"));
+
+    try testing.expect(qnnt.addResponder("test/rpc/cycle", &echoHandler, null));
+    try waitForProcedure("test/rpc/cycle", 5000);
+}
+
+test "a reply larger than the caller's buffer is reported, not truncated" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.addResponder("test/rpc/big", &echoHandler, null));
+    try waitForProcedure("test/rpc/big", 3000);
+
+    const payload = "0123456789" ** 4; // 40 bytes
+    var small: [8]u8 = undefined;
+    var len: usize = 99;
+    try testing.expectEqual(
+        qnnt.RpcStatus.too_large,
+        qnnt.request("test/rpc/big", payload, 2000, &small, &len),
+    );
+    // Nothing was written, and the length says so rather than leaving a stale value.
+    try testing.expectEqual(@as(usize, 0), len);
+}
+
+test "request and removeResponder after deinit are refused, not a crash" {
+    try startNode();
+    try testing.expect(qnnt.addResponder("test/rpc/after", &echoHandler, null));
+    qnnt.sleepMs(200);
+    qnnt.deinit();
+
+    try testing.expect(!qnnt.removeResponder("test/rpc/after"));
+    try testing.expectEqual(@as(u64, 0), qnnt.requestBegin("test/rpc/after", "x", 100));
+}
+
+fn slowHandler(_: []const u8, _: []const u8, _: ?*anyopaque) ?[]const u8 {
+    qnnt.sleepMs(800);
+    return "slow";
+}
+
+test "requestBegin does not wait for a slow responder" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.addResponder("test/rpc/slow", &slowHandler, null));
+    try waitForProcedure("test/rpc/slow", 5000);
+
+    // The handler takes 800 ms. A blocking call cannot return in less than that, so the
+    // margin below is what separates "started the work" from "did the work" -- an echo
+    // responder could not tell them apart, which is why this one sleeps.
+    const began = qnnt.nowMicros();
+    const id = qnnt.requestBegin("test/rpc/slow", "x", 5000);
+    const call_us = qnnt.nowMicros() - began;
+
+    try testing.expect(id != 0);
+    try testing.expect(call_us < 200_000);
+
+    // And the reply still arrives, so returning early did not mean dropping the work.
+    var out: [4]qnnt.QueuedReply = undefined;
+    var waited: usize = 0;
+    while (waited < 5000) : (waited += 50) {
+        const replies = qnnt.pollReplies(&out, 50);
+        if (replies.len == 0) continue;
+        try testing.expectEqual(id, replies[0].id);
+        try testing.expectEqual(qnnt.RpcStatus.ok, replies[0].status);
+        try testing.expectEqualStrings("slow", replies[0].data);
+        return;
+    }
+    return error.ReplyNeverArrived;
+}

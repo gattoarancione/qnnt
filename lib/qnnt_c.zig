@@ -584,6 +584,190 @@ export fn qnnt_poll(
     return .ok;
 }
 
+// ---------------------------------------------------------------- request / reply
+
+/// Mirrors qnnt_rpc_status. Values are on the wire: append, never renumber.
+const RpcStatus = enum(c_int) {
+    ok = 0,
+    no_procedure = 1,
+    unreachable_host = 2,
+    timed_out = 3,
+    refused = 4,
+    too_large = 5,
+    failed = 6,
+};
+
+fn rpcStatus(status: qnnt.RpcStatus) RpcStatus {
+    return switch (status) {
+        .ok => .ok,
+        .no_procedure => .no_procedure,
+        .unreachable_host => .unreachable_host,
+        .timed_out => .timed_out,
+        .refused => .refused,
+        .too_large => .too_large,
+        .failed => .failed,
+    };
+}
+
+/// Serves one request. Return NULL to refuse, which the caller sees as QNNT_RPC_REFUSED
+/// rather than as an empty reply. The bytes returned are read AFTER this returns, so they
+/// must outlive the call -- same rule as qnnt_source_fn.
+const ResponderFn = *const fn (
+    procedure: [*]const u8,
+    procedure_len: usize,
+    request: [*]const u8,
+    request_len: usize,
+    reply_len: *usize,
+    user: ?*anyopaque,
+) callconv(.c) ?[*]const u8;
+
+const ResponderBox = struct {
+    callback: ResponderFn,
+    user: ?*anyopaque,
+};
+
+fn releaseResponderBox(ptr: *anyopaque) void {
+    allocator.destroy(@as(*ResponderBox, @ptrCast(@alignCast(ptr))));
+}
+
+fn responderTrampoline(procedure: []const u8, request: []const u8, context: ?*anyopaque) ?[]const u8 {
+    const box: *const ResponderBox = @ptrCast(@alignCast(context orelse return null));
+
+    var len: usize = 0;
+    const bytes = box.callback(
+        procedure.ptr,
+        procedure.len,
+        request.ptr,
+        request.len,
+        &len,
+        box.user,
+    ) orelse return null;
+    // An empty reply is legitimate, so a non-null pointer with length 0 is answered as an
+    // empty `ok` -- only NULL refuses.
+    return bytes[0..len];
+}
+
+/// Serve `procedure` on this node. Requests are answered one at a time, so a handler that
+/// touches shared state needs no lock of its own.
+export fn qnnt_add_responder(
+    procedure: ?[*]const u8,
+    procedure_len: usize,
+    callback: ?ResponderFn,
+    user: ?*anyopaque,
+) callconv(.c) Status {
+    const name = topicSlice(procedure, procedure_len) orelse return .invalid_argument;
+    const cb = callback orelse return .invalid_argument;
+
+    const box = allocator.create(ResponderBox) catch return .failed;
+    box.* = .{ .callback = cb, .user = user };
+    const started = qnnt.addResponderRun(name, responderTrampoline, box);
+    return keepBox(started, name, true, box, releaseResponderBox);
+}
+
+/// Stop serving it: joins the responder's threads and drops its registration. QNNT_FAILED
+/// when nothing of that name was being served here, and when called from its own handler.
+export fn qnnt_remove_responder(procedure: ?[*]const u8, procedure_len: usize) callconv(.c) Status {
+    const name = topicSlice(procedure, procedure_len) orelse return .invalid_argument;
+    if (!qnnt.removeResponder(name)) return .failed;
+    releaseBoxes(name, true);
+    return .ok;
+}
+
+/// One request, on the calling thread. Returns a qnnt_rpc_status, not a qnnt_status: the
+/// interesting outcomes here are "no such procedure" and "timed out", which the general
+/// status enum has no room for.
+export fn qnnt_request(
+    procedure: ?[*]const u8,
+    procedure_len: usize,
+    data: ?[*]const u8,
+    data_len: usize,
+    timeout_ms: u64,
+    out: ?[*]u8,
+    out_cap: usize,
+    out_len: ?*usize,
+) callconv(.c) RpcStatus {
+    const name = topicSlice(procedure, procedure_len) orelse return .failed;
+    const written = out_len orelse return .failed;
+    written.* = 0;
+
+    const payload: []const u8 = if (data) |d| d[0..data_len] else &.{};
+    const dst: []u8 = if (out) |o| o[0..out_cap] else &.{};
+
+    return rpcStatus(qnnt.requestRun(name, payload, timeout_ms, dst, written));
+}
+
+/// Start a request and return a ticket at once; 0 means it could not be started. Collect
+/// the reply with qnnt_poll_replies -- there is deliberately no completion callback, for
+/// the same reason qnnt_poll exists.
+export fn qnnt_request_begin(
+    procedure: ?[*]const u8,
+    procedure_len: usize,
+    data: ?[*]const u8,
+    data_len: usize,
+    timeout_ms: u64,
+) callconv(.c) u64 {
+    const name = topicSlice(procedure, procedure_len) orelse return 0;
+    const payload: []const u8 = if (data) |d| d[0..data_len] else &.{};
+    return qnnt.requestBeginRun(name, payload, timeout_ms);
+}
+
+/// Mirrors qnnt_reply. `procedure` and `data` point into library storage valid until the
+/// next qnnt_poll_replies, which recycles it.
+const CReply = extern struct {
+    id: u64,
+    status: RpcStatus,
+    procedure: [*]const u8,
+    procedure_len: usize,
+    data: [*]const u8,
+    data_len: usize,
+};
+
+var reply_scratch: std.ArrayList(qnnt.QueuedReply) = .empty;
+
+export fn qnnt_poll_replies(
+    out: ?[*]CReply,
+    max: usize,
+    timeout_ms: i32,
+    count: ?*usize,
+) callconv(.c) Status {
+    const dst = out orelse return .invalid_argument;
+    const written = count orelse return .invalid_argument;
+    written.* = 0;
+    if (max == 0) return .ok;
+
+    reply_scratch.resize(allocator, max) catch return .failed;
+
+    const batch = qnnt.pollReplies(reply_scratch.items, timeout_ms);
+    for (batch, 0..) |reply, i| {
+        dst[i] = .{
+            .id = reply.id,
+            .status = rpcStatus(reply.status),
+            .procedure = reply.procedure.ptr,
+            .procedure_len = reply.procedure.len,
+            .data = reply.data.ptr,
+            .data_len = reply.data.len,
+        };
+    }
+    written.* = batch.len;
+    return .ok;
+}
+
+export fn qnnt_requests_in_flight() callconv(.c) usize {
+    return qnnt.requestsInFlight();
+}
+
+export fn qnnt_rpc_status_name(status: RpcStatus) callconv(.c) [*:0]const u8 {
+    return switch (status) {
+        .ok => "ok",
+        .no_procedure => "no such procedure",
+        .unreachable_host => "host unreachable",
+        .timed_out => "timed out",
+        .refused => "refused by the responder",
+        .too_large => "payload too large",
+        .failed => "failed",
+    };
+}
+
 // ---------------------------------------------------------------- diagnostics
 
 export fn qnnt_status_name(status: Status) callconv(.c) [*:0]const u8 {

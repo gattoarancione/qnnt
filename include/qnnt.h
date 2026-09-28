@@ -334,6 +334,102 @@ qnnt_status qnnt_subscribe_pattern_frames(const char *pattern, size_t pattern_le
                                           qnnt_frame_fn callback, void *user,
                                           uint64_t rescan_ms);
 
+/* --- request/reply ----------------------------------------------------------- */
+
+/*
+ * The other shape: one request, one reply, addressed to a name.
+ *
+ * Discovery is the same directory publishers use, so a procedure federates and expires
+ * like a topic -- but the entry records which it is, and the two cannot be crossed: asking
+ * for a topic by qnnt_request is QNNT_RPC_NO_PROCEDURE rather than a connection that waits
+ * for a reply no publisher will send.
+ *
+ * On the wire a request is a 4-byte big-endian length then the bytes; a reply prefixes its
+ * payload with a status byte, which is what makes "refused" distinguishable from "an empty
+ * answer". Each call is its own connection, so callers never block behind one another and
+ * a dead peer is a failed connect rather than a hang. That handshake per call is also why
+ * this is a control-plane facility: for anything at streaming rates, publish.
+ */
+
+typedef enum {
+    QNNT_RPC_OK = 0,
+    /* No such procedure, or the name is a topic rather than a procedure. */
+    QNNT_RPC_NO_PROCEDURE = 1,
+    QNNT_RPC_UNREACHABLE = 2,
+    QNNT_RPC_TIMED_OUT = 3,
+    /* The responder ran and declined -- distinct from an empty reply. */
+    QNNT_RPC_REFUSED = 4,
+    /* The request, the reply, or the caller's buffer was too small for it. */
+    QNNT_RPC_TOO_LARGE = 5,
+    QNNT_RPC_FAILED = 6
+} qnnt_rpc_status;
+
+const char *qnnt_rpc_status_name(qnnt_rpc_status status);
+
+/*
+ * Serves one request, on the responder's own thread. Return NULL to refuse.
+ *
+ * Write the reply length through `reply_len` and return the bytes. Those bytes are read
+ * AFTER this returns, so they must outlive the call -- a literal, a global, or heap you
+ * keep alive, never a buffer on this function's stack. Same rule as qnnt_source_fn.
+ *
+ * Requests are served one at a time, so a handler touching shared state needs no lock.
+ */
+typedef const uint8_t *(*qnnt_responder_fn)(const char *procedure, size_t procedure_len,
+                                            const uint8_t *request, size_t request_len,
+                                            size_t *reply_len, void *user);
+
+/* Serve `procedure` on this node. */
+qnnt_status qnnt_add_responder(const char *procedure, size_t procedure_len,
+                               qnnt_responder_fn callback, void *user);
+
+/* Stop serving it: joins the responder's threads, then drops the registration. QNNT_FAILED
+ * when nothing of that name was served here, and when called from its own handler -- which
+ * would otherwise wait for the calling thread. */
+qnnt_status qnnt_remove_responder(const char *procedure, size_t procedure_len);
+
+/*
+ * One request, start to finish, on the calling thread.
+ *
+ * The reply is copied into `out` and its length written to `out_len`. A reply larger than
+ * `out_cap` is QNNT_RPC_TOO_LARGE with `out_len` set to 0 -- never a truncated answer that
+ * looks complete. `timeout_ms` of 0 means the default (5s).
+ */
+qnnt_rpc_status qnnt_request(const char *procedure, size_t procedure_len,
+                             const void *data, size_t data_len,
+                             uint64_t timeout_ms,
+                             void *out, size_t out_cap, size_t *out_len);
+
+/*
+ * The non-blocking form: start the request and return a ticket immediately, 0 if it could
+ * not be started at all. The reply is collected with qnnt_poll_replies.
+ *
+ * There is no completion callback by design. One would have to fire on a library thread,
+ * and that is exactly the crossing qnnt_poll exists to avoid -- so replies are drained,
+ * and the same loop can drain messages and replies together.
+ */
+uint64_t qnnt_request_begin(const char *procedure, size_t procedure_len,
+                            const void *data, size_t data_len,
+                            uint64_t timeout_ms);
+
+/* One completed request. `procedure` and `data` point into library storage that stays
+ * valid until the next qnnt_poll_replies, which recycles it. */
+typedef struct {
+    uint64_t id;
+    qnnt_rpc_status status;
+    const char *procedure;
+    size_t procedure_len;
+    const uint8_t *data;
+    size_t data_len;
+} qnnt_reply;
+
+/* Drain completed requests into `out`, writing how many through `count`. `timeout_ms` of 0
+ * polls, a negative value waits until something completes. */
+qnnt_status qnnt_poll_replies(qnnt_reply *out, size_t max, int32_t timeout_ms, size_t *count);
+
+/* How many qnnt_request_begin calls have not yet completed. */
+size_t qnnt_requests_in_flight(void);
+
 /* --- per-topic teardown ------------------------------------------------------ */
 
 /*

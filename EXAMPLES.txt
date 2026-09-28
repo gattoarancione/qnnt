@@ -2384,3 +2384,115 @@ WHAT IT IS NOT
 Not a pause. There is no retention in qnnt, so a removed-and-recreated publisher is a new
 publisher: subscribers see a disconnect and reconnect, and anything published in between
 reached nobody. That is the same thing they would have seen had the process restarted.
+
+
+--------------------------------------------------------------------------------
+ 23. Request/reply: procedures
+--------------------------------------------------------------------------------
+
+Everything else in qnnt is one-way. A procedure is the other shape: one request, one reply,
+addressed to a name.
+
+SERVING
+
+    Zig     Qnnt.addResponder("arm/home", handler, ctx)
+            Qnnt.removeResponder("arm/home")
+
+    C       qnnt_add_responder("arm/home", 8, handler, NULL);
+            qnnt_remove_responder("arm/home", 8);
+
+    C++     node->addResponder("arm/home", [](auto name, auto req) -> std::optional<QByteArray> {
+                return QByteArray("done");
+            });
+
+    Python  node.add_responder("arm/home", lambda name, req: b"done")
+
+A handler returns the reply, or refuses: `null` in Zig and C, `std::nullopt` in C++, `None`
+in Python. Refusing is NOT the same as replying with nothing -- the caller can tell them
+apart, which is what the status byte on the wire is for.
+
+Requests are served ONE AT A TIME, so a handler that touches shared state needs no lock
+against itself. It runs on the responder's own thread, not yours.
+
+The bytes a handler returns are written to the socket AFTER it returns, so they must
+outlive the call -- a literal, a global, or heap you keep alive, never a buffer on the
+handler's own frame. Same rule as a publisher's source callback.
+
+CALLING, BLOCKING
+
+    Zig     var out: [4096]u8 = undefined;
+            var len: usize = 0;
+            const status = Qnnt.request("arm/home", "now", 2000, &out, &len);
+
+    C       qnnt_rpc_status rc = qnnt_request("arm/home", 8, "now", 3, 2000,
+                                              out, sizeof out, &len);
+
+    C++     QByteArray reply = node->request("arm/home", "now", 2000);
+
+    Python  reply = node.request("arm/home", b"now", timeout=2.0)
+
+The status says what happened, and the distinctions are the point: `no_procedure` (nothing
+of that name, or it is a topic), `unreachable` (resolved, host did not answer),
+`timed_out`, `refused` (the handler declined), `too_large`.
+
+`no_procedure` comes back IMMEDIATELY rather than after the timeout: the registry either
+knows the name or does not, so calling something that is not there costs a round trip to
+loopback, not five seconds.
+
+CALLING, NON-BLOCKING
+
+This is the part the old Qt interface never had. `request` blocks, which is fine in a
+script and wrong in a GUI or a control loop: a 5 second timeout against an unreachable host
+freezes the caller for 5 seconds.
+
+    Zig     const id = Qnnt.requestBegin("arm/home", "now", 2000);   // returns at once
+            var out: [8]Qnnt.QueuedReply = undefined;
+            for (Qnnt.pollReplies(&out, 100)) |r| { ... r.id, r.status, r.data ... }
+
+    C       uint64_t id = qnnt_request_begin("arm/home", 8, "now", 3, 2000);
+            qnnt_poll_replies(replies, 8, 100, &count);
+
+    C++     quint64 id = node->requestBegin("arm/home", "now", 2000);
+            // connect(node, &QnntNode::replyAvailable, ...) -- fires on the Qt thread
+
+    Python  ticket = node.request_begin("arm/home", b"now", timeout=2.0)
+            for reply in node.poll_replies(timeout=0.1): ...
+
+`requestBegin` returns a ticket, 0 if it could not be started at all. Replies are DRAINED,
+not delivered by callback, for the same reason `subscribeQueue` exists: a completion
+callback would fire on a library thread, and entering a managed runtime from a thread it
+has never seen means taking the GIL and having nowhere to put an exception. Drain replies
+and messages from the same loop.
+
+The ticket is how a reply is matched to its call. Several can be in flight at once, they
+complete in whatever order they finish, and each carries the procedure that answered so one
+drain loop can serve many call sites. The Qt binding does the draining for you and emits
+replyAvailable() on the object's thread.
+
+There is a bound -- 256 in flight -- because each one holds a thread. Past it,
+`requestBegin` returns 0 rather than growing without limit.
+
+WHAT IT COSTS, AND WHEN NOT TO USE IT
+
+One TCP connection per call. That is deliberate: no correlation ids, no multiplexing, no
+head-of-line blocking between callers, and a dead peer is a failed connect rather than a
+request waiting for a reply that is never coming.
+
+It also means a request is a CONTROL-PLANE operation. For anything at streaming rates,
+publish: a topic amortises one connection over every message that follows, and a procedure
+pays for a new one each time.
+
+NAMES
+
+Procedures and topics share one namespace and one directory, so a procedure federates
+across hosts and expires exactly as a topic does, and `QNNT_PUBLISHER_PORTS` covers a
+responder's listener like any other.
+
+Sharing the namespace means they can collide, so the directory entry records which it is
+and the two resolve separately: requesting a topic is `no_procedure`, and subscribing to a
+procedure is an error rather than a connection that waits forever for a stream. That
+deadlock is what the entry kind exists to prevent -- of all the ways a name collision could
+be reported, two ends blocked on each other is the worst.
+
+Older peers federate fine: the kind is a field appended to `fed-entry`, and a build that
+predates it reads the six fields it knows and ignores the rest.

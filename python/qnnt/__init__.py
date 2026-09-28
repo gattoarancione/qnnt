@@ -37,9 +37,9 @@ from dataclasses import dataclass
 from typing import Any, Iterator, Sequence
 
 from . import tld
-from ._lib import Error, EventRecord as _CEvent, Message as _CMessage, declare, load
+from ._lib import Error, EventRecord as _CEvent, Message as _CMessage, Reply as _CReply, declare, load
 
-__all__ = ["Node", "Message", "Error", "tld", "version"]
+__all__ = ["Node", "Message", "Reply", "RpcStatus", "Error", "tld", "version"]
 
 _QUEUE_TEXT = 0
 _QUEUE_FRAMES = 1
@@ -110,6 +110,36 @@ class Event:
     at_us: int
 
 
+class RpcStatus(_enum.IntEnum):
+    """How a request ended. Mirrors qnnt_rpc_status in qnnt.h."""
+
+    ok = 0
+    no_procedure = 1
+    unreachable = 2
+    timed_out = 3
+    refused = 4
+    too_large = 5
+    failed = 6
+
+
+@dataclass(frozen=True)
+class Reply:
+    """One completed request, copied out of library storage.
+
+    `id` is the ticket `request_begin` returned, so one drain loop can serve many call
+    sites; `procedure` says which name answered.
+    """
+
+    id: int
+    status: RpcStatus
+    procedure: str
+    data: bytes
+
+    @property
+    def ok(self) -> bool:
+        return self.status is RpcStatus.ok
+
+
 @dataclass(frozen=True)
 class Message:
     """One received message. `data` is already copied out of library storage."""
@@ -140,6 +170,17 @@ class Node:
 
     _open: "Node | None" = None
 
+    # const uint8_t *(*)(const char *, size_t, const uint8_t *, size_t, size_t *, void *)
+    #
+    # The result is c_void_p rather than POINTER(c_uint8): ctypes refuses a typed pointer
+    # as a callback's return type, and the address is the same either way.
+    _RESPONDER_FN = C.CFUNCTYPE(
+        C.c_void_p,
+        C.POINTER(C.c_char), C.c_size_t,
+        C.POINTER(C.c_uint8), C.c_size_t,
+        C.POINTER(C.c_size_t), C.c_void_p,
+    )
+
     def __init__(
         self,
         *,
@@ -162,6 +203,10 @@ class Node:
         # Topics are retained by the library rather than copied, so the encoded bytes have
         # to be kept alive here for as long as the subscription exists.
         self._topics: dict[str, bytes] = {}
+        # Responder trampolines and the last reply each returned. Both are referenced by
+        # the library after the call that created them, so Python must not collect them.
+        self._responders: dict[str, Any] = {}
+        self._replies: dict[str, bytes] = {}
         self._closed = False
 
         # The library reads every QNNT_* variable itself, so all four languages agree on
@@ -291,6 +336,131 @@ class Node:
         """
         raw = self._topic_bytes(topic)
         return self._lib.qnnt_remove_subscriber(raw, len(raw)) == 0
+
+    # --- request/reply ------------------------------------------------------------
+    #
+    # The responder side DOES call into Python from a library thread, which the delivery
+    # path deliberately does not. The reasoning that rules it out there does not apply
+    # here: it is per message against per request, and a request has already paid for a TCP
+    # handshake, so one FFI crossing on top is noise. What remains is the exception
+    # problem, and that has a sensible answer for a procedure -- a handler that raises has
+    # declined, so it is reported to the caller as `refused` and the traceback is printed
+    # rather than swallowed.
+
+    def add_responder(self, procedure: str, handler) -> None:
+        """Serve `procedure`. `handler(procedure: str, request: bytes) -> bytes | None`.
+
+        Returning None refuses the request, which the caller sees as RpcStatus.refused --
+        distinct from returning b"", which is an empty but successful reply. A handler that
+        raises is treated as a refusal.
+
+        Requests are served one at a time, so a handler touching shared state needs no lock.
+        """
+        raw = self._topic_bytes(procedure)
+
+        def trampoline(name_ptr, name_len, req_ptr, req_len, out_len, _user):
+            try:
+                name = C.string_at(name_ptr, name_len).decode("utf-8", "replace")
+                request = C.string_at(req_ptr, req_len) if req_len else b""
+                reply = handler(name, request)
+            except Exception:  # noqa: BLE001 -- a raising handler is a refusal, not a crash
+                import traceback
+
+                traceback.print_exc()
+                return None
+            if reply is None:
+                return None
+            if not isinstance(reply, (bytes, bytearray, memoryview)):
+                raise TypeError("a responder must return bytes or None")
+            reply = bytes(reply)
+            # The C side reads these bytes AFTER this returns, so they have to outlive the
+            # call. Held until this procedure answers again, or is removed.
+            self._replies[procedure] = reply
+            out_len[0] = len(reply)
+            # The address of the stored bytes. Kept in _replies, so the buffer this points
+            # at outlives the return -- which is the whole contract for a reply.
+            return C.cast(C.c_char_p(reply), C.c_void_p).value
+
+        cb = self._RESPONDER_FN(trampoline)
+        # Both the closure and the ctypes thunk have to outlive this call, or the library
+        # is left holding a pointer to a collected object.
+        self._responders[procedure] = cb
+        try:
+            _check(
+                self._lib,
+                self._lib.qnnt_add_responder(raw, len(raw), C.cast(cb, C.c_void_p), None),
+                f"add_responder({procedure})",
+            )
+        except Error:
+            self._responders.pop(procedure, None)
+            raise
+
+    def remove_responder(self, procedure: str) -> bool:
+        """Stop serving `procedure`, leaving the rest of the node running.
+
+        Joins the responder's threads before returning, so afterwards the handler is not
+        running and will not be called again. Returns False when nothing of that name was
+        being served here.
+        """
+        raw = self._topic_bytes(procedure)
+        removed = self._lib.qnnt_remove_responder(raw, len(raw)) == 0
+        if removed:
+            self._responders.pop(procedure, None)
+            self._replies.pop(procedure, None)
+        return removed
+
+    def request(self, procedure: str, data: bytes = b"", *, timeout: float = 5.0,
+                max_reply: int = 1 << 20) -> bytes:
+        """Call `procedure` and wait for the reply. Raises Error on anything but success.
+
+        This blocks for up to `timeout` seconds. Use `request_begin` from anything with a
+        UI or a control loop -- an unreachable host costs the whole timeout here.
+        """
+        raw = self._topic_bytes(procedure)
+        out = (C.c_ubyte * max_reply)()
+        written = C.c_size_t(0)
+        status = self._lib.qnnt_request(
+            raw, len(raw), data, len(data), int(timeout * 1000),
+            out, max_reply, C.byref(written),
+        )
+        if status != 0:
+            name = self._lib.qnnt_rpc_status_name(status).decode()
+            raise Error(status, name, f"request({procedure})")
+        return bytes(bytearray(out[: written.value]))
+
+    def request_object(self, procedure: str, value: Any, **kwargs) -> Any:
+        """`request` with a TLD frame in each direction."""
+        return tld.loads(self.request(procedure, tld.dumps(value), **kwargs))
+
+    def request_begin(self, procedure: str, data: bytes = b"", *, timeout: float = 5.0) -> int:
+        """Start a request and return a ticket at once; 0 if it could not be started.
+
+        The reply arrives through `poll_replies`, matched by the ticket. Nothing blocks.
+        """
+        raw = self._topic_bytes(procedure)
+        return self._lib.qnnt_request_begin(raw, len(raw), data, len(data), int(timeout * 1000))
+
+    def poll_replies(self, *, timeout: float | None = 0.0, max_replies: int = 64) -> list[Reply]:
+        """Drain completed requests. `timeout=None` waits until one completes."""
+        buf = (_CReply * max_replies)()
+        count = C.c_size_t(0)
+        ms = -1 if timeout is None else int(timeout * 1000)
+        _check(self._lib, self._lib.qnnt_poll_replies(buf, max_replies, ms, C.byref(count)),
+               "poll_replies")
+        out: list[Reply] = []
+        for i in range(count.value):
+            r = buf[i]
+            out.append(Reply(
+                id=r.id,
+                status=RpcStatus(r.status),
+                procedure=C.string_at(r.procedure, r.procedure_len).decode("utf-8", "replace"),
+                data=bytes(bytearray(r.data[: r.data_len])) if r.data_len else b"",
+            ))
+        return out
+
+    def requests_in_flight(self) -> int:
+        """How many `request_begin` calls have not yet completed."""
+        return self._lib.qnnt_requests_in_flight()
 
     def subscribe(self, topic: str, *, frames: bool = False) -> None:
         """Subscribe, delivering into the queue that `poll` drains.

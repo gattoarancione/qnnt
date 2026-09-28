@@ -54,6 +54,7 @@
 #include <atomic>
 #include <cstring>
 #include <functional>
+#include <optional>
 #include <vector>
 
 /* ---------------------------------------------------------------- Qt types in TLD
@@ -315,6 +316,51 @@ public:
     /// would otherwise wait for the calling thread.
     bool removePublisher(const QString& topic);
 
+    /// --- request/reply ---------------------------------------------------------
+    ///
+    /// The other shape: one request, one reply, addressed to a name. Procedures live in
+    /// the same directory as topics -- so they federate and expire the same way -- but the
+    /// two cannot be crossed: requesting a topic fails rather than hanging.
+
+    /// Serve `procedure` on this node. Return std::nullopt to refuse, which the caller sees
+    /// as QNNT_RPC_REFUSED -- distinct from returning an empty QByteArray, which is an
+    /// empty but successful reply.
+    ///
+    /// The handler runs on the RESPONDER'S thread, not the Qt thread, exactly as
+    /// addScheduledPublisher()'s source does. Requests are served one at a time, so it
+    /// needs no lock against itself -- but it does against anything the GUI touches.
+    bool addResponder(const QString& procedure,
+                      std::function<std::optional<QByteArray>(const QString&, const QByteArray&)> handler);
+
+    /// Stop serving it: joins the responder's threads, then drops the registration. False
+    /// when nothing of that name was served here, and when called from its own handler.
+    bool removeResponder(const QString& procedure);
+
+    /// One request, BLOCKING the calling thread until the reply arrives or the timeout
+    /// expires. Never call this from the GUI thread with a timeout you would not freeze
+    /// for -- that is what requestBegin() is for. `status`, if given, receives the outcome.
+    QByteArray request(const QString& procedure, const QByteArray& data,
+                       int timeoutMs = 5000, qnnt_rpc_status* status = nullptr);
+
+    /// Start a request and return a ticket at once; 0 if it could not be started. The
+    /// reply arrives as replyAvailable() on this object's thread, matched by the ticket.
+    /// Nothing blocks, which is what makes this the one to call from a GUI.
+    quint64 requestBegin(const QString& procedure, const QByteArray& data, int timeoutMs = 5000);
+
+    /// requestBegin() with a TLD-mapped type as the payload -- the counterpart of
+    /// publishPacked(). Decode the reply with unpacked<T>().
+    template <class T>
+    quint64 requestBeginPacked(const QString& procedure, const T& value, int timeoutMs = 5000) {
+        const auto bytes = qnnt::tld::pack(value);
+        return requestBegin(procedure,
+                            QByteArray(reinterpret_cast<const char*>(bytes.data()),
+                                       static_cast<qsizetype>(bytes.size())),
+                            timeoutMs);
+    }
+
+    /// How many requestBegin() calls have not yet completed.
+    int requestsInFlight() const { return static_cast<int>(qnnt_requests_in_flight()); }
+
     /// Stop every subscription on a topic, whichever call started it. A topic reached
     /// through addSubscriberPattern() stays gone: the pattern will not rejoin it.
     ///
@@ -354,6 +400,11 @@ Q_SIGNALS:
 
     /// One whole TLD frame on a Delivery::Frames topic. Pass it to unpacked<T>().
     void frameAvailable(const QString& topic, const QByteArray& frame);
+
+    /// A request started with requestBegin() has completed. `status` is a qnnt_rpc_status;
+    /// compare against QNNT_RPC_OK. Emitted on this object's thread, so a slot may touch
+    /// the GUI directly.
+    void replyAvailable(quint64 id, int status, const QString& procedure, const QByteArray& data);
 
     /// The queue overflowed and discarded messages; `total` is cumulative. Emitted when the
     /// count changes, so connecting to it is how a Qt program notices it is falling behind.
@@ -417,6 +468,11 @@ private:
     QList<QPair<QString, Delivery>> m_patterns;
     /// Kept alive for the lifetime of the publisher: the C ABI holds the raw pointer.
     QMap<QString, std::function<QByteArray()>> m_sources;
+    /// The C ABI keeps a raw pointer to each of these for as long as the responder runs.
+    QMap<QString, std::function<std::optional<QByteArray>(const QString&, const QByteArray&)>> m_responders;
+    /// The last reply each procedure returned. The library reads those bytes after the
+    /// handler returns, so they have to outlive it.
+    QMap<QString, QByteArray> m_lastReply;
 
     friend class QnntPoller;
 };
@@ -443,6 +499,7 @@ public Q_SLOTS:
 
 Q_SIGNALS:
     void message(const QString& topic, const QByteArray& data);
+    void reply(quint64 id, int status, const QString& procedure, const QByteArray& data);
     void dropped_(quint64 total);
     void stopSeen();
     void finished();
@@ -485,6 +542,24 @@ inline void QnntPoller::run() {
             Q_EMIT message(QString::fromUtf8(msg.topic, static_cast<qsizetype>(msg.topic_len)),
                            QByteArray(reinterpret_cast<const char*>(msg.data),
                                       static_cast<qsizetype>(msg.data_len)));
+        }
+
+        // Replies share this thread rather than getting one of their own: the poll above
+        // already bounds the loop, and a request completing while it sleeps is picked up on
+        // the next turn -- at most kTimeoutMs later, which is not a latency that matters to
+        // something that just made a network round trip.
+        qnnt_reply replies[kBatch];
+        std::size_t reply_count = 0;
+        if (qnnt_poll_replies(replies, kBatch, 0, &reply_count) == QNNT_OK) {
+            for (std::size_t i = 0; i < reply_count; ++i) {
+                const qnnt_reply& r = replies[i];
+                // Copied on this thread, like messages: the library recycles both buffers
+                // on the next poll and the receiving slot may look much later.
+                Q_EMIT reply(r.id, static_cast<int>(r.status),
+                             QString::fromUtf8(r.procedure, static_cast<qsizetype>(r.procedure_len)),
+                             QByteArray(reinterpret_cast<const char*>(r.data),
+                                        static_cast<qsizetype>(r.data_len)));
+            }
         }
 
         const quint64 dropped = qnnt_queue_dropped();
@@ -640,6 +715,8 @@ inline bool QnntNode::start() {
     connect(m_thread, &QThread::started, m_poller, &QnntPoller::run);
     connect(m_poller, &QnntPoller::message, this, &QnntNode::messageDelivered,
             Qt::QueuedConnection);
+    connect(m_poller, &QnntPoller::reply, this, &QnntNode::replyAvailable,
+            Qt::QueuedConnection);
     connect(m_poller, &QnntPoller::dropped_, this, &QnntNode::messagesDropped,
             Qt::QueuedConnection);
     connect(m_poller, &QnntPoller::stopSeen, this, &QnntNode::stopRequested,
@@ -778,6 +855,101 @@ inline bool QnntNode::removeSubscriber(const QString& topic) {
     return true;
 }
 
+inline bool QnntNode::addResponder(
+    const QString& procedure,
+    std::function<std::optional<QByteArray>(const QString&, const QByteArray&)> handler) {
+    if (!handler) return false;
+
+    // The C ABI keeps the raw pointer, so the std::function has to outlive this call.
+    auto it = m_responders.insert(procedure, std::move(handler));
+
+    struct Trampoline {
+        static const std::uint8_t* call(const char* name, std::size_t name_len,
+                                        const std::uint8_t* request, std::size_t request_len,
+                                        std::size_t* reply_len, void* user) {
+            auto* self = static_cast<QnntNode*>(user);
+            const QString who = QString::fromUtf8(name, static_cast<qsizetype>(name_len));
+
+            const auto slot = self->m_responders.constFind(who);
+            if (slot == self->m_responders.constEnd()) return nullptr;
+
+            const QByteArray body(reinterpret_cast<const char*>(request),
+                                  static_cast<qsizetype>(request_len));
+            const std::optional<QByteArray> reply = (*slot)(who, body);
+            if (!reply) return nullptr; // std::nullopt refuses; an empty QByteArray does not
+
+            // Held on the node, because these bytes are written to the socket after this
+            // returns. Replaced on the next call to the same procedure.
+            self->m_lastReply[who] = *reply;
+            const QByteArray& kept = self->m_lastReply[who];
+            *reply_len = static_cast<std::size_t>(kept.size());
+            return reinterpret_cast<const std::uint8_t*>(kept.constData());
+        }
+    };
+
+    const QByteArray name = procedure.toUtf8();
+    const bool ok = check(qnnt_add_responder(name.constData(),
+                                             static_cast<std::size_t>(name.size()),
+                                             &Trampoline::call, this),
+                          QStringLiteral("addResponder(%1)").arg(procedure));
+    if (!ok) {
+        m_responders.erase(it);
+        return false;
+    }
+    return true;
+}
+
+inline bool QnntNode::removeResponder(const QString& procedure) {
+    const QByteArray name = procedure.toUtf8();
+    if (qnnt_remove_responder(name.constData(),
+                              static_cast<std::size_t>(name.size())) != QNNT_OK) {
+        return false;
+    }
+    // After the call, never before: the library has joined the responder, so no request can
+    // be part-way through the std::function this drops.
+    m_responders.remove(procedure);
+    m_lastReply.remove(procedure);
+    return true;
+}
+
+inline QByteArray QnntNode::request(const QString& procedure, const QByteArray& data,
+                                    int timeoutMs, qnnt_rpc_status* status) {
+    const QByteArray name = procedure.toUtf8();
+
+    // Sized once and reused per call rather than guessed small: a reply that does not fit
+    // is reported as too_large, and silently choosing a tiny cap here would turn ordinary
+    // replies into errors the caller cannot explain.
+    QByteArray out(1 << 20, Qt::Uninitialized);
+    std::size_t written = 0;
+    const qnnt_rpc_status rc = qnnt_request(name.constData(),
+                                            static_cast<std::size_t>(name.size()),
+                                            data.constData(),
+                                            static_cast<std::size_t>(data.size()),
+                                            static_cast<std::uint64_t>(timeoutMs),
+                                            out.data(),
+                                            static_cast<std::size_t>(out.size()),
+                                            &written);
+    if (status) *status = rc;
+    if (rc != QNNT_RPC_OK) {
+        Q_EMIT errorOccurred(QStringLiteral("request(%1)").arg(procedure),
+                             static_cast<int>(rc),
+                             QString::fromUtf8(qnnt_rpc_status_name(rc)));
+        return {};
+    }
+    out.truncate(static_cast<qsizetype>(written));
+    return out;
+}
+
+inline quint64 QnntNode::requestBegin(const QString& procedure, const QByteArray& data,
+                                      int timeoutMs) {
+    const QByteArray name = procedure.toUtf8();
+    return qnnt_request_begin(name.constData(),
+                              static_cast<std::size_t>(name.size()),
+                              data.constData(),
+                              static_cast<std::size_t>(data.size()),
+                              static_cast<std::uint64_t>(timeoutMs));
+}
+
 /// Which framing a delivered topic was subscribed with. A literal subscription answers
 /// directly; otherwise the patterns are asked, through the LIBRARY's matcher rather than a
 /// second implementation here -- a header that disagreed with the library about what
@@ -832,22 +1004,22 @@ inline quint64 QnntNode::droppedCount() const { return qnnt_queue_dropped(); }
  * undeclared on purpose: a method that compiles and then fails is worse than one that is
  * absent and documented.
  *
- *   addResponder / removeResponder / request / req<Tin,Tout>
- *   requestAvailable(QString procedure, QByteArray data)
- *       Request/reply does not exist. qnnt is publish/subscribe only: there is no
- *       responder socket role, no registry verb for a procedure, and no request path.
- *       Adding it needs a new socket role that reads a request and writes a reply, a way
- *       to register and resolve procedure names (the topic directory can carry them, which
- *       would give federation and expiry for free), a length-prefixed request/reply framing
- *       since payloads are binary, and a timeout on the client side. Then a Qt layer over
- *       it: request() as an async call returning a QFuture, or a requestAvailable() signal
- *       plus a reply() slot for the serving side.
+ *   requestAvailable(QString procedure, QByteArray data) + reply() slot
+ *       Request/reply itself now exists -- addResponder, removeResponder, request and
+ *       requestBegin are above. What is absent is serving a request FROM the Qt thread:
+ *       a handler passed to addResponder runs on the responder's own thread, as
+ *       addScheduledPublisher's source does. The signal/slot form would have to hold the
+ *       responder thread blocked while the Qt thread decided what to answer, with a
+ *       correlation id to pair the reply with its request and a timeout for a slot that
+ *       never replies. Worth doing when something needs it; until then a handler that
+ *       needs GUI state should copy what it needs under a lock, or answer from a worker.
  *
  *   responderConnected
- *       Needs the request/reply role above. The other four connection signals now exist:
- *       subscriberConnected, subscriberDisconnected, publisherConnected and
- *       publisherDisconnected are emitted from real library events, plus publisherStale
- *       and publisherResumed which the old class did not have.
+ *       No event is emitted when a requester connects. Requests are one connection each
+ *       and typically shorter-lived than the signal would be useful for -- the four
+ *       connection signals that do exist (subscriberConnected, subscriberDisconnected,
+ *       publisherConnected, publisherDisconnected, plus publisherStale and
+ *       publisherResumed) all concern long-lived streams.
  *
  * Also worth knowing when porting:
  *

@@ -114,6 +114,7 @@ zig build cat -- test/topic-a   # read it
 | **Directory** | `topic -> endpoint`, plus origin, version, subscriber counts. Refreshed by publishers every 2 s; entries expire when refreshes stop. |
 | **Topic** | A `/`-separated name. No hierarchy is enforced; the separator is a convention the tools and globs understand. |
 | **Direct data plane** | Subscribers dial publishers. The registry never carries a message. |
+| **Procedure** | A name in the same directory, marked as request/reply rather than a stream. One connection per call; a requester dials the responder directly, as a subscriber dials a publisher. |
 | **Federation** | Registries exchange directories over port 2223, gated by `QNNT_CLUSTER_KEY`. Entries carry their origin and version so merges converge without a coordinator. |
 | **Warm standby** | Every node keeps a mirrored copy of the directory, so registry takeover is ~0.2 s instead of a rebuild. |
 | **Node id** | A random per-process id. Identity for merge rules — never parsed as an address. |
@@ -125,6 +126,7 @@ zig build cat -- test/topic-a   # read it
 - **Glob subscriptions** — `subscribePattern("bus/*")` joins matching topics as they appear
 - **Callback or queue** delivery; the queue is what the managed-runtime bindings use
 - **Per-topic teardown** — `removePublisher` / `removeSubscriber` stop one topic, node stays up
+- **Request/reply** — `addResponder` + `request`, with a non-blocking `requestBegin` that returns a ticket
 - **Events**: subscriber connected/disconnected, publisher connected/disconnected/stale/resumed
 - **Federation** across hosts, any topology, with observed-address substitution
 - **Registry failover** with a warm directory mirror

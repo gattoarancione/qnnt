@@ -61,8 +61,34 @@ pub const PeerRecord = struct {
 /// and stays visible; one that stops is over.
 pub const conflict_window_us: u64 = 30 * std.time.us_per_s;
 
+/// What a directory entry names. Topics and procedures share one namespace deliberately --
+/// one directory means one federation path and one expiry rule for both -- so the entry has
+/// to say which it is. Without that a subscriber could resolve a procedure and sit waiting
+/// for a stream that will never come, while the responder waits for a request: two ends
+/// blocked on each other, which is the worst way to report a name collision.
+///
+/// Values are on the wire (fed-entry's 7th field). Append, never renumber.
+pub const EntryKind = enum(u8) {
+    topic = 0,
+    responder = 1,
+
+    /// A kind off the wire. An unrecognised one comes from a peer newer than this build,
+    /// and degrades to `.topic` rather than being dropped: the entry is still a real
+    /// endpoint worth federating onward, and the worst that follows is that a local
+    /// requester is told the name is a topic rather than a procedure.
+    pub fn fromWire(value: u8) EntryKind {
+        return switch (value) {
+            0 => .topic,
+            1 => .responder,
+            else => .topic,
+        };
+    }
+};
+
 pub const TopicEntry = struct {
     endpoint: net.IpAddress,
+    /// Stream or procedure. See `EntryKind`.
+    kind: EntryKind = .topic,
     first_us: u64, // first time this topic was registered
     last_us: u64, // most recent refresh
 
@@ -206,7 +232,7 @@ pub fn isShuttingDown() bool {
 // global flag OR this token's, so a topic can be stopped on its own and a node shutdown
 // still stops all of them.
 
-const TopicKind = enum { publisher, subscriber };
+const TopicKind = enum { publisher, subscriber, responder };
 
 const TopicToken = struct {
     /// Owned, and the name the workers themselves use -- so a topic's name outlives the
@@ -402,19 +428,17 @@ fn stopTopicToken(token: *TopicToken) void {
     pending.deinit(allocator);
 }
 
-/// Stop the publisher for `topic` on this node: its accept loop, its registry refresh and
-/// its scheduler, then drop the registration and close the delivery connections.
+/// Cancel a named worker of one kind, join it, and drop its registration.
 ///
-/// Returns false when no publisher of that name is running here, and when called from one
-/// of that publisher's own threads -- a source callback asking to remove its own topic
-/// would otherwise wait for itself.
-pub fn removePublisher(topic: []const u8) bool {
+/// The body of `removePublisher`, `removeSubscriber` and `removeResponder`: they differ in
+/// which kind they look for and what they clean up afterwards, not in the teardown itself.
+fn stopAndForget(name: []const u8, kind: TopicKind, label: []const u8) bool {
     // Guarded because these are documented as safe to call speculatively, and the obvious
     // place to call one is on the way out -- possibly after `deinit`, where the mutexes
     // below would be reaching for an `io` that is already gone.
     if (!node_running) return false;
 
-    const token = detachTopicToken(topic, .publisher) orelse return false;
+    const token = detachTopicToken(name, kind) orelse return false;
 
     if (current_topic_token == token) {
         // Put it back: nothing was stopped, and leaving it detached would strand the
@@ -422,14 +446,15 @@ pub fn removePublisher(topic: []const u8) bool {
         topic_tokens_mutex.lockUncancelable(io);
         defer topic_tokens_mutex.unlock(io);
         topic_tokens.append(allocator, token) catch {};
-        std.debug.print("removePublisher {s}: refused, called from its own thread\n", .{topic});
+        std.debug.print("{s} {s}: refused, called from its own thread\n", .{ label, name });
         return false;
     }
 
     stopTopicToken(token);
 
-    // Only now that the accept loop is gone can the delivery connections be closed: a
-    // live loop would be appending to the very list being torn down.
+    // Only now that the accept loop is gone can the delivery connections be closed: a live
+    // loop would be appending to the very list being torn down. Empty for a responder,
+    // which finishes with each connection as it goes.
     {
         subscribers_mutex.lockUncancelable(io);
         defer subscribers_mutex.unlock(io);
@@ -441,7 +466,7 @@ pub fn removePublisher(topic: []const u8) bool {
     }
 
     // Best effort, and deliberately after the workers are gone: the refresh loop would
-    // otherwise re-register the topic between this and its next tick. A registry that is
+    // otherwise re-register the name between this and its next tick. A registry that is
     // down or mid-failover just means the entry expires on its own instead.
     var buf: [256]u8 = undefined;
     var cmd_buf: [256]u8 = undefined;
@@ -452,13 +477,26 @@ pub fn removePublisher(topic: []const u8) bool {
     return true;
 }
 
+/// Stop publishing one topic on this node: its accept loop, its registry refresh and its
+/// scheduler, then drop the registration and close the delivery connections.
+///
+/// Returns false when no publisher of that name is running here, and when called from one
+/// of that publisher's own threads -- a source callback asking to remove its own topic
+/// would otherwise wait for itself.
+pub fn removePublisher(topic: []const u8) bool {
+    return stopAndForget(topic, .publisher, "removePublisher");
+}
+
 /// Stop every subscription this node holds on `topic`, whichever flavour started it.
 ///
 /// A topic joined by a glob stays gone: `patternLoop` never forgets what it has joined, so
 /// its next rescan passes over this name rather than resubscribing.
 pub fn removeSubscriber(topic: []const u8) bool {
-    if (!node_running) return false; // see removePublisher
+    if (!node_running) return false; // see stopAndForget
 
+    // Not `stopAndForget`: a topic may hold SEVERAL subscriptions and one call takes them
+    // all, and a subscriber has no registration to drop -- only the publisher's entry names
+    // the topic in the directory.
     var removed = false;
     while (detachTopicToken(topic, .subscriber)) |token| {
         if (current_topic_token == token) {
@@ -1208,6 +1246,35 @@ pub const Qnnt = struct {
     /// glob stays gone -- the pattern does not rejoin it. See `removeSubscriber`.
     pub const removeSubscriber = &@import("qnnt.zig").removeSubscriber;
 
+    // --- request/reply -------------------------------------------------------------
+    //
+    // The other shape: one request, one reply, addressed to a name. See the notes above
+    // `RpcStatus` for the wire and why discovery reuses the topic directory.
+
+    /// Serves one request. See `ResponderHandlerFn` for the lifetime of what it returns.
+    pub const ResponderHandler = ResponderHandlerFn;
+    /// How a request ended. See `RpcStatus`.
+    pub const RpcStatus = @import("qnnt.zig").RpcStatus;
+    /// One completed request, as `pollReplies` hands it back. See `QueuedReply`.
+    pub const QueuedReply = @import("qnnt.zig").QueuedReply;
+
+    /// Serve `procedure` on this node. Requests are answered one at a time.
+    pub const addResponder = &addResponderRun;
+    /// Stop serving it, and drop its registration. Sibling of `removePublisher`.
+    pub const removeResponder = &@import("qnnt.zig").removeResponder;
+
+    /// One request, on the calling thread, returning when the reply arrives or the timeout
+    /// expires. A control-plane call: it costs a connection. See `requestRun`.
+    pub const request = &requestRun;
+
+    /// Start a request and return a ticket immediately. The reply is collected with
+    /// `pollReplies`, never through a callback on a library thread. See `requestBeginRun`.
+    pub const requestBegin = &requestBeginRun;
+    /// Drain completed requests, as `poll` drains messages.
+    pub const pollReplies = &@import("qnnt.zig").pollReplies;
+    /// How many requests started with `requestBegin` have not yet completed.
+    pub const requestsInFlight = &@import("qnnt.zig").requestsInFlight;
+
     /// The topics the registry knows, for discovery: see `listTopics`.
     pub const listTopics = &@import("qnnt.zig").listTopics;
 
@@ -1373,8 +1440,38 @@ fn clientCommand(command: []const u8) !Reply {
             try buffer.print(allocator, "error: malformed uri '{s}', expected tcp://<host>:<port>\n", .{uri});
             return ownedReply(&buffer);
         };
-        try registerTopic(topic, endpoint, node_id);
+        try registerTopic(topic, endpoint, node_id, .topic);
         try buffer.print(allocator, "ok\n", .{});
+    } else if (eqlAny(verb, &.{"rpc"})) {
+        // "rpc <procedure> tcp://<host>:<port>" — a responder registering its endpoint.
+        // Same directory as `pub`, so federation and expiry come for free; the entry is
+        // marked so a subscriber cannot resolve it by mistake.
+        const name = it.next() orelse return usageReply(&buffer, "rpc <procedure> <uri>");
+        const uri = it.next() orelse return usageReply(&buffer, "rpc <procedure> <uri>");
+        const endpoint = parseTcpUri(uri) catch {
+            try buffer.print(allocator, "error: malformed uri '{s}', expected tcp://<host>:<port>\n", .{uri});
+            return ownedReply(&buffer);
+        };
+        try registerTopic(name, endpoint, node_id, .responder);
+        try buffer.print(allocator, "ok\n", .{});
+    } else if (eqlAny(verb, &.{"rpc-find"})) {
+        // `sub` for procedures, and deliberately a separate verb: it refuses to answer for
+        // a streaming topic. A requester that got a publisher's address here would send a
+        // request nobody reads and then wait out its timeout on every call.
+        const name = it.next() orelse return usageReply(&buffer, "rpc-find <procedure>");
+        directory_mutex.lockUncancelable(io);
+        defer directory_mutex.unlock(io);
+        if (directory.get(name)) |entry| {
+            if (entry.kind != .responder) {
+                try buffer.print(allocator, "error: {s} is a topic, not a procedure\n", .{name});
+            } else if (!federation.entryIsServable(&entry, @intCast(nowMicrosFn()))) {
+                try buffer.print(allocator, "error: procedure {s} expired\n", .{name});
+            } else {
+                try buffer.print(allocator, "tcp://{f}\n", .{entry.endpoint});
+            }
+        } else {
+            try buffer.print(allocator, "error: procedure {s} not found\n", .{name});
+        }
     } else if (eqlAny(verb, &.{"sub"})) {
         // Hand the subscriber the complete URI of the topic's publisher so it
         // can connect there directly.
@@ -1382,6 +1479,11 @@ fn clientCommand(command: []const u8) !Reply {
         directory_mutex.lockUncancelable(io);
         defer directory_mutex.unlock(io);
         if (directory.get(topic)) |entry| {
+            // The mirror of `rpc-find`'s check: a subscriber handed a responder's address
+            // would connect and wait for a stream that only arrives in reply to a request.
+            if (entry.kind != .topic) {
+                try buffer.print(allocator, "error: {s} is a procedure, not a topic\n", .{topic});
+            } else
             // A remote entry whose origin has gone quiet is withheld rather than handed
             // out: pointing a subscriber at an unreachable host only makes it retry.
             if (!federation.entryIsServable(&entry, @intCast(nowMicrosFn()))) {
@@ -1805,7 +1907,7 @@ fn writeStatus(buffer: *std.ArrayList(u8)) !void {
 // Record (or refresh) a topic's publisher endpoint in the discovery directory.
 // The topic key arrives in a transient network buffer, so it is heap-owned on
 // first insert and left untouched on refresh.
-fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId) !void {
+fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId, kind: EntryKind) !void {
     const now_us: u64 = @intCast(nowMicrosFn());
 
     // Notified after the lock is released: waking a connector while holding the directory
@@ -1835,6 +1937,7 @@ fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId) !vo
             .learned_us = now_us,
             .conflict_us = 0,
             .local = true,
+            .kind = kind,
         };
         changed = true;
         return;
@@ -1852,6 +1955,7 @@ fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId) !vo
         gop.value_ptr.last_us = now_us;
         gop.value_ptr.version = now_us;
         gop.value_ptr.local = true;
+        gop.value_ptr.kind = kind;
         return;
     }
 
@@ -1866,6 +1970,7 @@ fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId) !vo
     // one and every host ended up preferring someone else's publisher.
     gop.value_ptr.conflict_us = now_us;
     gop.value_ptr.local = true;
+    gop.value_ptr.kind = kind;
     gop.value_ptr.origin = origin;
     gop.value_ptr.endpoint = endpoint;
     gop.value_ptr.last_us = now_us;
@@ -3798,6 +3903,553 @@ pub fn publisherRun(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: ?
     return true;
 }
 
+// ---------------------------------------------------------------- request / reply
+//
+// Everything above this line is one-way: a publisher writes and whoever is listening
+// reads. A procedure is the other shape -- one request, one reply, addressed to a name --
+// and it needs three things pub/sub does not have.
+//
+// DISCOVERY is the directory, unchanged. A responder registers its endpoint exactly as a
+// publisher does, which is what buys federation, expiry and the publisher port range for
+// free rather than building a second naming scheme beside the first. The entry carries an
+// `EntryKind` so the two cannot be confused; see the note there for why a collision that
+// merely deadlocked would be the worst outcome.
+//
+// FRAMING is a 4-byte big-endian length and then the bytes. Deliberately not TLD: a
+// payload here is opaque to qnnt, and very often IS a TLD frame, so imposing TLD would
+// mean either double-encoding or forbidding raw bytes. A reply prefixes its payload with
+// one status byte, so "the handler refused" is distinguishable from "the handler returned
+// nothing", which a bare length cannot express.
+//
+// LIFETIME is one connection per call. No correlation ids, no multiplexing, no
+// head-of-line blocking between concurrent callers, and a dead peer is a failed connect
+// rather than a request that waits for a reply that is never coming. The cost is a TCP
+// handshake per call, which is why `request` is documented as a control-plane operation:
+// for anything at streaming rates, publish.
+
+/// How a request ended. Values cross the C ABI: append, never renumber.
+pub const RpcStatus = enum(u8) {
+    ok = 0,
+    /// No such procedure in the directory, or the name is a topic rather than a procedure.
+    no_procedure = 1,
+    /// The procedure resolved but its host could not be reached.
+    unreachable_host = 2,
+    /// No reply within the timeout.
+    timed_out = 3,
+    /// The responder ran and declined to answer -- the handler returned null.
+    refused = 4,
+    /// The request or the reply was larger than `maxFrameBytes`.
+    too_large = 5,
+    /// Anything else: a malformed reply, a connection broken mid-exchange.
+    failed = 6,
+};
+
+/// Serves one request. Returns the reply, or null to refuse -- which reaches the caller as
+/// `refused`, distinct from an empty reply.
+///
+/// Runs on the responder's own thread, so it must be thread-safe. `request` is valid only
+/// for the call. The RETURN value is written to the socket after the handler returns, so it
+/// must outlive the call: a literal, a global, or heap the handler keeps alive -- never a
+/// buffer on the handler's frame. Same contract as `SourceHandler`.
+pub const ResponderHandlerFn = *const fn (
+    procedure: []const u8,
+    request: []const u8,
+    context: ?*anyopaque,
+) ?[]const u8;
+
+/// Default deadline for a request that does not name one.
+pub const default_request_timeout_ms: u64 = 5000;
+
+/// How long a responder waits for a client that has connected to finish sending. A client
+/// that opens a connection and then stops -- crashed, or hostile -- must not hold the
+/// responder's only thread for ever.
+const responder_read_timeout_ms: u64 = 5000;
+
+/// In-flight `requestBegin` calls. Each holds a thread, so this is a real bound rather
+/// than a formality: the failure it prevents is a caller looping on requestBegin against a
+/// dead procedure and spawning a thread per iteration.
+pub const max_pending_requests: usize = 256;
+
+fn deadlineFrom(timeout_ms: u64) u64 {
+    const now: u64 = @intCast(nowMicrosFn());
+    const ms = if (timeout_ms == 0) default_request_timeout_ms else timeout_ms;
+    return now +| ms *| 1000;
+}
+
+/// Fill `dest` completely, or fail. The deadline covers the whole fill, not each read, so
+/// a peer dribbling one byte at a time cannot extend it indefinitely.
+fn receiveExact(sock: *const net.Socket, dest: []u8, deadline_us: u64) !void {
+    var filled: usize = 0;
+    while (filled < dest.len) {
+        const now: u64 = @intCast(nowMicrosFn());
+        if (now >= deadline_us) return error.TimedOut;
+
+        const remain_ms = (deadline_us - now + 999) / 1000;
+        const timeout: Io.Timeout = .{ .duration = .{
+            .raw = Io.Duration.fromMilliseconds(@intCast(@min(remain_ms, 1 << 30))),
+            .clock = .awake,
+        } };
+
+        const message = sock.receiveTimeout(io, dest[filled..], timeout) catch |err| switch (err) {
+            error.Timeout => return error.TimedOut,
+            else => return error.Broken,
+        };
+        // Zero bytes with no error is the peer closing: more will never arrive, so waiting
+        // out the rest of the deadline would only delay the same answer.
+        if (message.data.len == 0) return error.Broken;
+        filled += message.data.len;
+    }
+}
+
+fn sendAll(stream: *net.Stream, bytes: []const u8) !void {
+    var writer = stream.writer(io, &.{});
+    try writer.interface.writeAll(bytes);
+}
+
+/// `[u32 be length][body]`. The length counts the body only.
+fn sendFrame(stream: *net.Stream, first: []const u8, rest: []const u8) !void {
+    var header: [4]u8 = undefined;
+    std.mem.writeInt(u32, &header, @intCast(first.len + rest.len), .big);
+    try sendAll(stream, &header);
+    if (first.len != 0) try sendAll(stream, first);
+    if (rest.len != 0) try sendAll(stream, rest);
+}
+
+/// Read one length-prefixed frame into `buf`, returning what it holds.
+fn receiveFrame(sock: *const net.Socket, buf: *std.ArrayList(u8), deadline_us: u64) ![]u8 {
+    var header: [4]u8 = undefined;
+    try receiveExact(sock, &header, deadline_us);
+
+    const len = std.mem.readInt(u32, &header, .big);
+    // The length is 4 attacker-controlled bytes, so it is checked before it is trusted as
+    // an allocation size -- the same rule `readFrame` follows for TLD.
+    if (len > maxFrameBytes()) return error.TooLarge;
+
+    buf.clearRetainingCapacity();
+    try buf.ensureTotalCapacity(allocator, len);
+    buf.items.len = len;
+    if (len != 0) try receiveExact(sock, buf.items, deadline_us);
+    return buf.items;
+}
+
+// ---------------------------------------------------------------- responder side
+
+/// Keep the registry's directory pointing at this responder. `registerLoop` for procedures:
+/// the same refresh cadence and the same reason -- a registry elected after a failover has
+/// to re-learn what is served here.
+fn rpcRegisterLoop(token: *TopicToken, endpoint: net.IpAddress) void {
+    while (!token.stopping()) {
+        rpcRegisterOnce(token.topic, endpoint) catch {}; // registry not up yet / mid-failover
+        if (!sleepMsInterruptibleFor(token, registry_probe_interval_ms)) return;
+    }
+}
+
+fn rpcRegisterOnce(procedure: []const u8, endpoint: net.IpAddress) !void {
+    var cmd_buf: [320]u8 = undefined;
+    const command = try std.fmt.bufPrint(&cmd_buf, "rpc {s} tcp://{f}", .{ procedure, endpoint });
+    var reply_buf: [256]u8 = undefined;
+    _ = try registryCommand(command, &reply_buf);
+}
+
+fn responderLoop(token: *TopicToken, handler: ResponderHandlerFn, context: ?*anyopaque) !void {
+    const procedure = token.topic;
+
+    var server = listenForPublisher(procedure) catch |err| {
+        if (err != error.ShuttingDown) {
+            std.debug.print("responder {s}: not started\n", .{procedure});
+        }
+        return;
+    };
+    defer server.deinit(io);
+
+    if (!trackSocketFor(token, server.socket, .listener)) return;
+    defer untrackSocketFor(token, server.socket);
+
+    var endpoint: net.IpAddress = try .parse(advertiseText(), 0);
+    endpoint.setPort(server.socket.address.getPort());
+
+    std.debug.print("responder {s} listening on tcp://{f}\n", .{ procedure, endpoint });
+
+    if (!spawnWorkerFor(token, rpcRegisterLoop, .{ token, endpoint })) {
+        std.debug.print("failed to spawn register loop for responder {s}\n", .{procedure});
+    }
+
+    // One buffer for the whole responder, reused per request rather than per connection.
+    var request_buf: std.ArrayList(u8) = .empty;
+    defer request_buf.deinit(allocator);
+
+    while (!token.stopping()) {
+        var client = server.accept(io) catch |err| {
+            if (token.stopping()) return; // our own shutdown, or this procedure's
+            return err;
+        };
+        // Unlike a publisher's subscriber list, a request connection is finished with at
+        // the end of this iteration -- so it is closed here, and the waker connection that
+        // `breakTopicSockets` uses to interrupt the accept is closed here too. That is safe
+        // where it is not for a publisher: nothing has bound this port from a fixed range
+        // and gone on to need it back within the TIME_WAIT window, because the responder
+        // holding it is the thing being torn down.
+        defer client.close(io);
+
+        if (token.stopping()) return;
+
+        serveRequest(procedure, &client, handler, context, &request_buf) catch |err| {
+            // One bad client is not a reason to stop answering everyone else.
+            if (err != error.Broken and err != error.TimedOut) {
+                std.debug.print("responder {s}: {t}\n", .{ procedure, err });
+            }
+        };
+    }
+}
+
+fn serveRequest(
+    procedure: []const u8,
+    client: *net.Stream,
+    handler: ResponderHandlerFn,
+    context: ?*anyopaque,
+    buf: *std.ArrayList(u8),
+) !void {
+    const deadline = deadlineFrom(responder_read_timeout_ms);
+
+    const request = receiveFrame(&client.socket, buf, deadline) catch |err| {
+        // A request too large to read still gets an answer, so the caller learns why
+        // rather than timing out. Nothing else can be said on a broken connection.
+        if (err == error.TooLarge) {
+            sendFrame(client, &.{@intFromEnum(RpcStatus.too_large)}, &.{}) catch {};
+        }
+        return err;
+    };
+
+    if (handler(procedure, request, context)) |reply| {
+        if (reply.len > maxFrameBytes()) {
+            std.debug.print(
+                "responder {s}: reply of {d} bytes exceeds the {d} byte cap\n",
+                .{ procedure, reply.len, maxFrameBytes() },
+            );
+            try sendFrame(client, &.{@intFromEnum(RpcStatus.too_large)}, &.{});
+            return;
+        }
+        try sendFrame(client, &.{@intFromEnum(RpcStatus.ok)}, reply);
+    } else {
+        try sendFrame(client, &.{@intFromEnum(RpcStatus.refused)}, &.{});
+    }
+}
+
+/// Serve `procedure` on this node. The handler answers one request at a time; a slow
+/// handler delays the next caller rather than being run concurrently, which is what makes
+/// a handler that touches shared state safe to write without a lock of its own.
+pub fn addResponderRun(
+    procedure: []const u8,
+    handler: ResponderHandlerFn,
+    context: ?*anyopaque,
+) bool {
+    const token = createTopicToken(procedure, .responder) orelse {
+        std.debug.print("error tracking responder {s}\n", .{procedure});
+        return false;
+    };
+
+    if (!spawnWorkerFor(token, responderLoop, .{ token, handler, context })) {
+        std.debug.print("error spawning responder thread for {s}\n", .{procedure});
+        detachTopicTokenPtr(token);
+        destroyTopicToken(token);
+        return false;
+    }
+    sleepMsFn(5);
+    return true;
+}
+
+/// Stop serving `procedure`: joins its threads and drops its registration. The sibling of
+/// `removePublisher`, with the same guarantee and the same refusal when called from the
+/// procedure's own handler.
+pub fn removeResponder(procedure: []const u8) bool {
+    return stopAndForget(procedure, .responder, "removeResponder");
+}
+
+// ---------------------------------------------------------------- requester side
+
+fn resolveProcedure(procedure: []const u8) ?net.IpAddress {
+    var cmd_buf: [320]u8 = undefined;
+    const command = std.fmt.bufPrint(&cmd_buf, "rpc-find {s}", .{procedure}) catch return null;
+    var reply_buf: [256]u8 = undefined;
+    const reply = registryCommand(command, &reply_buf) catch return null;
+
+    var lines = std.mem.splitScalar(u8, reply, '\n');
+    while (lines.next()) |line| {
+        const text = std.mem.trim(u8, line, " \t\r");
+        if (text.len == 0 or text[0] == '#') continue;
+        return parseTcpUri(text) catch return null;
+    }
+    return null;
+}
+
+/// One request, start to finish, on the calling thread.
+///
+/// The reply is written into `out` and its length returned through `out_len`. A reply
+/// larger than `out` is `too_large`: the size is the caller's to choose, because the
+/// library has nowhere to put a reply the caller did not make room for.
+pub fn requestRun(
+    procedure: []const u8,
+    payload: []const u8,
+    timeout_ms: u64,
+    out: []u8,
+    out_len: *usize,
+) RpcStatus {
+    out_len.* = 0;
+    if (payload.len > maxFrameBytes()) return .too_large;
+
+    const deadline = deadlineFrom(timeout_ms);
+    const endpoint = resolveProcedure(procedure) orelse return .no_procedure;
+
+    var stream = endpoint.connect(io, .{ .mode = .stream }) catch return .unreachable_host;
+    defer stream.close(io);
+
+    // Tracked so a shutdown mid-request does not hold the caller until the peer answers.
+    if (!trackSocket(stream.socket, .stream)) return .failed;
+    defer untrackSocket(stream.socket);
+
+    sendFrame(&stream, payload, &.{}) catch return .failed;
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    const frame = receiveFrame(&stream.socket, &buf, deadline) catch |err| return switch (err) {
+        error.TimedOut => .timed_out,
+        error.TooLarge => .too_large,
+        else => .failed,
+    };
+
+    // Status byte, then the payload. A frame with neither is a responder speaking a
+    // protocol this build does not know.
+    if (frame.len < 1) return .failed;
+    const status = statusFromWire(frame[0]);
+    const body = frame[1..];
+    if (status != .ok) return status;
+
+    if (body.len > out.len) return .too_large;
+    @memcpy(out[0..body.len], body);
+    out_len.* = body.len;
+    return .ok;
+}
+
+// ---------------------------------------------------------------- non-blocking requests
+//
+// `request` blocks, which is fine for a script and wrong for anything with a UI or a
+// control loop: a 5 second timeout against an unreachable host freezes the caller for 5
+// seconds. The non-blocking form hands the work to a thread and gives the caller a ticket.
+//
+// Completions are DRAINED, not delivered. A callback would have to fire on the worker's
+// thread, and that is exactly the crossing `subscribeQueue` exists to avoid -- a managed
+// runtime would be entered from a thread it has never seen, holding no GIL and with
+// nowhere to put an exception. So `pollReplies` mirrors `poll`, down to the lifetime of
+// the bytes it hands back, and the two can be drained from the same loop.
+
+/// One completed request. `data` is owned by the library and valid until the next
+/// `pollReplies` call, which recycles it -- the same contract as `QueuedMessage.data`.
+pub const QueuedReply = struct {
+    /// The ticket `requestBegin` returned.
+    id: u64,
+    status: RpcStatus,
+    /// The procedure that was called, so one drain loop can serve many call sites.
+    procedure: []const u8,
+    data: []const u8,
+};
+
+const ReplySlot = struct {
+    id: u64 = 0,
+    status: RpcStatus = .failed,
+    procedure: std.ArrayList(u8) = .empty,
+    buf: std.ArrayList(u8) = .empty,
+};
+
+var replies_done: std.ArrayList(ReplySlot) = .empty;
+var replies_staging: std.ArrayList(ReplySlot) = .empty;
+var replies_mutex: Io.Mutex = .init;
+var replies_seq: std.atomic.Value(u32) = .init(0);
+var request_seq: std.atomic.Value(u64) = .init(0);
+var requests_in_flight: std.atomic.Value(usize) = .init(0);
+
+/// What a request worker owns for the duration of its call. Copied because the caller's
+/// slices are theirs again the moment `requestBegin` returns.
+const RequestJob = struct {
+    id: u64,
+    procedure: []u8,
+    payload: []u8,
+    timeout_ms: u64,
+};
+
+/// Start a request and return immediately with a ticket to match the reply against.
+///
+/// Returns 0 when the request could not be started at all -- out of memory, too many
+/// already in flight, or the node is stopping. A 0 is never reported through
+/// `pollReplies`, so a caller that checks for it has nothing else to time out.
+pub fn requestBeginRun(procedure: []const u8, payload: []const u8, timeout_ms: u64) u64 {
+    if (!node_running) return 0;
+    if (payload.len > maxFrameBytes()) return 0;
+
+    // Checked before the copies, so the failure path allocates nothing.
+    if (requests_in_flight.load(.monotonic) >= max_pending_requests) {
+        std.debug.print(
+            "requestBegin {s}: {d} requests already in flight\n",
+            .{ procedure, max_pending_requests },
+        );
+        return 0;
+    }
+
+    const job = allocator.create(RequestJob) catch return 0;
+    const name = allocator.dupe(u8, procedure) catch {
+        allocator.destroy(job);
+        return 0;
+    };
+    const body = allocator.dupe(u8, payload) catch {
+        allocator.free(name);
+        allocator.destroy(job);
+        return 0;
+    };
+
+    const id = request_seq.fetchAdd(1, .monotonic) + 1; // 0 is reserved for "not started"
+    job.* = .{ .id = id, .procedure = name, .payload = body, .timeout_ms = timeout_ms };
+
+    _ = requests_in_flight.fetchAdd(1, .monotonic);
+    if (!spawnWorker(requestWorker, .{job})) {
+        _ = requests_in_flight.fetchSub(1, .monotonic);
+        allocator.free(body);
+        allocator.free(name);
+        allocator.destroy(job);
+        return 0;
+    }
+    return id;
+}
+
+fn requestWorker(job: *RequestJob) void {
+    defer {
+        allocator.free(job.payload);
+        allocator.free(job.procedure);
+        allocator.destroy(job);
+        _ = requests_in_flight.fetchSub(1, .monotonic);
+    }
+
+    // Sized to the cap rather than guessed: the worker has no caller buffer to grow into,
+    // and a reply that does not fit would be reported as too_large when it is not.
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+
+    var status: RpcStatus = .failed;
+    var length: usize = 0;
+    if (out.resize(allocator, @min(maxFrameBytes(), 1 << 20))) {
+        status = requestRun(job.procedure, job.payload, job.timeout_ms, out.items, &length);
+    } else |_| {
+        status = .failed;
+    }
+
+    pushReply(job.id, job.procedure, status, out.items[0..length]);
+}
+
+fn pushReply(id: u64, procedure: []const u8, status: RpcStatus, data: []const u8) void {
+    replies_mutex.lockUncancelable(io);
+    defer replies_mutex.unlock(io);
+
+    replies_done.ensureUnusedCapacity(allocator, 1) catch return;
+    var slot: ReplySlot = .{ .id = id, .status = status };
+    slot.procedure.appendSlice(allocator, procedure) catch {
+        slot.procedure.deinit(allocator);
+        return;
+    };
+    slot.buf.appendSlice(allocator, data) catch {
+        slot.procedure.deinit(allocator);
+        slot.buf.deinit(allocator);
+        return;
+    };
+    replies_done.appendAssumeCapacity(slot);
+
+    // Wake a caller parked in pollReplies, the way queuePush wakes one parked in poll.
+    _ = replies_seq.fetchAdd(1, .monotonic);
+    io.futexWake(u32, &replies_seq.raw, 1);
+}
+
+/// Drain completed requests. Returns the prefix of `out` that was filled.
+///
+/// `timeout_ms` of 0 polls and returns whatever is ready; a negative value waits until
+/// something is. The slices in the results are recycled by the NEXT call, so copy anything
+/// kept beyond the current batch.
+pub fn pollReplies(out: []QueuedReply, timeout_ms: i32) []QueuedReply {
+    if (out.len == 0) return out[0..0];
+
+    replies_mutex.lockUncancelable(io);
+    defer replies_mutex.unlock(io);
+
+    if (replies_done.items.len == 0 and timeout_ms != 0) {
+        // Read the sequence before unlocking so a completion landing in the gap is not
+        // missed -- futexWaitTimeout returns at once when the word has already moved.
+        const observed = replies_seq.load(.monotonic);
+        replies_mutex.unlock(io);
+        const timeout: Io.Timeout = if (timeout_ms < 0)
+            .none
+        else
+            .{ .duration = .{
+                .raw = Io.Duration.fromMilliseconds(timeout_ms),
+                .clock = .awake,
+            } };
+        io.futexWaitTimeout(u32, &replies_seq.raw, observed, timeout) catch {};
+        replies_mutex.lockUncancelable(io);
+    }
+
+    const take = @min(out.len, replies_done.items.len);
+    if (take == 0) return out[0..0];
+
+    // Last batch's buffers go back now rather than at the end of the previous call: that
+    // is what lets the slices handed out then stay valid until this call.
+    for (replies_staging.items) |*slot| {
+        slot.procedure.deinit(allocator);
+        slot.buf.deinit(allocator);
+    }
+    replies_staging.clearRetainingCapacity();
+    replies_staging.ensureTotalCapacity(allocator, take) catch return out[0..0];
+
+    for (0..take) |i| {
+        replies_staging.appendAssumeCapacity(replies_done.orderedRemove(0));
+        const slot = &replies_staging.items[i];
+        out[i] = .{
+            .id = slot.id,
+            .status = slot.status,
+            .procedure = slot.procedure.items,
+            .data = slot.buf.items,
+        };
+    }
+    return out[0..take];
+}
+
+/// How many `requestBegin` calls have not yet completed.
+pub fn requestsInFlight() usize {
+    return requests_in_flight.load(.monotonic);
+}
+
+fn repliesDeinit() void {
+    replies_mutex.lockUncancelable(io);
+    defer replies_mutex.unlock(io);
+    for (replies_done.items) |*slot| {
+        slot.procedure.deinit(allocator);
+        slot.buf.deinit(allocator);
+    }
+    replies_done.clearAndFree(allocator);
+    for (replies_staging.items) |*slot| {
+        slot.procedure.deinit(allocator);
+        slot.buf.deinit(allocator);
+    }
+    replies_staging.clearAndFree(allocator);
+}
+
+fn statusFromWire(value: u8) RpcStatus {
+    return switch (value) {
+        0 => .ok,
+        1 => .no_procedure,
+        2 => .unreachable_host,
+        3 => .timed_out,
+        4 => .refused,
+        5 => .too_large,
+        else => .failed,
+    };
+}
+
 // Stop the node and release everything it holds. Safe to call once per `nodeRun`, and a
 // node may be started again afterwards.
 //
@@ -3862,6 +4514,7 @@ pub fn nodeDeinit() void {
     }
 
     queueDeinit();
+    repliesDeinit();
 
     io_impl.deinit();
     node_running = false;
@@ -3896,19 +4549,19 @@ test "the directory epoch counts material changes and ignores refresh heartbeats
     const before = directory_epoch.load(.monotonic);
 
     // A topic appearing is a change.
-    try registerTopic("epoch/one", first, node_id);
+    try registerTopic("epoch/one", first, node_id, .topic);
     const after_insert = directory_epoch.load(.monotonic);
     try testing.expect(after_insert > before);
 
     // Refreshing it is not. This is the heartbeat every publisher sends every couple of
     // seconds, and it must be free.
-    try registerTopic("epoch/one", first, node_id);
-    try registerTopic("epoch/one", first, node_id);
+    try registerTopic("epoch/one", first, node_id, .topic);
+    try registerTopic("epoch/one", first, node_id, .topic);
     try testing.expectEqual(after_insert, directory_epoch.load(.monotonic));
 
     // The endpoint moving is a change: a standby holding the old address would hand
     // subscribers somewhere nothing is listening.
-    try registerTopic("epoch/one", moved, node_id);
+    try registerTopic("epoch/one", moved, node_id, .topic);
     const after_move = directory_epoch.load(.monotonic);
     try testing.expect(after_move > after_insert);
 

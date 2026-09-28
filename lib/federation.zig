@@ -184,6 +184,7 @@ const RemoteEntry = struct {
     host: []const u8,
     port: u16,
     subs: u32,
+    kind: qnnt.EntryKind = .topic,
 };
 
 fn parseNodeId(text: []const u8, out: *NodeId) bool {
@@ -244,6 +245,7 @@ fn applyRemoteEntryLocked(entry: RemoteEntry, observed_host: []const u8) !bool {
             // Learned from a peer, so its port is on THAT host and says nothing about what
             // is bound here. The publisher port allocator has to know the difference.
             .local = false,
+            .kind = entry.kind,
         };
         // Subscriber detail is not federated -- only the count, recorded by padding the
         // peer list with placeholders. Detail stays with the host that owns it and is
@@ -263,6 +265,7 @@ fn applyRemoteEntryLocked(entry: RemoteEntry, observed_host: []const u8) !bool {
         held.version = entry.version;
         held.last_us = now_us;
         held.learned_us = now_us;
+        held.kind = entry.kind;
         try setRemoteSubCount(held, entry.subs, endpoint);
         return true;
     }
@@ -282,6 +285,7 @@ fn applyRemoteEntryLocked(entry: RemoteEntry, observed_host: []const u8) !bool {
         held.learned_us = now_us;
         held.conflict_us = now_us;
         held.local = false;
+        held.kind = entry.kind;
         try setRemoteSubCount(held, entry.subs, endpoint);
         return true;
     }
@@ -351,13 +355,18 @@ pub fn writeFedEntries(buffer: *std.ArrayList(u8)) !void {
 
         const host_only = host;
 
-        try buffer.print(allocator, "fed-entry {s} {d} {s} {s} {d} {d}\n", .{
+        // The 7th field is the entry kind, appended rather than inserted: a peer running
+        // an older build reads six fields and ignores the rest, and this parser defaults a
+        // missing one to `.topic`. So responders propagate to peers that understand them
+        // and are simply invisible to those that do not, in both directions.
+        try buffer.print(allocator, "fed-entry {s} {d} {s} {s} {d} {d} {d}\n", .{
             qnnt.formatNodeId(&id_buf, entry.origin),
             entry.version,
             kv.key_ptr.*,
             host_only,
             entry.endpoint.getPort(),
             entry.peers.items.len,
+            @intFromEnum(entry.kind),
         });
     }
 }
@@ -488,6 +497,8 @@ fn parseFedEntry(it: *std.mem.TokenIterator(u8, .any)) ?RemoteEntry {
     const host = it.next() orelse return null;
     const port_text = it.next() orelse return null;
     const subs_text = it.next() orelse return null;
+    // Optional: absent from a peer that predates procedures, which means `.topic`.
+    const kind_text = it.next() orelse "0";
 
     var origin: NodeId = undefined;
     if (!parseNodeId(origin_text, &origin)) return null;
@@ -499,6 +510,7 @@ fn parseFedEntry(it: *std.mem.TokenIterator(u8, .any)) ?RemoteEntry {
         .host = if (std.mem.eql(u8, host, "-")) "" else host,
         .port = std.fmt.parseInt(u16, port_text, 10) catch return null,
         .subs = std.fmt.parseInt(u32, subs_text, 10) catch return null,
+        .kind = qnnt.EntryKind.fromWire(std.fmt.parseInt(u8, kind_text, 10) catch return null),
     };
 }
 
@@ -1484,4 +1496,47 @@ test "the mirror carries a port range only to a node that has none" {
     try testing.expectEqual(@as(u16, 24299), qnnt.publisher_port_high);
 
     _ = qnnt.setPublisherPortsFn(0, 0);
+}
+
+test "the entry kind survives the wire, and a peer that omits it still federates" {
+    // The compatibility claim, in both directions. A build that predates procedures sends
+    // six fields; this one must read that as a stream rather than rejecting the line, or a
+    // mixed cluster would stop sharing topics the moment one host was upgraded.
+    const old_style = "bb" ** 16 ++ " 7 legacy/topic 10.0.0.4 7100 0";
+    var old_it = std.mem.tokenizeAny(u8, old_style, " \t\r\n");
+    const legacy = parseFedEntry(&old_it).?;
+    try testing.expectEqual(qnnt.EntryKind.topic, legacy.kind);
+    try testing.expectEqualStrings("legacy/topic", legacy.topic);
+
+    const with_kind = "bb" ** 16 ++ " 7 remote/proc 10.0.0.4 7101 0 1";
+    var new_it = std.mem.tokenizeAny(u8, with_kind, " \t\r\n");
+    try testing.expectEqual(qnnt.EntryKind.responder, parseFedEntry(&new_it).?.kind);
+
+    // A kind this build does not know comes from a peer NEWER than it. The entry is still a
+    // real endpoint worth holding, so it degrades to a stream rather than being dropped.
+    const from_the_future = "bb" ** 16 ++ " 7 future/thing 10.0.0.4 7102 0 9";
+    var future_it = std.mem.tokenizeAny(u8, from_the_future, " \t\r\n");
+    try testing.expectEqual(qnnt.EntryKind.topic, parseFedEntry(&future_it).?.kind);
+}
+
+test "a responder learned from a peer stays a responder in the directory" {
+    const Q = @import("qnnt.zig").Qnnt;
+    try testing.expect(Q.setRegistryPort(22317));
+    try testing.expect(Q.run());
+    defer Q.deinit();
+
+    try testing.expect(try applyRemoteEntry(.{
+        .origin = @splat(0x77), .version = 9, .topic = "remote/arm/home",
+        .host = "10.0.0.11", .port = 7200, .subs = 0, .kind = .responder,
+    }, "10.0.0.11"));
+
+    // It must come back out of `rpc-find` and NOT out of `sub`: a federated procedure is
+    // still a procedure, and the kind is the only thing that says so on this host.
+    var buf: [512]u8 = undefined;
+    const found = try Q.registryCommand("rpc-find remote/arm/home", &buf);
+    try testing.expect(std.mem.indexOf(u8, found, "10.0.0.11") != null);
+
+    var buf2: [512]u8 = undefined;
+    const as_topic = try Q.registryCommand("sub remote/arm/home", &buf2);
+    try testing.expect(std.mem.indexOf(u8, as_topic, "not a topic") != null);
 }
