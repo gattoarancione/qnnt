@@ -1325,3 +1325,37 @@ test "requestBegin does not wait for a slow responder" {
     }
     return error.ReplyNeverArrived;
 }
+
+test "a completing request wakes a caller parked in poll" {
+    // The Qt poller -- and any C program written the same way -- drains messages and
+    // replies from one loop: it blocks in `poll` and only looks at replies when that
+    // returns. If a completion did not wake `poll`, every reply would wait out that
+    // timeout. This pins the wake, because the cost of losing it is invisible in any test
+    // that polls with a short timeout.
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.addResponder("test/rpc/wake", &echoHandler, null));
+    try waitForProcedure("test/rpc/wake", 5000);
+
+    // Nothing is published, so the message queue stays empty for the whole test: `poll`
+    // below can only return early because the reply woke it.
+    try testing.expect(qnnt.reserveQueue(64));
+
+    const id = qnnt.requestBegin("test/rpc/wake", "wake-up", 3000);
+    try testing.expect(id != 0);
+
+    const began = qnnt.nowMicros();
+    var msgs: [8]QueuedMessage = undefined;
+    const batch = qnnt.poll(&msgs, 10_000); // ten seconds it must NOT wait out
+    const waited_us = qnnt.nowMicros() - began;
+
+    try testing.expectEqual(@as(usize, 0), batch.len); // no messages, as expected
+    try testing.expect(waited_us < 3_000_000);
+
+    // And the reply really is there to be drained, which is what the wake was for.
+    var out: [4]qnnt.QueuedReply = undefined;
+    const replies = qnnt.pollReplies(&out, 2000);
+    try testing.expectEqual(@as(usize, 1), replies.len);
+    try testing.expectEqual(id, replies[0].id);
+}

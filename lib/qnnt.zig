@@ -4364,6 +4364,22 @@ fn pushReply(id: u64, procedure: []const u8, status: RpcStatus, data: []const u8
     // Wake a caller parked in pollReplies, the way queuePush wakes one parked in poll.
     _ = replies_seq.fetchAdd(1, .monotonic);
     io.futexWake(u32, &replies_seq.raw, 1);
+
+    // And wake anyone parked in `poll`, which is a deliberate widening of what that
+    // sequence means: "something arrived worth looking at", not "a message arrived".
+    //
+    // A binding that drains both from one loop -- the Qt poller does, and any C program
+    // written the same way -- blocks in `poll` waiting for messages, and only looks at
+    // replies when that returns. On a node doing control-plane RPC and streaming nothing,
+    // `poll` sleeps out its whole timeout every turn, so a reply that completed in a
+    // millisecond waited up to 100 ms to be seen. That is two orders of magnitude added to
+    // the call it was reporting.
+    //
+    // The waiter wakes, finds no messages, returns an empty batch and goes on to drain the
+    // replies. The spurious wakeup costs a loop iteration and can only happen while
+    // requests are actually completing -- a program that makes none is never woken by one.
+    _ = queue_seq.fetchAdd(1, .monotonic);
+    io.futexWake(u32, &queue_seq.raw, 1);
 }
 
 /// Drain completed requests. Returns the prefix of `out` that was filled.

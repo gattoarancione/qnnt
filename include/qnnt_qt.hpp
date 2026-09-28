@@ -544,10 +544,12 @@ inline void QnntPoller::run() {
                                       static_cast<qsizetype>(msg.data_len)));
         }
 
-        // Replies share this thread rather than getting one of their own: the poll above
-        // already bounds the loop, and a request completing while it sleeps is picked up on
-        // the next turn -- at most kTimeoutMs later, which is not a latency that matters to
-        // something that just made a network round trip.
+        // Replies share this thread rather than getting one of their own, and that is only
+        // acceptable because a completing request WAKES the poll above. Without that it
+        // would sleep out its whole timeout on a node that streams nothing, and every reply
+        // would arrive up to kTimeoutMs late -- far larger than the round trip it reports.
+        // So this is polled with timeout 0: by the time we get here, either a message
+        // arrived or a reply did.
         qnnt_reply replies[kBatch];
         std::size_t reply_count = 0;
         if (qnnt_poll_replies(replies, kBatch, 0, &reply_count) == QNNT_OK) {
