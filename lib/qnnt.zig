@@ -194,6 +194,316 @@ pub fn isShuttingDown() bool {
     return shutting_down.load(.monotonic);
 }
 
+// ---------------------------------------------------------------- per-topic teardown
+//
+// `nodeDeinit` stops everything at once: one flag, one sweep of the sockets, one join of
+// every worker. That is the right shape for shutdown and the wrong shape for dropping a
+// single topic, which is what `removePublisher` and `removeSubscriber` need.
+//
+// A token is the missing per-topic handle. It carries its own cancel flag, the threads
+// spawned under it, and the sockets those threads block on -- the same three things the
+// global path owns, scoped to one topic. Workers test `token.stopping()`, which is the
+// global flag OR this token's, so a topic can be stopped on its own and a node shutdown
+// still stops all of them.
+
+const TopicKind = enum { publisher, subscriber };
+
+const TopicToken = struct {
+    /// Owned, and the name the workers themselves use -- so a topic's name outlives the
+    /// caller's slice for exactly as long as something is still running under it.
+    topic: []const u8,
+    kind: TopicKind,
+    cancelled: std.atomic.Value(bool) = .init(false),
+    threads: std.ArrayList(std.Thread) = .empty,
+    sockets: std.ArrayList(TrackedSocket) = .empty,
+    mutex: Io.Mutex = .init,
+
+    fn stopping(t: *const TopicToken) bool {
+        return isShuttingDown() or t.cancelled.load(.monotonic);
+    }
+};
+
+var topic_tokens: std.ArrayList(*TopicToken) = .empty;
+var topic_tokens_mutex: Io.Mutex = .init;
+
+/// Which token the running thread belongs to, or null on a caller's own thread.
+///
+/// The guard against the one deadlock this feature invites: `removePublisher` joins the
+/// topic's threads, so calling it from that topic's own source callback or message
+/// handler would have the thread wait for itself. Set once as each worker starts.
+threadlocal var current_topic_token: ?*TopicToken = null;
+
+fn createTopicToken(topic: []const u8, kind: TopicKind) ?*TopicToken {
+    topic_tokens_mutex.lockUncancelable(io);
+    defer topic_tokens_mutex.unlock(io);
+
+    if (isShuttingDown()) return null;
+    topic_tokens.ensureUnusedCapacity(allocator, 1) catch return null;
+
+    const token = allocator.create(TopicToken) catch return null;
+    token.* = .{
+        .topic = allocator.dupe(u8, topic) catch {
+            allocator.destroy(token);
+            return null;
+        },
+        .kind = kind,
+    };
+    topic_tokens.appendAssumeCapacity(token);
+    return token;
+}
+
+/// Free a token and everything it owns. The caller must already have detached it and
+/// joined its threads -- this frees the name those threads were using.
+fn destroyTopicToken(token: *TopicToken) void {
+    token.threads.deinit(allocator);
+    token.sockets.deinit(allocator);
+    allocator.free(token.topic);
+    allocator.destroy(token);
+}
+
+/// Take a token out of the registry so nothing else can find it. Returns null when the
+/// topic has no live worker of that kind.
+fn detachTopicToken(topic: []const u8, kind: TopicKind) ?*TopicToken {
+    topic_tokens_mutex.lockUncancelable(io);
+    defer topic_tokens_mutex.unlock(io);
+
+    for (topic_tokens.items, 0..) |token, i| {
+        if (token.kind == kind and std.mem.eql(u8, token.topic, topic)) {
+            return topic_tokens.swapRemove(i);
+        }
+    }
+    return null;
+}
+
+/// Take one specific token out, for the path where a topic failed to start and the token
+/// must not be left behind for a later `remove` to find.
+fn detachTopicTokenPtr(token: *TopicToken) void {
+    topic_tokens_mutex.lockUncancelable(io);
+    defer topic_tokens_mutex.unlock(io);
+
+    for (topic_tokens.items, 0..) |candidate, i| {
+        if (candidate == token) {
+            _ = topic_tokens.swapRemove(i);
+            return;
+        }
+    }
+}
+
+/// As `spawnWorker`, but the thread is owned by `token` rather than the global list, so
+/// stopping that topic joins it and a node shutdown still does through `joinWorkers`.
+fn spawnWorkerFor(token: *TopicToken, comptime function: anytype, args: anytype) bool {
+    token.mutex.lockUncancelable(io);
+    defer token.mutex.unlock(io);
+
+    // Under the same lock the remover takes, so there is no window: a spawn serialised
+    // before the cancel lands in the list the remover takes, and one serialised after it
+    // is refused here instead of starting a thread nothing would ever join.
+    if (token.stopping()) return false;
+    token.threads.ensureUnusedCapacity(allocator, 1) catch return false;
+
+    const Shim = struct {
+        fn run(t: *TopicToken, a: @TypeOf(args)) @typeInfo(@TypeOf(function)).@"fn".return_type.? {
+            current_topic_token = t;
+            applyRealtimePriority();
+            return @call(.auto, function, a);
+        }
+    };
+
+    const thread = std.Thread.spawn(.{}, Shim.run, .{ token, args }) catch return false;
+    token.threads.appendAssumeCapacity(thread);
+    return true;
+}
+
+/// `trackSocket` for a token's own workers: the token breaks these, not `breakLiveSockets`.
+///
+/// Deliberately NOT also registered globally. Registering in both wakes a listener twice at
+/// shutdown -- once from `breakLiveSockets`, once from `breakTopicSockets` -- and each wake
+/// is a real connection, since a listening socket cannot be shut down portably. The server
+/// closes each one, leaving it in TIME_WAIT on the listener's port, and the next bind of
+/// that port (publishers bind with reuse_address = false) fails. That surfaced as a
+/// publisher in a configured range being handed a second port, which shifts every later
+/// assignment in that range. `nodeDeinit` reaches these through `joinTopicTokens`.
+fn trackSocketFor(
+    token: *TopicToken,
+    socket: net.Socket,
+    kind: @FieldType(TrackedSocket, "kind"),
+) bool {
+    token.mutex.lockUncancelable(io);
+    defer token.mutex.unlock(io);
+
+    if (token.stopping()) return false;
+    if (isShuttingDown()) return false; // the check `trackSocket` makes, for the same reason
+    token.sockets.append(allocator, .{ .socket = socket, .kind = kind }) catch return false;
+    return true;
+}
+
+fn untrackSocketFor(token: *TopicToken, socket: net.Socket) void {
+    token.mutex.lockUncancelable(io);
+    defer token.mutex.unlock(io);
+    for (token.sockets.items, 0..) |tracked, i| {
+        if (tracked.socket.handle == socket.handle) {
+            _ = token.sockets.swapRemove(i);
+            return;
+        }
+    }
+}
+
+/// Break the blocking calls this token's workers are in. Held under the token's lock for
+/// the reason `breakLiveSockets` is: a worker untracks before it closes, so an entry seen
+/// under the lock is still open and its handle cannot have been reused.
+fn breakTopicSockets(token: *TopicToken) void {
+    token.mutex.lockUncancelable(io);
+    defer token.mutex.unlock(io);
+
+    for (token.sockets.items) |tracked| switch (tracked.kind) {
+        .stream => {
+            const stream: Stream = .{ .socket = tracked.socket };
+            stream.shutdown(io, .both) catch {};
+        },
+        .listener => {
+            var waker = tracked.socket.address.connect(io, .{ .mode = .stream }) catch continue;
+            waker.close(io);
+        },
+    };
+}
+
+/// Sleep, waking early when this topic is stopped or the node is. Returns false if the
+/// caller should stop.
+fn sleepUsInterruptibleFor(token: *TopicToken, us: u64) bool {
+    var remaining = us;
+    while (remaining > 0) {
+        if (token.stopping()) return false;
+        const slice = @min(remaining, shutdown_poll_ms * 1000);
+        sleepUsFn(slice);
+        remaining -= slice;
+    }
+    return !token.stopping();
+}
+
+fn sleepMsInterruptibleFor(token: *TopicToken, ms: u64) bool {
+    return sleepUsInterruptibleFor(token, ms * 1000);
+}
+
+/// Cancel a token, break what its workers are blocked in, and join them. Returns with
+/// every thread gone, so the caller may free what they were using.
+fn stopTopicToken(token: *TopicToken) void {
+    // Before the lock, so every later `spawnWorkerFor` and `trackSocketFor` refuses.
+    token.cancelled.store(true, .monotonic);
+    breakTopicSockets(token);
+
+    // Move the threads out under the lock and join outside it: an exiting worker still
+    // calls `untrackSocketFor`, which wants the same lock.
+    token.mutex.lockUncancelable(io);
+    var pending = token.threads;
+    token.threads = .empty;
+    token.mutex.unlock(io);
+
+    for (pending.items) |thread| thread.join();
+    pending.deinit(allocator);
+}
+
+/// Stop the publisher for `topic` on this node: its accept loop, its registry refresh and
+/// its scheduler, then drop the registration and close the delivery connections.
+///
+/// Returns false when no publisher of that name is running here, and when called from one
+/// of that publisher's own threads -- a source callback asking to remove its own topic
+/// would otherwise wait for itself.
+pub fn removePublisher(topic: []const u8) bool {
+    // Guarded because these are documented as safe to call speculatively, and the obvious
+    // place to call one is on the way out -- possibly after `deinit`, where the mutexes
+    // below would be reaching for an `io` that is already gone.
+    if (!node_running) return false;
+
+    const token = detachTopicToken(topic, .publisher) orelse return false;
+
+    if (current_topic_token == token) {
+        // Put it back: nothing was stopped, and leaving it detached would strand the
+        // workers with no way to reach them again.
+        topic_tokens_mutex.lockUncancelable(io);
+        defer topic_tokens_mutex.unlock(io);
+        topic_tokens.append(allocator, token) catch {};
+        std.debug.print("removePublisher {s}: refused, called from its own thread\n", .{topic});
+        return false;
+    }
+
+    stopTopicToken(token);
+
+    // Only now that the accept loop is gone can the delivery connections be closed: a
+    // live loop would be appending to the very list being torn down.
+    {
+        subscribers_mutex.lockUncancelable(io);
+        defer subscribers_mutex.unlock(io);
+        if (subscribers.fetchRemove(token.topic)) |entry| {
+            var list = entry.value;
+            for (list.items) |node| node.client.close(io);
+            list.deinit(allocator);
+        }
+    }
+
+    // Best effort, and deliberately after the workers are gone: the refresh loop would
+    // otherwise re-register the topic between this and its next tick. A registry that is
+    // down or mid-failover just means the entry expires on its own instead.
+    var buf: [256]u8 = undefined;
+    var cmd_buf: [256]u8 = undefined;
+    const cmd = std.fmt.bufPrint(&cmd_buf, "unpub {s}", .{token.topic}) catch "";
+    if (cmd.len != 0) _ = registryCommand(cmd, &buf) catch {};
+
+    destroyTopicToken(token);
+    return true;
+}
+
+/// Stop every subscription this node holds on `topic`, whichever flavour started it.
+///
+/// A topic joined by a glob stays gone: `patternLoop` never forgets what it has joined, so
+/// its next rescan passes over this name rather than resubscribing.
+pub fn removeSubscriber(topic: []const u8) bool {
+    if (!node_running) return false; // see removePublisher
+
+    var removed = false;
+    while (detachTopicToken(topic, .subscriber)) |token| {
+        if (current_topic_token == token) {
+            topic_tokens_mutex.lockUncancelable(io);
+            defer topic_tokens_mutex.unlock(io);
+            topic_tokens.append(allocator, token) catch {};
+            std.debug.print("removeSubscriber {s}: refused, called from its own thread\n", .{topic});
+            return false;
+        }
+
+        stopTopicToken(token);
+
+        // The stale sweeper reads this table; with the loop gone the entry would sit there
+        // for ever, still claiming a connection.
+        {
+            sub_states_mutex.lockUncancelable(io);
+            defer sub_states_mutex.unlock(io);
+            if (sub_states.fetchRemove(token.topic)) |entry| allocator.free(entry.key);
+        }
+
+        destroyTopicToken(token);
+        removed = true;
+    }
+    return removed;
+}
+
+/// Stop and free every remaining token. Shutdown only: `joinWorkers` has to reach these
+/// threads too, and it runs after the global flag is already set, so the joins here are
+/// against workers that are already winding down.
+fn joinTopicTokens() void {
+    while (true) {
+        topic_tokens_mutex.lockUncancelable(io);
+        const token = topic_tokens.pop();
+        topic_tokens_mutex.unlock(io);
+
+        const t = token orelse break;
+        stopTopicToken(t);
+        destroyTopicToken(t);
+    }
+
+    topic_tokens_mutex.lockUncancelable(io);
+    defer topic_tokens_mutex.unlock(io);
+    topic_tokens.clearAndFree(allocator);
+}
+
 // ---------------------------------------------------------------- memory locking
 
 // Whether to pin the process's pages into RAM with mlockall, so a latency-critical path
@@ -889,6 +1199,14 @@ pub const Qnnt = struct {
     pub const subscribeFrames = &subscribeFramesRun;
     /// `subscribePattern` for TLD frames.
     pub const subscribePatternFrames = &subscribePatternFramesRun;
+
+    /// Stop publishing one topic without stopping the node: joins that publisher's
+    /// threads, drops its registration and closes its delivery connections. False when no
+    /// such publisher is running here. See `removePublisher`.
+    pub const removePublisher = &@import("qnnt.zig").removePublisher;
+    /// Stop subscribing to one topic without stopping the node. A topic reached through a
+    /// glob stays gone -- the pattern does not rejoin it. See `removeSubscriber`.
+    pub const removeSubscriber = &@import("qnnt.zig").removeSubscriber;
 
     /// The topics the registry knows, for discovery: see `listTopics`.
     pub const listTopics = &@import("qnnt.zig").listTopics;
@@ -2432,10 +2750,11 @@ pub fn publishAll(topic: []const u8, data: []const u8) !void {
 // Drive `source` at a fixed rate, publishing whatever it returns. Paced against an
 // absolute deadline rather than "sleep(period) after the work", so the callback's own
 // cost and wake-up jitter don't accumulate into drift. A period of 0 is unpaced.
-fn publisherSchedule(topic: []const u8, source: Qnnt.SourceHandler, period_us: u64, context: ?*anyopaque) void {
+fn publisherSchedule(token: *TopicToken, source: Qnnt.SourceHandler, period_us: u64, context: ?*anyopaque) void {
+    const topic = token.topic;
     var next_us: u64 = @intCast(nowMicrosFn());
 
-    while (!isShuttingDown()) {
+    while (!token.stopping()) {
         // Unpaced has no deadline to wait for, so it skips the clock read as well as
         // the sleep — the read is the only remaining per-tick overhead at that point.
         if (period_us != 0) {
@@ -2443,7 +2762,7 @@ fn publisherSchedule(topic: []const u8, source: Qnnt.SourceHandler, period_us: u
             const now_us: u64 = @intCast(nowMicrosFn());
 
             if (next_us > now_us) {
-                if (!sleepUsInterruptible(next_us - now_us)) return;
+                if (!sleepUsInterruptibleFor(token, next_us - now_us)) return;
             } else if (now_us - next_us >= period_us) {
                 // More than a full period behind (slow callback, scheduling hiccup):
                 // give up on the missed ticks and resynchronize, rather than firing a
@@ -2460,7 +2779,10 @@ fn publisherSchedule(topic: []const u8, source: Qnnt.SourceHandler, period_us: u
     }
 }
 
-fn nodePublish(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: u64, context: ?*anyopaque) !void {
+fn nodePublish(token: *TopicToken, source: ?Qnnt.SourceHandler, period_us: u64, context: ?*anyopaque) !void {
+    // The token's copy, not the caller's slice: it outlives every worker started below,
+    // which is what lets `removePublisher` free it only once they have all gone.
+    const topic = token.topic;
     // Bind with an ephemeral port (0); the OS fills in the real port, which we read back
     // from the socket.
     // Port 0 unless this node was given a range, in which case the registry says which.
@@ -2478,9 +2800,10 @@ fn nodePublish(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: u64, c
     };
     defer server.deinit(io);
 
-    // Tracked so shutdown can break the accept loop below.
-    if (!trackSocket(server.socket, .listener)) return;
-    defer untrackSocket(server.socket);
+    // Tracked so shutdown -- or `removePublisher` on this topic alone -- can break the
+    // accept loop below.
+    if (!trackSocketFor(token, server.socket, .listener)) return;
+    defer untrackSocketFor(token, server.socket);
 
     // What we listen on and what we advertise are separate: binding 0.0.0.0 is useful,
     // telling a subscriber to dial 0.0.0.0 is not. Take the port the OS chose and pair it
@@ -2500,7 +2823,7 @@ fn nodePublish(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: u64, c
     // node holds the registry (we register over the network, even to ourselves),
     // retries until a registry exists, and refreshes so a newly-elected registry
     // after a failover re-learns this publisher.
-    if (!spawnWorker(registerLoop, .{ topic, endpoint })) {
+    if (!spawnWorkerFor(token, registerLoop, .{ token, endpoint })) {
         std.debug.print("failed to spawn register loop for {s}\n", .{topic});
     }
 
@@ -2508,16 +2831,29 @@ fn nodePublish(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: u64, c
     // listener is up and registered, so no tick can fire before subscribers have
     // somewhere to connect.
     if (source) |src| {
-        if (!spawnWorker(publisherSchedule, .{ topic, src, period_us, context })) {
+        if (!spawnWorkerFor(token, publisherSchedule, .{ token, src, period_us, context })) {
             std.debug.print("failed to spawn scheduler for {s}\n", .{topic});
         }
     }
 
-    while (!isShuttingDown()) {
+    while (!token.stopping()) {
         const client = server.accept(io) catch |err| {
-            if (isShuttingDown()) return; // our own shutdown broke the accept
+            if (token.stopping()) return; // our own shutdown, or this topic's, broke the accept
             return err;
         };
+
+        // NOTE: the waker connection that `breakTopicSockets` used to interrupt this accept
+        // is deliberately NOT closed here, even though we are stopping and it is not a real
+        // subscriber. Closing it on this thread races with the waker's own close, and on
+        // loopback the two FINs cross: a simultaneous close leaves the SERVER end in
+        // TIME_WAIT on the publisher's port, which then cannot be bound for ~30s. That is
+        // invisible with ephemeral ports and fatal with QNNT_PUBLISHER_PORTS, where the next
+        // publisher is handed that exact port and its bind fails.
+        //
+        // So it goes onto the subscriber list like any other connection and is closed with
+        // the rest of them -- by `removePublisher` after the join, or by `nodeDeinit` --
+        // late enough that the waker's FIN has certainly arrived and the close is an
+        // ordinary passive one.
 
         var now_count: usize = 0;
         {
@@ -2617,10 +2953,10 @@ fn registerOnce(topic: []const u8, endpoint: net.IpAddress) !void {
     discardReply(&reader.interface);
 }
 
-fn registerLoop(topic: []const u8, endpoint: net.IpAddress) void {
-    while (!isShuttingDown()) {
-        registerOnce(topic, endpoint) catch {}; // registry not up yet / mid-failover
-        if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
+fn registerLoop(token: *TopicToken, endpoint: net.IpAddress) void {
+    while (!token.stopping()) {
+        registerOnce(token.topic, endpoint) catch {}; // registry not up yet / mid-failover
+        if (!sleepMsInterruptibleFor(token, registry_probe_interval_ms)) return;
     }
 }
 
@@ -2739,22 +3075,24 @@ fn resolveTopic(topic: []const u8) !net.IpAddress {
 // message received to `handler`. Retries resolution/connection so it tolerates the
 // registry or publisher not being ready yet (e.g. the publishing node started
 // later), and reconnects if the publisher goes away.
-fn subscribeLoop(topic: []const u8, handler: Qnnt.MessageHandler, context: ?*anyopaque) void {
-    while (!isShuttingDown()) {
+fn subscribeLoop(token: *TopicToken, handler: Qnnt.MessageHandler, context: ?*anyopaque) void {
+    const topic = token.topic;
+    while (!token.stopping()) {
         const endpoint = resolveTopic(topic) catch {
-            if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
+            if (!sleepMsInterruptibleFor(token, registry_probe_interval_ms)) return;
             continue;
         };
 
         var stream = endpoint.connect(io, .{ .mode = .stream }) catch {
-            if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
+            if (!sleepMsInterruptibleFor(token, registry_probe_interval_ms)) return;
             continue;
         };
         defer stream.close(io);
 
-        // Tracked so shutdown breaks the blocking read below.
-        if (!trackSocket(stream.socket, .stream)) return;
-        defer untrackSocket(stream.socket);
+        // Tracked so shutdown -- or `removeSubscriber` on this topic -- breaks the
+        // blocking read below.
+        if (!trackSocketFor(token, stream.socket, .stream)) return;
+        defer untrackSocketFor(token, stream.socket);
 
         std.debug.print("subscribed to {s} @ tcp://{f}\n", .{ topic, endpoint });
 
@@ -2775,7 +3113,7 @@ fn subscribeLoop(topic: []const u8, handler: Qnnt.MessageHandler, context: ?*any
         emitEvent(.publisher_disconnected, topic, peer, 0);
 
         // Publisher closed (or we are shutting down); re-resolve and reconnect.
-        if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
+        if (!sleepMsInterruptibleFor(token, registry_probe_interval_ms)) return;
     }
 }
 
@@ -2879,15 +3217,19 @@ fn patternLoop(
     context: ?*anyopaque,
     rescan_ms: u64,
 ) void {
-    // Joined names are duped and kept: `subscribeLoop` borrows the topic slice for its
-    // lifetime, and the listing buffer is reused on every rescan, so handing it a slice
-    // into that buffer would leave a subscriber reading a name that has been overwritten.
+    // Joined names are duped because the listing buffer is reused on every rescan, so a
+    // slice into it would be overwritten under whoever held it.
     var joined: std.ArrayList([]const u8) = .empty;
-    // The list goes; the names do NOT. Each one was handed to a subscription that borrows
-    // it for its whole life, and this loop can return long before those do -- immediately,
-    // with a zero rescan. Freeing them here left every subscriber reading a topic name out
-    // of freed memory. They belong to the subscriptions now, and are released with them.
-    defer joined.deinit(allocator);
+    // Both the list and the names, now that each subscription owns its own copy of the
+    // topic in its token. They did not used to: a subscription borrowed this slice for its
+    // whole life, and since this loop can return long before those do -- immediately, with
+    // a zero rescan -- freeing here left every subscriber reading freed memory. With the
+    // token owning the name that hazard is gone, and keeping these was simply a leak: one
+    // name per joined topic, for the life of the node.
+    defer {
+        for (joined.items) |name| allocator.free(name);
+        joined.deinit(allocator);
+    }
     // Reserved up front, all of it, so appending can never fail mid-scan. It matters more
     // than the 4KiB costs: the list is the ONLY record of what we already joined, so a
     // failed append would re-subscribe the same topic on every rescan, for ever.
@@ -2969,8 +3311,15 @@ fn alreadyJoined(items: []const []const u8, name: []const u8) bool {
 }
 
 pub fn subscribeRun(topic: []const u8, handler: Qnnt.MessageHandler, context: ?*anyopaque) bool {
-    if (!spawnWorker(subscribeLoop, .{ topic, handler, context })) {
+    const token = createTopicToken(topic, .subscriber) orelse {
+        std.debug.print("error tracking subscriber {s}\n", .{topic});
+        return false;
+    };
+
+    if (!spawnWorkerFor(token, subscribeLoop, .{ token, handler, context })) {
         std.debug.print("error spawning subscriber thread for {s}\n", .{topic});
+        detachTopicTokenPtr(token);
+        destroyTopicToken(token);
         return false;
     }
     return true;
@@ -3012,26 +3361,29 @@ pub fn setMaxFrameBytesFn(bytes: usize) bool {
 // A topic is one or the other, not both: the framing is a property of the stream, so a
 // producer publishing TLD must be read with `subscribeFrames`, and a producer
 // publishing text lines with `subscribe`.
-fn subscribeFramesLoop(topic: []const u8, handler: Qnnt.FrameHandler, context: ?*anyopaque) void {
+fn subscribeFramesLoop(token: *TopicToken, handler: Qnnt.FrameHandler, context: ?*anyopaque) void {
+    const topic = token.topic;
+
     // One buffer per subscription, reused for every frame, holding at most a frame.
     var frame_buf: std.ArrayList(u8) = .empty;
     defer frame_buf.deinit(allocator);
 
-    while (!isShuttingDown()) {
+    while (!token.stopping()) {
         const endpoint = resolveTopic(topic) catch {
-            if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
+            if (!sleepMsInterruptibleFor(token, registry_probe_interval_ms)) return;
             continue;
         };
 
         var stream = endpoint.connect(io, .{ .mode = .stream }) catch {
-            if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
+            if (!sleepMsInterruptibleFor(token, registry_probe_interval_ms)) return;
             continue;
         };
         defer stream.close(io);
 
-        // Tracked so shutdown breaks the blocking frame read below.
-        if (!trackSocket(stream.socket, .stream)) return;
-        defer untrackSocket(stream.socket);
+        // Tracked so shutdown -- or `removeSubscriber` on this topic -- breaks the
+        // blocking frame read below.
+        if (!trackSocketFor(token, stream.socket, .stream)) return;
+        defer untrackSocketFor(token, stream.socket);
 
         std.debug.print("subscribed to {s} @ tcp://{f} (tld)\n", .{ topic, endpoint });
 
@@ -3059,7 +3411,7 @@ fn subscribeFramesLoop(topic: []const u8, handler: Qnnt.FrameHandler, context: ?
         subMark(topic, false);
         emitEvent(.publisher_disconnected, topic, peer, 0);
 
-        if (!sleepMsInterruptible(registry_probe_interval_ms)) return;
+        if (!sleepMsInterruptibleFor(token, registry_probe_interval_ms)) return;
     }
 }
 
@@ -3283,8 +3635,15 @@ fn queueDeinit() void {
 }
 
 pub fn subscribeFramesRun(topic: []const u8, handler: Qnnt.FrameHandler, context: ?*anyopaque) bool {
-    if (!spawnWorker(subscribeFramesLoop, .{ topic, handler, context })) {
+    const token = createTopicToken(topic, .subscriber) orelse {
+        std.debug.print("error tracking tld subscriber {s}\n", .{topic});
+        return false;
+    };
+
+    if (!spawnWorkerFor(token, subscribeFramesLoop, .{ token, handler, context })) {
         std.debug.print("error spawning tld subscriber thread for {s}\n", .{topic});
+        detachTopicTokenPtr(token);
+        destroyTopicToken(token);
         return false;
     }
     return true;
@@ -3424,8 +3783,15 @@ pub fn publisherRun(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: ?
         }
     }
 
-    if (!spawnWorker(nodePublish, .{ topic, source, period, context })) {
+    const token = createTopicToken(topic, .publisher) orelse {
+        std.debug.print("error tracking publisher {s}\n", .{topic});
+        return false;
+    };
+
+    if (!spawnWorkerFor(token, nodePublish, .{ token, source, period, context })) {
         std.debug.print("error spawning publisher thread for {s}\n", .{topic});
+        detachTopicTokenPtr(token);
+        destroyTopicToken(token);
         return false;
     }
     sleepMsFn(5);
@@ -3447,6 +3813,10 @@ pub fn nodeDeinit() void {
     breakLiveSockets();
     breakSubscriberStreams();
     joinWorkers();
+    // The per-topic workers are not in the global list, so they are joined separately.
+    // After `joinWorkers`, because a publisher's accept loop can still be spawning its
+    // register loop while the global workers are winding down.
+    joinTopicTokens();
 
     // Past this point no worker exists, so the locks below are uncontended and only
     // taken to keep the access pattern honest.
@@ -3480,6 +3850,15 @@ pub fn nodeDeinit() void {
         live_sockets_mutex.lockUncancelable(io);
         defer live_sockets_mutex.unlock(io);
         live_sockets.clearAndFree(allocator);
+    }
+    {
+        // Keys are duped on first mark and were freed nowhere, so a node that started and
+        // stopped repeatedly leaked one per subscribed topic per lifetime.
+        sub_states_mutex.lockUncancelable(io);
+        defer sub_states_mutex.unlock(io);
+        var it = sub_states.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        sub_states.clearAndFree();
     }
 
     queueDeinit();

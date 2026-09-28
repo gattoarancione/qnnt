@@ -845,3 +845,186 @@ test "a peer's port inside our range does not consume a slot here" {
     const port = try askPort("test/peerport/other", 0);
     try testing.expectEqual(@as(u16, 23701), port);
 }
+
+// ---------------------------------------------------------------- per-topic teardown
+//
+// The interesting failure here is the same one the rest of this file exists for: a worker
+// still running after the call returned. `removePublisher` and `removeSubscriber` join,
+// so a regression shows up as a hang or as a worker touching freed memory, not as a
+// failed assertion. What the assertions add is that the topic is actually *gone* --
+// unregistered, and not merely quiet.
+
+fn waitForTopic(name: []const u8, want: bool, timeout_ms: usize) !void {
+    var names: [64][]const u8 = undefined;
+    var buf: [4096]u8 = undefined;
+    var waited: usize = 0;
+    while (waited < timeout_ms) : (waited += 25) {
+        const n = qnnt.listTopics(&names, &buf) catch 0;
+        var seen = false;
+        for (names[0..n]) |listed| {
+            if (std.mem.eql(u8, listed, name)) seen = true;
+        }
+        if (seen == want) return;
+        qnnt.sleepMs(25);
+    }
+    return error.TopicDidNotSettle;
+}
+
+test "removePublisher stops the publisher and drops its registration" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.runPublisher("test/remove/pub", &source, 1000, null));
+    try waitForTopic("test/remove/pub", true, 3000);
+
+    try testing.expect(qnnt.removePublisher("test/remove/pub"));
+
+    // Gone from the directory, and it stays gone: the refresh loop was joined before the
+    // `unpub` went out, so nothing re-registers it afterwards.
+    try waitForTopic("test/remove/pub", false, 3000);
+    qnnt.sleepMs(300);
+    try waitForTopic("test/remove/pub", false, 500);
+}
+
+test "removePublisher reports whether there was anything to remove" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(!qnnt.removePublisher("test/remove/never-published"));
+
+    try testing.expect(qnnt.runPublisher("test/remove/once", null, null, null));
+    try waitForTopic("test/remove/once", true, 3000);
+
+    try testing.expect(qnnt.removePublisher("test/remove/once"));
+    // Second call has nothing left: the token was detached and freed by the first.
+    try testing.expect(!qnnt.removePublisher("test/remove/once"));
+}
+
+test "removeSubscriber stops a subscription" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.runPublisher("test/remove/feed", &source, 1000, null));
+    try testing.expect(qnnt.subscribe("test/remove/feed", &onMessage, null));
+    qnnt.sleepMs(300); // let it connect, so the join has a live read to break
+
+    try testing.expect(qnnt.removeSubscriber("test/remove/feed"));
+    try testing.expect(!qnnt.removeSubscriber("test/remove/feed"));
+
+    // The publisher is untouched by its subscriber going away.
+    try waitForTopic("test/remove/feed", true, 3000);
+}
+
+test "removeSubscriber stops a frames subscription too" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.subscribeFrames("test/remove/frames", &onFrame, null));
+    qnnt.sleepMs(100); // parked in resolve, which is the retry path rather than a read
+
+    try testing.expect(qnnt.removeSubscriber("test/remove/frames"));
+    try testing.expect(!qnnt.removeSubscriber("test/remove/frames"));
+}
+
+test "removeSubscriber takes every subscription on the topic" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.subscribe("test/remove/twice", &onMessage, null));
+    try testing.expect(qnnt.subscribe("test/remove/twice", &onMessage, null));
+    qnnt.sleepMs(100);
+
+    // One call, both gone -- otherwise the second would outlive the node's own bookkeeping
+    // and the next call would find it.
+    try testing.expect(qnnt.removeSubscriber("test/remove/twice"));
+    try testing.expect(!qnnt.removeSubscriber("test/remove/twice"));
+}
+
+test "a publisher can be removed and the topic published again" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.runPublisher("test/remove/cycle", &source, 1000, null));
+    try waitForTopic("test/remove/cycle", true, 3000);
+    try testing.expect(qnnt.removePublisher("test/remove/cycle"));
+    try waitForTopic("test/remove/cycle", false, 3000);
+
+    // The name was freed with the first token, so this is a fresh allocation under the
+    // same string -- the case that catches a token holding a borrowed slice.
+    try testing.expect(qnnt.runPublisher("test/remove/cycle", &source, 1000, null));
+    try waitForTopic("test/remove/cycle", true, 3000);
+    try testing.expect(qnnt.removePublisher("test/remove/cycle"));
+}
+
+test "removing one topic leaves the others running" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.runPublisher("test/remove/keep-a", &source, 1000, null));
+    try testing.expect(qnnt.runPublisher("test/remove/keep-b", &source, 1000, null));
+    try waitForTopic("test/remove/keep-a", true, 3000);
+    try waitForTopic("test/remove/keep-b", true, 3000);
+
+    try testing.expect(qnnt.removePublisher("test/remove/keep-a"));
+
+    try waitForTopic("test/remove/keep-a", false, 3000);
+    // The whole point of a per-topic token: b's accept loop and refresh were never
+    // signalled, so it is still registering long after a was joined.
+    qnnt.sleepMs(300);
+    try waitForTopic("test/remove/keep-b", true, 1000);
+}
+
+test "deinit after removing everything, and after removing nothing" {
+    try startNode();
+    try testing.expect(qnnt.runPublisher("test/remove/all", &source, 1000, null));
+    try testing.expect(qnnt.subscribe("test/remove/all", &onMessage, null));
+    qnnt.sleepMs(200);
+    try testing.expect(qnnt.removePublisher("test/remove/all"));
+    try testing.expect(qnnt.removeSubscriber("test/remove/all"));
+    qnnt.deinit();
+
+    // And the other order: tokens still live when deinit runs, so joinTopicTokens is what
+    // reaps them. A leak here hangs the join or faults on a torn-down `io`.
+    try startNode();
+    try testing.expect(qnnt.runPublisher("test/remove/all", &source, 1000, null));
+    try testing.expect(qnnt.subscribe("test/remove/all", &onMessage, null));
+    qnnt.sleepMs(200);
+    qnnt.deinit();
+}
+
+test "a topic removed from under a glob is not rejoined" {
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.runPublisher("test/remove/glob-a", &source, 1000, null));
+    try waitForTopic("test/remove/glob-a", true, 3000);
+
+    // Rescan fast, so the "did it come back" window below covers several passes.
+    try testing.expect(qnnt.subscribePattern("test/remove/glob-*", &onMessage, null, 100));
+
+    // Wait for the pattern to have joined it -- observable as there being a subscription
+    // to remove.
+    var waited: usize = 0;
+    while (waited < 3000) : (waited += 50) {
+        if (qnnt.removeSubscriber("test/remove/glob-a")) break;
+        qnnt.sleepMs(50);
+    } else return error.PatternNeverJoined;
+
+    // Ten rescans' worth. `joined` is append-only, so the name is still in it and the
+    // pattern skips it -- if it rejoined, there would be a subscription to remove again.
+    qnnt.sleepMs(1000);
+    try testing.expect(!qnnt.removeSubscriber("test/remove/glob-a"));
+}
+
+test "removing after deinit is refused, not a crash" {
+    try startNode();
+    try testing.expect(qnnt.runPublisher("test/remove/after", &source, 1000, null));
+    try testing.expect(qnnt.subscribe("test/remove/after", &onMessage, null));
+    qnnt.sleepMs(200);
+    qnnt.deinit();
+
+    // The natural place to call one of these is on the way out, which is easily one line
+    // too late. Both mutexes would otherwise reach for an `io` that deinit tore down.
+    try testing.expect(!qnnt.removePublisher("test/remove/after"));
+    try testing.expect(!qnnt.removeSubscriber("test/remove/after"));
+}

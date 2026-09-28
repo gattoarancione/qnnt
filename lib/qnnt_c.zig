@@ -60,6 +60,80 @@ fn retainTopic(topic: ?[*]const u8, topic_len: usize) ?[]const u8 {
     return allocator.dupe(u8, borrowed) catch null;
 }
 
+// ---------------------------------------------------------------- per-topic teardown
+//
+// The trampoline box a direct subscription allocates, so `qnnt_remove_subscriber` can give
+// it back. Boxes were always leaked on purpose -- one per subscription, for the life of the
+// node, bounded by how many a program makes. Per-topic removal makes that unbounded, so
+// what a topic owns is tracked here and freed with it.
+//
+// Pattern subscriptions are deliberately absent: one box serves every topic a glob joins,
+// so freeing it when one of them is removed would leave the others calling through it.
+// A pattern's box stays bounded by the number of patterns, as before.
+//
+// Unguarded, like `poll_scratch` and `event_box` below: these are control-plane calls made
+// from the caller's own thread, never from a library worker.
+const OwnedBox = struct {
+    topic: []const u8, // owned
+    publisher: bool,
+    box: *anyopaque,
+    release: *const fn (*anyopaque) void,
+};
+
+var owned_boxes: std.ArrayList(OwnedBox) = .empty;
+
+fn releaseMessageBox(p: *anyopaque) void {
+    allocator.destroy(@as(*MessageBox, @ptrCast(@alignCast(p))));
+}
+
+fn releaseFrameBox(p: *anyopaque) void {
+    allocator.destroy(@as(*FrameBox, @ptrCast(@alignCast(p))));
+}
+
+fn releaseSourceBox(p: *anyopaque) void {
+    allocator.destroy(@as(*SourceBox, @ptrCast(@alignCast(p))));
+}
+
+/// Record a box against a topic, or free it now if the subscription never started.
+/// Returns the status to hand back to the caller.
+fn keepBox(
+    started: bool,
+    topic: []const u8,
+    publisher: bool,
+    box: *anyopaque,
+    release: *const fn (*anyopaque) void,
+) Status {
+    if (!started) {
+        release(box);
+        return .failed;
+    }
+    const name = allocator.dupe(u8, topic) catch return .ok; // started; just untracked
+    owned_boxes.append(allocator, .{
+        .topic = name,
+        .publisher = publisher,
+        .box = box,
+        .release = release,
+    }) catch {
+        allocator.free(name);
+    };
+    return .ok;
+}
+
+/// Free whatever the topic's direct subscriptions or publisher allocated here.
+fn releaseBoxes(topic: []const u8, publisher: bool) void {
+    var i: usize = 0;
+    while (i < owned_boxes.items.len) {
+        const entry = owned_boxes.items[i];
+        if (entry.publisher == publisher and std.mem.eql(u8, entry.topic, topic)) {
+            entry.release(entry.box);
+            allocator.free(entry.topic);
+            _ = owned_boxes.swapRemove(i);
+            continue; // swapRemove moved a new entry into i
+        }
+        i += 1;
+    }
+}
+
 // ---------------------------------------------------------------- lifecycle
 
 /// Choose the registry port for the next `qnnt_init`. Returns QNNT_FAILED while a node is
@@ -235,14 +309,17 @@ export fn qnnt_publisher_start(
     period_us: u64,
     user: ?*anyopaque,
 ) callconv(.c) Status {
-    const name = retainTopic(topic, topic_len) orelse return .invalid_argument;
+    // Borrowed, not copied: the library duplicates the topic into the publisher's own
+    // token and never refers to this slice again.
+    const name = topicSlice(topic, topic_len) orelse return .invalid_argument;
 
     if (source) |callback| {
-        // The box must outlive the publisher, and publishers live until deinit, so it is
-        // never freed. Bounded by the number of publishers, not by messages.
+        // The box outlives this call -- it is what the scheduler calls back through -- so
+        // it is tracked against the topic and freed by `qnnt_remove_publisher`.
         const box = allocator.create(SourceBox) catch return .failed;
         box.* = .{ .callback = callback, .user = user };
-        return if (qnnt.publisherRun(name, sourceTrampoline, period_us, box)) .ok else .failed;
+        const started = qnnt.publisherRun(name, sourceTrampoline, period_us, box);
+        return keepBox(started, name, true, box, releaseSourceBox);
     }
 
     if (period_us != 0) return .invalid_period;
@@ -289,12 +366,13 @@ export fn qnnt_subscribe(
     callback: ?MessageFn,
     user: ?*anyopaque,
 ) callconv(.c) Status {
-    const name = retainTopic(topic, topic_len) orelse return .invalid_argument;
+    const name = topicSlice(topic, topic_len) orelse return .invalid_argument;
     const cb = callback orelse return .invalid_argument;
 
     const box = allocator.create(MessageBox) catch return .failed;
     box.* = .{ .callback = cb, .user = user };
-    return if (qnnt.subscribeRun(name, messageTrampoline, box)) .ok else .failed;
+    const started = qnnt.subscribeRun(name, messageTrampoline, box);
+    return keepBox(started, name, false, box, releaseMessageBox);
 }
 
 /// `qnnt_subscribe` over a glob: every topic matching `pattern` now, and every one that
@@ -353,12 +431,13 @@ export fn qnnt_subscribe_frames(
     callback: ?FrameFn,
     user: ?*anyopaque,
 ) callconv(.c) Status {
-    const name = retainTopic(topic, topic_len) orelse return .invalid_argument;
+    const name = topicSlice(topic, topic_len) orelse return .invalid_argument;
     const cb = callback orelse return .invalid_argument;
 
     const box = allocator.create(FrameBox) catch return .failed;
     box.* = .{ .callback = cb, .user = user };
-    return if (qnnt.subscribeFramesRun(name, frameTrampoline, box)) .ok else .failed;
+    const started = qnnt.subscribeFramesRun(name, frameTrampoline, box);
+    return keepBox(started, name, false, box, releaseFrameBox);
 }
 
 /// `qnnt_subscribe_frames` over a glob. See `qnnt_subscribe_pattern`.
@@ -407,12 +486,39 @@ export fn qnnt_subscribe_queue(
     topic_len: usize,
     mode: QueueMode,
 ) callconv(.c) Status {
-    const name = retainTopic(topic, topic_len) orelse return .invalid_argument;
+    // No box on this path: the queue subscription's handler is the library's own.
+    const name = topicSlice(topic, topic_len) orelse return .invalid_argument;
     const zig_mode: qnnt.QueueMode = switch (mode) {
         .text => .text,
         .frames => .frames,
     };
     return if (qnnt.Qnnt.subscribeQueue(name, zig_mode)) .ok else .failed;
+}
+
+// ---------------------------------------------------------------- per-topic removal
+
+/// Stop publishing `topic` without stopping the node: joins that publisher's threads, drops
+/// its registration and closes its delivery connections.
+///
+/// QNNT_FAILED when no publisher of that name is running here, and when called from that
+/// publisher's own source callback -- which would otherwise wait for the calling thread.
+export fn qnnt_remove_publisher(topic: ?[*]const u8, topic_len: usize) callconv(.c) Status {
+    const name = topicSlice(topic, topic_len) orelse return .invalid_argument;
+    if (!qnnt.removePublisher(name)) return .failed;
+    // After the join, so nothing can be calling through the box as it is freed.
+    releaseBoxes(name, true);
+    return .ok;
+}
+
+/// Stop every subscription this node holds on `topic`, whichever flavour started it.
+///
+/// A topic reached through a glob stays gone: the pattern does not rejoin it. QNNT_FAILED
+/// when nothing was subscribed, and when called from that topic's own callback.
+export fn qnnt_remove_subscriber(topic: ?[*]const u8, topic_len: usize) callconv(.c) Status {
+    const name = topicSlice(topic, topic_len) orelse return .invalid_argument;
+    if (!qnnt.removeSubscriber(name)) return .failed;
+    releaseBoxes(name, false);
+    return .ok;
 }
 
 /// Does `topic` match `pattern`? Exposed because a caller that subscribes to a glob often

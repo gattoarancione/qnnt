@@ -272,6 +272,26 @@ class Node:
         """Encode `value` as one TLD frame and publish it."""
         self.publish(topic, tld.dumps(value))
 
+    def remove_publisher(self, topic: str) -> bool:
+        """Stop publishing `topic`, leaving the rest of the node running.
+
+        Joins the topic's worker threads before returning, so afterwards nothing is still
+        writing to its subscribers and the registration is gone. Returns False when nothing
+        of that name was publishing here, which makes it safe to call speculatively.
+        """
+        raw = self._topic_bytes(topic)
+        return self._lib.qnnt_remove_publisher(raw, len(raw)) == 0
+
+    def remove_subscriber(self, topic: str) -> bool:
+        """Stop every subscription on `topic`, leaving the rest of the node running.
+
+        A topic reached through `subscribe_pattern` stays gone -- the pattern will not
+        rejoin it. Messages already queued are still returned by `poll`; this stops new
+        ones arriving. Returns False when nothing was subscribed.
+        """
+        raw = self._topic_bytes(topic)
+        return self._lib.qnnt_remove_subscriber(raw, len(raw)) == 0
+
     def subscribe(self, topic: str, *, frames: bool = False) -> None:
         """Subscribe, delivering into the queue that `poll` drains.
 

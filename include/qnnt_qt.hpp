@@ -306,6 +306,22 @@ public:
     bool addSubscriberPattern(const QString& pattern, Delivery delivery = Delivery::Text,
                               int rescanMs = 500);
 
+    /// Stop publishing a topic, without stopping the node. Joins that publisher's threads
+    /// before returning, so once it does, no scheduler callback for this topic can still be
+    /// running and the std::function behind it is released.
+    ///
+    /// False when nothing of that name was publishing here -- so it is safe to call
+    /// speculatively -- and also when called from that topic's own source callback, which
+    /// would otherwise wait for the calling thread.
+    bool removePublisher(const QString& topic);
+
+    /// Stop every subscription on a topic, whichever call started it. A topic reached
+    /// through addSubscriberPattern() stays gone: the pattern will not rejoin it.
+    ///
+    /// False when nothing was subscribed, and when called from that topic's own
+    /// messageAvailable()/frameAvailable() handler -- see removePublisher().
+    bool removeSubscriber(const QString& topic);
+
     /// Decode a frame from frameAvailable() into a TLD-mapped type -- the replacement for
     /// the old getUnpacked<T>(). Throws qnnt::tld::Error on a malformed frame.
     template <class T>
@@ -740,6 +756,28 @@ inline bool QnntNode::addSubscriberPattern(const QString& pattern, Delivery deli
     return true;
 }
 
+inline bool QnntNode::removePublisher(const QString& topic) {
+    const QByteArray name = topic.toUtf8();
+    if (qnnt_remove_publisher(name.constData(),
+                              static_cast<std::size_t>(name.size())) != QNNT_OK) {
+        return false;
+    }
+    // After the call, never before: the library has joined the scheduler thread, so no tick
+    // can be part-way through the std::function this drops.
+    m_sources.remove(topic);
+    return true;
+}
+
+inline bool QnntNode::removeSubscriber(const QString& topic) {
+    const QByteArray name = topic.toUtf8();
+    if (qnnt_remove_subscriber(name.constData(),
+                               static_cast<std::size_t>(name.size())) != QNNT_OK) {
+        return false;
+    }
+    m_subscriptions.remove(topic);
+    return true;
+}
+
 /// Which framing a delivered topic was subscribed with. A literal subscription answers
 /// directly; otherwise the patterns are asked, through the LIBRARY's matcher rather than a
 /// second implementation here -- a header that disagreed with the library about what
@@ -804,12 +842,6 @@ inline quint64 QnntNode::droppedCount() const { return qnnt_queue_dropped(); }
  *       since payloads are binary, and a timeout on the client side. Then a Qt layer over
  *       it: request() as an async call returning a QFuture, or a requestAvailable() signal
  *       plus a reply() slot for the serving side.
- *
- *   removePublisher / removeSubscriber
- *       There is no per-topic teardown. A publisher or subscriber lives until the whole
- *       node is torn down by stop(). The registry does understand an `unpub` verb, so half
- *       the wire support exists; what is missing is a way to stop the worker thread for one
- *       topic and unregister it.
  *
  *   responderConnected
  *       Needs the request/reply role above. The other four connection signals now exist:

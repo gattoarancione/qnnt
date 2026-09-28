@@ -2313,3 +2313,74 @@ An FD frame will not leave an interface whose MTU is still 16 -- the write fails
 EMSGSIZE. `ip link set vcan0 mtu 72` is what the link needs, and
 examples/can/start-gateway.sh does it. A vcan at MTU 72 carries classic frames unchanged, so
 it costs nothing.
+
+
+--------------------------------------------------------------------------------
+ 22. Stopping one topic: removePublisher and removeSubscriber
+--------------------------------------------------------------------------------
+
+Until now a publisher or a subscriber lived until the whole node did. These stop one topic
+and leave the rest of the node running.
+
+    Zig     Qnnt.removePublisher("bus/one")
+            Qnnt.removeSubscriber("bus/one")
+
+    C       qnnt_remove_publisher("bus/one", 7);
+            qnnt_remove_subscriber("bus/one", 7);
+
+    C++     node->removePublisher("bus/one");
+            node->removeSubscriber("bus/one");
+
+    Python  node.remove_publisher("bus/one")
+            node.remove_subscriber("bus/one")
+
+Both answer "was there anything to remove" -- false/QNNT_FAILED when that topic was not
+running here. That makes them safe to call speculatively rather than tracking what you
+started.
+
+WHAT REMOVAL ACTUALLY DOES
+
+A publisher is three threads, not one: the accept loop holding the listening socket, the
+loop that refreshes the registry every couple of seconds, and (if you gave it a period) the
+scheduler calling your source. `removePublisher` stops all three, then drops the
+registration with the registry's `unpub` verb and closes the connections its subscribers
+were reading from.
+
+The order matters and is not the obvious one. The refresh loop is joined BEFORE the `unpub`
+goes out -- reverse it and the loop re-registers the topic a moment later, leaving a
+directory entry pointing at a socket nobody is listening on.
+
+A subscriber is one thread parked in a read. `removeSubscriber` breaks that read and joins
+it, and takes EVERY subscription on the name: subscribe to the same topic twice and one
+call removes both.
+
+THE GUARANTEE, AND THE ONE TRAP
+
+Both calls JOIN. When they return, no thread is left reading, writing or calling back on
+that topic, so whatever your callback's user pointer pointed at is yours to free.
+
+That guarantee is exactly what makes the trap: calling either from the topic's own callback
+would have the thread wait for itself. That is refused -- false, and a line on stderr --
+rather than deadlocking. If you need a topic to stop itself, set a flag and remove it from
+whichever thread drives your program.
+
+    // WRONG -- this is the callback's own thread
+    void on_message(const char *topic, size_t n, const uint8_t *d, size_t len, void *u) {
+        if (looks_done(d, len)) qnnt_remove_subscriber(topic, n);  // returns QNNT_FAILED
+    }
+
+    // Right: the callback raises a flag, the main loop acts on it.
+    if (atomic_load(&done)) qnnt_remove_subscriber("bus/one", 7);
+
+GLOBS
+
+A topic joined by `subscribePattern` can be removed like any other, and it stays removed:
+the pattern keeps a record of every topic it has ever joined, so its next rescan passes
+over that name instead of resubscribing. Removing the pattern itself is not a thing --
+there is no handle for it. To stop a whole glob, stop the node.
+
+WHAT IT IS NOT
+
+Not a pause. There is no retention in qnnt, so a removed-and-recreated publisher is a new
+publisher: subscribers see a disconnect and reconnect, and anything published in between
+reached nobody. That is the same thing they would have seen had the process restarted.

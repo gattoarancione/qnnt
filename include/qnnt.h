@@ -334,6 +334,30 @@ qnnt_status qnnt_subscribe_pattern_frames(const char *pattern, size_t pattern_le
                                           qnnt_frame_fn callback, void *user,
                                           uint64_t rescan_ms);
 
+/* --- per-topic teardown ------------------------------------------------------ */
+
+/*
+ * Stop one topic without stopping the node.
+ *
+ * Both calls JOIN the topic's worker threads before returning, so when they return nothing
+ * is still reading, writing or calling back on that topic and any user pointer it held can
+ * be freed. That is also the one trap: calling either from the topic's own callback would
+ * have the thread wait for itself, so that is refused with QNNT_FAILED rather than
+ * deadlocking.
+ *
+ * QNNT_FAILED also means there was nothing to remove, which makes both safe to call
+ * speculatively.
+ */
+
+/* Stop publishing a topic: joins the accept loop, the registry refresh and the scheduler,
+ * drops the registration and closes the delivery connections. Subscribers on other nodes
+ * see the publisher go away, exactly as they would if the process had exited. */
+qnnt_status qnnt_remove_publisher(const char *topic, size_t topic_len);
+
+/* Stop every subscription this node holds on a topic, whichever call started it. A topic
+ * reached through a glob stays gone -- the pattern will not rejoin it. */
+qnnt_status qnnt_remove_subscriber(const char *topic, size_t topic_len);
+
 /* --- subscriptions: queue ---------------------------------------------------- */
 
 /*
