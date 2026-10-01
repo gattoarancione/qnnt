@@ -116,6 +116,15 @@ pub fn build(b: *Build) void {
     });
     dirigera_frames_mod.addImport("qnnt", qnnt_lib_mod);
 
+    // The pairing exchange. No imports of its own -- it drives HTTP through a function the
+    // caller supplies -- which is what lets its whole state machine be tested without
+    // OpenSSL, a hub, or a finger on the hub's button.
+    const dirigera_pair_mod = b.createModule(.{
+        .root_source_file = b.path("examples/dirigera/pair.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const dirigera_bridge_mod = b.createModule(.{
         .root_source_file = b.path("examples/dirigera/bridge.zig"),
         .target = target,
@@ -126,6 +135,7 @@ pub fn build(b: *Build) void {
     dirigera_bridge_mod.addImport("hub", dirigera_hub_mod);
     dirigera_bridge_mod.addImport("ws", dirigera_ws_mod);
     dirigera_bridge_mod.addImport("frames", dirigera_frames_mod);
+    dirigera_bridge_mod.addImport("pair", dirigera_pair_mod);
     dirigera_bridge_mod.addImport("qnnt", qnnt_lib_mod);
     dirigera_bridge_mod.linkLibrary(qnnt_lib);
 
@@ -784,6 +794,7 @@ pub fn build(b: *Build) void {
         "examples/dirigera/https.zig",
         "examples/dirigera/hub.zig",
         "examples/dirigera/frames.zig",
+        "examples/dirigera/pair.zig",
         "examples/dirigera/ws.zig",
         "examples/ugv/sio.zig",
         "examples/ugv/beast.zig",

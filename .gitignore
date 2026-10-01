@@ -13,3 +13,8 @@ python/qnnt/_lib/*.so
 python/qnnt/_lib/*.dll
 python/**/__pycache__/
 python/*.egg-info/
+
+# The DIRIGERA bearer token. It grants control of a house's lights and sits in the working
+# directory by default, so it is ignored here rather than left one `git add .` away from
+# being published. dirigera-bridge writes it 0600 for the same reason.
+dirigera_token

@@ -100,6 +100,30 @@ pub const StatusFrame = struct {
     /// Commands for a device the hub does not accept commands for, or an unknown id.
     commands_refused: u64,
     reconnects: u64,
+
+    /// A bearer token is in hand.
+    ///
+    /// False means the bridge is running and its topics are up, but the only hub endpoint
+    /// it can reach is the unauthenticated one -- it is waiting to be paired. A controller
+    /// reads this to know whether to show a house or a pairing panel.
+    paired: bool,
+    /// A pairing exchange is under way: the hub has a window open and is waiting for its
+    /// action button to be pressed.
+    pairing: bool,
+    /// The last thing the pairing exchange said, in words meant for whoever is standing at
+    /// the hub -- "press the action button", or the hub's own reason for refusing. Empty
+    /// when no pairing has been attempted.
+    pair_detail: []const u8,
+};
+
+/// A request to pair, from a controller. The bridge runs the exchange; the controller only
+/// starts and stops it, because the operator has to be at the hub either way.
+pub const PairRequest = struct {
+    /// How the hub will list this client. Worth a name a person would recognise months
+    /// later, since it appears in IKEA's own app.
+    name: []const u8 = "qnnt-bridge",
+    /// Abandon an exchange already running.
+    cancel: bool = false,
 };
 
 /// A command from the command topic. Every field but the id is optional, so a controller can

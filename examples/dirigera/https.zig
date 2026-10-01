@@ -101,6 +101,9 @@ pub const Client = struct {
     /// One request, one connection. The hub answers `Connection: close`, so there is
     /// nothing to pool; and the REST calls here are occasional (an inventory refresh, a
     /// light command) rather than a stream.
+    ///
+    /// A non-2xx is `error.Rejected`. Pairing needs to read the body of a 4xx instead, so
+    /// it calls `requestTyped` directly.
     pub fn request(
         c: *Client,
         authority: []const u8,
@@ -110,6 +113,34 @@ pub const Client = struct {
         body: ?[]const u8,
         out: *std.ArrayList(u8),
     ) !void {
+        const status = try c.requestTyped(
+            authority,
+            method,
+            path,
+            token,
+            "application/json",
+            body,
+            out,
+        );
+        if (status < 200 or status > 299) return error.Rejected;
+    }
+
+    /// As `request`, but the caller names the body's media type and receives the status
+    /// rather than an error for a non-2xx.
+    ///
+    /// Both exist for the pairing exchange: its token endpoint is form-encoded rather than
+    /// JSON, and it answers 4xx with a body that says whether to keep waiting for the
+    /// operator's button press or to start a fresh pairing window.
+    pub fn requestTyped(
+        c: *Client,
+        authority: []const u8,
+        method: []const u8,
+        path: []const u8,
+        token: ?[]const u8,
+        content_type: []const u8,
+        body: ?[]const u8,
+        out: *std.ArrayList(u8),
+    ) !u16 {
         const connection = try c.connect(authority, c.timeout_ms);
         defer connection.close();
 
@@ -121,8 +152,8 @@ pub const Client = struct {
             w.print("Authorization: Bearer {s}\r\n", .{bearer}) catch return error.Rejected;
         }
         if (body) |payload| {
-            w.print("Content-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{
-                payload.len, payload,
+            w.print("Content-Type: {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{
+                content_type, payload.len, payload,
             }) catch return error.Rejected;
         } else {
             w.writeAll("\r\n") catch return error.Rejected;
@@ -148,7 +179,7 @@ pub const Client = struct {
             if (c.raw.items.len > wire.max_response_bytes) return error.Rejected;
         }
 
-        return wire.decodeResponse(c.raw.items, out, c.allocator);
+        return wire.decodeResponseStatus(c.raw.items, out, c.allocator);
     }
 };
 

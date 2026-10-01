@@ -290,6 +290,13 @@ class Home : public QObject
     Q_PROPERTY(bool eventLink READ eventLink NOTIFY statusChanged)
     Q_PROPERTY(QString linkDetail READ linkDetail NOTIFY statusChanged)
     Q_PROPERTY(bool haveStatus MEMBER m_have_status NOTIFY statusChanged)
+
+    // Pairing. The bridge runs the exchange -- it owns the hub connection -- and this only
+    // starts it and shows what it says, because the decisive step happens at the hub
+    // itself, under someone's thumb.
+    Q_PROPERTY(bool paired MEMBER m_paired NOTIFY statusChanged)
+    Q_PROPERTY(bool pairing MEMBER m_pairing NOTIFY statusChanged)
+    Q_PROPERTY(QString pairDetail MEMBER m_pair_detail NOTIFY statusChanged)
     Q_PROPERTY(int lightsOn READ lightsOn NOTIFY devicesChanged)
     Q_PROPERTY(int lightCount READ lightCount NOTIFY devicesChanged)
 
@@ -305,6 +312,7 @@ public:
         }
 
         node->addPublisher(topic("light"));
+        node->addPublisher(topic("pair"));
         node->addSubscriber(topic("inventory"), qnnt::QnntNode::Delivery::Frames);
         node->addSubscriber(topic("state"), qnnt::QnntNode::Delivery::Frames);
         node->addSubscriber(topic("status"), qnnt::QnntNode::Delivery::Frames);
@@ -448,6 +456,25 @@ Q_SIGNALS:
     void devicesChanged();
     void statusChanged();
 
+public Q_SLOTS:
+    /// Ask the bridge to pair. It answers through the status topic rather than here: the
+    /// operator still has to walk to the hub and press its button, so progress arrives over
+    /// the following minutes and this returns at once.
+    void startPairing(const QString& name)
+    {
+        dirigera::PairRequest request;
+        request.name = name.isEmpty() ? std::string("qnnt-home") : name.toStdString();
+        request.cancel = false;
+        qnnt::QnntNode::instance()->publishPacked(topic("pair"), request);
+    }
+
+    void cancelPairing()
+    {
+        dirigera::PairRequest request;
+        request.cancel = true;
+        qnnt::QnntNode::instance()->publishPacked(topic("pair"), request);
+    }
+
 private Q_SLOTS:
     void onFrame(const QString& topic_name, const QByteArray& frame)
     {
@@ -470,6 +497,9 @@ private Q_SLOTS:
             m_failed = status.commands_failed;
             m_refused = status.commands_refused;
             m_reconnects = status.reconnects;
+            m_paired = status.paired;
+            m_pairing = status.pairing;
+            m_pair_detail = QString::fromStdString(status.pair_detail);
             m_have_status = true;
             Q_EMIT statusChanged();
         }
@@ -604,6 +634,8 @@ private:
 
     QString m_hub, m_firmware;
     bool m_api_link{false}, m_event_link{false}, m_have_status{false};
+    bool m_paired{false}, m_pairing{false};
+    QString m_pair_detail;
     quint64 m_events{0}, m_unparsed{0}, m_dropped{0}, m_failed{0}, m_refused{0},
         m_reconnects{0};
 };

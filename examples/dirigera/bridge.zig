@@ -1,20 +1,34 @@
 //! The bridge: an IKEA DIRIGERA hub on one side, qnnt topics on the other.
 //!
+//!   ./zig-out/bin/dirigera-bridge --host 192.168.1.20:8443 --pair    # once, ever
 //!   ./zig-out/bin/dirigera-bridge --host 192.168.1.20:8443 --token ./dirigera_token
 //!
-//!   dirigera-bridge --host <ip:port> [--token path] [--topic prefix] [--list]
+//!   dirigera-bridge --host <ip:port> [--token path] [--topic prefix] [--list] [--pair]
 //!
 //! Find the hub without guessing, because its address moves:
 //!
 //!   dns-sd -B _ihsp._tcp local            # the hub announces itself
 //!   dns-sd -L <instance> _ihsp._tcp local # TXT record carries ipv4address and version
 //!
-//! Four topics:
+//! Five topics:
 //!
 //!   home/dirigera/state       published   one frame per device, when it changes
 //!   home/dirigera/inventory   published   every device, on a timer
-//!   home/dirigera/status      published   the link, the hub, the counters
+//!   home/dirigera/status      published   the link, the hub, the counters, pairing
 //!   home/dirigera/light       subscribed  {id, on?, level?, kelvin?}
+//!   home/dirigera/pair        subscribed  {name, cancel} -- start or stop pairing
+//!
+//! PAIRING IS PART OF THE BRIDGE, not a step you do elsewhere first. Everything above needs
+//! a bearer token, and the only way to get one is an OAuth PKCE exchange finished by
+//! pressing the hub's physical button. This program used to read that token from a file and
+//! exit if it was missing, which left the procedure living in a script outside the tree --
+//! so the example could not actually be run from a clean checkout.
+//!
+//! Now a bridge with no token still starts. Its topics come up, its status says
+//! `paired: false`, and it waits for a request on the pair topic; `--pair` does the same
+//! thing on the terminal. The exchange itself is in pair.zig, driven through callbacks so
+//! that its whole state machine is tested offline -- see the tests there. The bridge
+//! supplies the four things it cannot: TLS, a clock, a sleep, and entropy.
 //!
 //! WHAT MAKES THIS DIFFERENT FROM THE UGV BRIDGE, and it is the interesting part: the hub
 //! PUSHES. State arrives on a WebSocket the moment a light is switched, a sensor trips or an
@@ -50,6 +64,7 @@ const https = @import("https");
 const hub = @import("hub");
 const ws = @import("ws");
 const frames = @import("frames");
+const pair = @import("pair");
 
 const allocator = std.heap.page_allocator;
 
@@ -105,6 +120,17 @@ const Shared = struct {
     pending_len: usize = 0,
     /// Commands dropped because the ring was full.
     pending_dropped: u64 = 0,
+
+    /// A bearer token is in hand. Everything the bridge does beyond `GET /v1/hub/status`
+    /// waits on this.
+    paired: bool = false,
+    /// A pairing exchange is running on its own thread.
+    pairing: bool = false,
+    /// Set to abandon that exchange.
+    pair_cancel: bool = false,
+    /// The last thing the exchange said, for whoever is standing at the hub.
+    pair_detail_buf: [192]u8 = undefined,
+    pair_detail_len: usize = 0,
 };
 
 const Pending = struct {
@@ -220,10 +246,12 @@ var topic_state_buf: [128]u8 = undefined;
 var topic_inventory_buf: [128]u8 = undefined;
 var topic_status_buf: [128]u8 = undefined;
 var topic_light_buf: [128]u8 = undefined;
+var topic_pair_buf: [128]u8 = undefined;
 var topic_state: []const u8 = "";
 var topic_inventory: []const u8 = "";
 var topic_status: []const u8 = "";
 var topic_light: []const u8 = "";
+var topic_pair: []const u8 = "";
 
 var authority: []const u8 = "";
 var token: []const u8 = "";
@@ -391,11 +419,216 @@ fn publishStatus() !void {
         .commands_failed = shared.commands_failed,
         .commands_refused = shared.commands_refused + shared.pending_dropped,
         .reconnects = shared.reconnects,
+        .paired = shared.paired,
+        .pairing = shared.pairing,
+        .pair_detail = shared.pair_detail_buf[0..shared.pair_detail_len],
     };
     shared.mutex.unlock(bridge_io);
 
     try tld.packTo(allocator, &publish_buf, out);
     try qnnt.publish(topic_status, publish_buf.items);
+}
+
+// -- pairing -----------------------------------------------------------------------------
+//
+// The exchange lives in pair.zig, which knows nothing about TLS, qnnt or this program. What
+// is here is the wiring: the four callbacks it needs from a real runtime, the thread it runs
+// on, and writing the token out at the end.
+//
+// It runs on its own thread because it blocks for as long as it takes someone to walk to the
+// hub and press a button -- up to ten minutes. The supervisor keeps publishing status
+// throughout, which is the whole point: the GUI shows the progress below while it waits.
+
+/// Where the token is written once the hub grants it.
+var pair_token_path: []const u8 = "dirigera_token";
+/// The name the hub will list this client under, from the pairing request.
+var pair_client_name_buf: [64]u8 = undefined;
+var pair_client_name_len: usize = 0;
+
+fn pairRequest(
+    context: ?*anyopaque,
+    method: []const u8,
+    path: []const u8,
+    content_type: []const u8,
+    body: ?[]const u8,
+    out: *std.ArrayList(u8),
+) anyerror!u16 {
+    const client: *https.Client = @ptrCast(@alignCast(context.?));
+    // No token: this exchange is how one is obtained.
+    return client.requestTyped(authority, method, path, null, content_type, body, out);
+}
+
+// `bridge_io`, NOT the library's `io` by way of `qnnt.sleepMs`/`qnnt.nowMicros`.
+//
+// `--pair` runs before `qnnt.run()` and never starts a node at all, so the library's `io` is
+// still undefined there -- reaching for it segfaults on the first call. That is the hazard
+// this file's own header warns about for `--list` and the token read; pairing is the third
+// thing that happens outside a running node, and it walked straight into it against a real
+// hub. `bridge_io` is valid from the first line of `main`, so it is correct in both paths:
+// the terminal one and the one driven from the GUI after the node is up.
+fn pairSleep(ms: u64, context: ?*anyopaque) void {
+    _ = context;
+    bridge_io.sleep(.fromMilliseconds(@intCast(ms)), .awake) catch {};
+}
+
+/// Elapsed rather than wall-clock time: these are deadlines for how long to keep offering
+/// the operator a chance to press the button, and a clock adjustment must not extend or cut
+/// short the window.
+fn pairNow(context: ?*anyopaque) i64 {
+    _ = context;
+    return @divTrunc(std.Io.Timestamp.now(bridge_io, .awake).toMicroseconds(), 1000);
+}
+
+fn pairEntropy(buffer: []u8, context: ?*anyopaque) void {
+    _ = context;
+    bridge_io.random(buffer);
+}
+
+/// Progress goes two places: the terminal, for `--pair`, and the status topic, for the GUI.
+fn pairProgress(message: []const u8, context: ?*anyopaque) void {
+    _ = context;
+    std.debug.print("dirigera-bridge: pairing -- {s}\n", .{message});
+
+    shared.mutex.lockUncancelable(bridge_io);
+    defer shared.mutex.unlock(bridge_io);
+    shared.pair_detail_len = @min(message.len, shared.pair_detail_buf.len);
+    @memcpy(shared.pair_detail_buf[0..shared.pair_detail_len], message[0..shared.pair_detail_len]);
+}
+
+fn pairShouldStop(context: ?*anyopaque) bool {
+    _ = context;
+    if (qnnt.stopRequested()) return true;
+    shared.mutex.lockUncancelable(bridge_io);
+    defer shared.mutex.unlock(bridge_io);
+    return shared.pair_cancel;
+}
+
+fn isPaired() bool {
+    shared.mutex.lockUncancelable(bridge_io);
+    defer shared.mutex.unlock(bridge_io);
+    return shared.paired;
+}
+
+/// Record what the exchange ended as, for the status topic.
+fn pairFinished(detail: []const u8, paired: bool) void {
+    shared.mutex.lockUncancelable(bridge_io);
+    defer shared.mutex.unlock(bridge_io);
+    shared.pairing = false;
+    shared.pair_cancel = false;
+    if (paired) shared.paired = true;
+    shared.pair_detail_len = @min(detail.len, shared.pair_detail_buf.len);
+    @memcpy(shared.pair_detail_buf[0..shared.pair_detail_len], detail[0..shared.pair_detail_len]);
+}
+
+/// The whole exchange, including writing the token out. Returns true when paired.
+///
+/// Its own HTTPS client rather than the supervisor's: this runs for minutes on another
+/// thread, and the supervisor is meanwhile using its client for the inventory.
+fn runPairing() bool {
+    var client = https.Client.init(bridge_io, allocator) catch {
+        pairFinished("could not start a TLS client", false);
+        return false;
+    };
+    defer client.deinit();
+
+    var fresh: std.ArrayList(u8) = .empty;
+    defer fresh.deinit(allocator);
+
+    const name = if (pair_client_name_len > 0)
+        pair_client_name_buf[0..pair_client_name_len]
+    else
+        "qnnt-bridge";
+
+    const host: pair.Host = .{
+        .request = pairRequest,
+        .sleep = pairSleep,
+        .now_ms = pairNow,
+        .entropy = pairEntropy,
+        .context = &client,
+    };
+
+    pair.run(
+        host,
+        &fresh,
+        allocator,
+        .{ .client_name = name },
+        pairProgress,
+        pairShouldStop,
+    ) catch |err| {
+        const detail = switch (err) {
+            error.TimedOut => "nobody pressed the hub's button -- pairing gave up",
+            error.Cancelled => "pairing cancelled",
+            error.OutOfMemory => "out of memory",
+        };
+        pairFinished(detail, false);
+        return false;
+    };
+
+    // Owner-only: this is a bearer token for someone's house, and the default 0o666 would
+    // leave it readable by every account on the machine.
+    std.Io.Dir.cwd().writeFile(bridge_io, .{
+        .sub_path = pair_token_path,
+        .data = fresh.items,
+        .flags = .{ .permissions = @enumFromInt(0o600) },
+    }) catch |err| {
+        std.debug.print(
+            "dirigera-bridge: paired, but could not write the token to '{s}' ({t})\n",
+            .{ pair_token_path, err },
+        );
+        pairFinished("paired, but the token could not be saved", false);
+        return false;
+    };
+
+    // Adopted in memory too, so a bridge that paired at runtime starts working without
+    // being restarted.
+    token = allocator.dupe(u8, fresh.items) catch {
+        pairFinished("paired, but the token could not be held", false);
+        return false;
+    };
+    std.debug.print(
+        "dirigera-bridge: paired -- token written to {s}\n",
+        .{pair_token_path},
+    );
+    pairFinished("paired", true);
+    return true;
+}
+
+/// The thread body for a pairing asked for over the topic.
+fn pairingThread() void {
+    _ = runPairing();
+}
+
+/// A pairing request from a controller. Starts the exchange, or cancels one.
+fn onPair(topic: []const u8, frame: tld.Frame, context: ?*anyopaque) void {
+    _ = topic;
+    _ = context;
+    const request = tld.unpack(frames.PairRequest, frame, null) catch return;
+
+    if (request.cancel) {
+        shared.mutex.lockUncancelable(bridge_io);
+        shared.pair_cancel = true;
+        shared.mutex.unlock(bridge_io);
+        return;
+    }
+
+    shared.mutex.lockUncancelable(bridge_io);
+    const busy = shared.pairing or shared.paired;
+    if (!busy) {
+        shared.pairing = true;
+        shared.pair_cancel = false;
+        pair_client_name_len = @min(request.name.len, pair_client_name_buf.len);
+        @memcpy(pair_client_name_buf[0..pair_client_name_len], request.name[0..pair_client_name_len]);
+    }
+    shared.mutex.unlock(bridge_io);
+    if (busy) return;
+
+    // Detached: nothing waits for it, and it must not run on the subscriber thread -- it
+    // blocks for minutes.
+    const thread = std.Thread.spawn(.{}, pairingThread, .{}) catch {
+        pairFinished("could not start the pairing thread", false);
+        return;
+    };
+    thread.detach();
 }
 
 // -- the hub -----------------------------------------------------------------------------
@@ -491,6 +724,14 @@ fn eventLoop() void {
     defer allocator.free(frame_buf);
 
     while (!qnnt.stopRequested()) {
+        // Nothing to subscribe to without a token, and the hub answers an unauthenticated
+        // upgrade with 401. An unpaired bridge waits here rather than reconnecting in a
+        // loop against a door it cannot open.
+        if (!isPaired()) {
+            _ = qnnt.sleepMs(500);
+            continue;
+        }
+
         // Connected with a long read timeout for the handshake, then dropped to a short one
         // for the stream itself -- see below. An idle event stream is normal (nothing in the
         // house is changing), so the LENGTH of the idle period this tolerates has not
@@ -689,6 +930,7 @@ fn usage() void {
         \\                    or the DIRIGERA_TOKEN environment variable)
         \\  --topic <prefix>  topic prefix (default home/dirigera)
         \\  --list            print the devices and their ids, then exit
+        \\  --pair            pair with the hub, write the token, then exit
         \\
         \\--host is required rather than defaulted because a hub's address moves. Find it
         \\the way the hub advertises it:
@@ -698,6 +940,13 @@ fn usage() void {
         \\
         \\The token comes from pressing the hub's action button during an OAuth PKCE
         \\exchange; it is never printed by this program.
+        \\
+        \\  dirigera-bridge --host <ip:port> --pair
+        \\
+        \\...then press the action button on the underside of the hub. The token is written
+        \\to --token, owner-readable only. Pairing can also be driven from the GUI: started
+        \\without a token this bridge comes up unpaired, publishes that on its status topic,
+        \\and waits for a request on <prefix>/pair.
         \\
         \\State is PUSHED by the hub over a WebSocket, so this does not poll. The inventory
         \\is refetched on a timer only so that a late subscriber sees every device rather
@@ -736,6 +985,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var prefix: []const u8 = "home/dirigera";
     var token_path: []const u8 = "dirigera_token";
     var list_only = false;
+    var pair_only = false;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--host")) {
@@ -746,6 +996,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             prefix = args.next() orelse return usage();
         } else if (std.mem.eql(u8, arg, "--list")) {
             list_only = true;
+        } else if (std.mem.eql(u8, arg, "--pair")) {
+            pair_only = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             return usage();
         } else {
@@ -759,26 +1011,59 @@ pub fn main(init: std.process.Init.Minimal) !void {
         return usage();
     }
 
-    token = loadToken(token_path) catch |err| {
+    pair_token_path = token_path;
+
+    // A missing token is no longer a reason to exit. It used to be, and that left the
+    // pairing procedure outside the program entirely -- a scratchpad script you had to
+    // have kept. Unpaired, the bridge still starts, still publishes status saying so, and
+    // waits for a pairing request; the GUI's panel is built on exactly that.
+    token = loadToken(token_path) catch "";
+    shared.paired = token.len > 0;
+    if (!shared.paired) {
         std.debug.print(
-            "dirigera-bridge: could not read the token from '{s}' ({t}). Pair with the hub " ++
-                "first, or set DIRIGERA_TOKEN.\n",
-            .{ token_path, err },
+            "dirigera-bridge: no token in '{s}' -- starting UNPAIRED. Run with --pair, or " ++
+                "send a request on the pair topic (the GUI has a panel for it).\n",
+            .{token_path},
         );
-        return;
-    };
-    if (token.len == 0) {
-        std.debug.print("dirigera-bridge: the token is empty\n", .{});
-        return;
     }
 
     topic_state = try std.fmt.bufPrint(&topic_state_buf, "{s}/state", .{prefix});
     topic_inventory = try std.fmt.bufPrint(&topic_inventory_buf, "{s}/inventory", .{prefix});
     topic_status = try std.fmt.bufPrint(&topic_status_buf, "{s}/status", .{prefix});
     topic_light = try std.fmt.bufPrint(&topic_light_buf, "{s}/light", .{prefix});
+    topic_pair = try std.fmt.bufPrint(&topic_pair_buf, "{s}/pair", .{prefix});
+
+    // -- pairing on the terminal: no qnnt node, no topics --------------------------
+    //
+    // Before `--list`, because `--list` cannot work without a token and the natural order
+    // of a first run is pair, then look.
+    if (pair_only) {
+        if (shared.paired) {
+            std.debug.print(
+                "dirigera-bridge: already paired -- '{s}' holds a token. Delete it to pair " ++
+                    "again.\n",
+                .{token_path},
+            );
+            return;
+        }
+        std.debug.print(
+            "dirigera-bridge: pairing with {s}\n" ++
+                "  press the action button on the underside of the hub\n",
+            .{authority},
+        );
+        if (!runPairing()) return;
+        return;
+    }
 
     // -- the diagnostic path: talk to the hub, print, exit ------------------------
     if (list_only) {
+        if (!shared.paired) {
+            std.debug.print(
+                "dirigera-bridge: --list needs a token. Pair first: --pair\n",
+                .{},
+            );
+            return;
+        }
         var client = try https.Client.init(bridge_io, allocator);
         defer client.deinit();
         var body: std.ArrayList(u8) = .empty;
@@ -836,15 +1121,32 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("dirigera-bridge: could not subscribe to {s}\n", .{topic_light});
         return;
     }
+    // Subscribed even when already paired, so the topic exists either way: a controller
+    // that attaches to a missing topic waits for ever rather than being told no.
+    if (!qnnt.subscribeFrames(topic_pair, onPair, null)) {
+        std.debug.print("dirigera-bridge: could not subscribe to {s}\n", .{topic_pair});
+        return;
+    }
 
     std.debug.print(
-        \\dirigera-bridge: {s} (firmware {s}) at {s}
+        \\dirigera-bridge: {s} (firmware {s}) at {s}{s}
         \\  pushed state  {s}
         \\  inventory     {s}
         \\  status        {s}
         \\  commands      {s}
+        \\  pairing       {s}
         \\
-    , .{ hub_name, hub_firmware, authority, topic_state, topic_inventory, topic_status, topic_light });
+    , .{
+        hub_name,
+        hub_firmware,
+        authority,
+        if (shared.paired) "" else "  -- UNPAIRED",
+        topic_state,
+        topic_inventory,
+        topic_status,
+        topic_light,
+        topic_pair,
+    });
 
     const events = try std.Thread.spawn(.{}, eventLoop, .{});
 
@@ -858,7 +1160,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     while (!qnnt.stopRequested()) {
         const now = qnnt.nowMicros();
 
-        if (now -| last_inventory_us >= 30_000_000) {
+        // Every call below needs the token. Unpaired, the loop does nothing but keep
+        // publishing status -- which is how the GUI's pairing panel learns what is
+        // happening while someone walks to the hub.
+        if (now -| last_inventory_us >= 30_000_000 and isPaired()) {
             last_inventory_us = now;
             if (fetchInventory(&client, &body)) |fresh| {
                 // Swapped under the lock: the event thread reads this to identify a

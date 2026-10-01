@@ -1446,20 +1446,23 @@ An IKEA DIRIGERA hub on one side, qnnt topics on the other:
     https.zig        HTTPS with the chain verified against IKEA's embedded root
     hub.zig          the hub's vocabulary, read off a real hub
     ws.zig           enough of RFC 6455 to listen to the push stream
-    bridge.zig       the qnnt node: three topics published, one subscribed
-    home.cpp         Qt/QML: rooms, lights, sensors
+    pair.zig         the pairing exchange: PKCE, and the hub's button
+    bridge.zig       the qnnt node: three topics published, two subscribed
+    home.cpp         Qt/QML: rooms, lights, sensors, and the pairing panel
     main.qml         the interface
 
     zig build dirigera -Ddirigera-openssl=/opt/homebrew/opt/openssl@3 \
                        -Dqt=/path/to/Qt/6.10.3/macos
-    ./zig-out/bin/dirigera-bridge --host 192.168.1.20:8443 --list   # a diagnostic
-    ./zig-out/bin/dirigera-bridge --host 192.168.1.20:8443          # the bridge
-    ./zig-out/bin/dirigera-home                                     # the station
+    ./zig-out/bin/dirigera-bridge --host 192.168.1.20:8443 --pair    # once, ever
+    ./zig-out/bin/dirigera-bridge --host 192.168.1.20:8443 --list    # a diagnostic
+    ./zig-out/bin/dirigera-bridge --host 192.168.1.20:8443           # the bridge
+    ./zig-out/bin/dirigera-home                                      # the station
 
     home/dirigera/state       published   one frame per device, when it changes
     home/dirigera/inventory   published   every device, on a timer
-    home/dirigera/status      published   the link, the hub, the counters
+    home/dirigera/status      published   the link, the hub, the counters, pairing
     home/dirigera/light       subscribed  {id, on?, level?, kelvin?}
+    home/dirigera/pair        subscribed  {name, cancel} -- start or stop pairing
 
 THIS ONE PUSHES, and that is the point of it. The hub holds a WebSocket open and
 sends state the moment a light is switched or a sensor trips, so the bridge is a
@@ -1479,11 +1482,80 @@ moves:
     dns-sd -B _ihsp._tcp local              # -> gw2-<serial>
     dns-sd -L gw2-<serial> _ihsp._tcp local # TXT: ipv4address, type, sv, pv
 
-Pairing is OAuth2 PKCE plus a press of the hub's physical action button. On
-firmware 2.975.3 the methods are the REVERSE of most published examples:
-`/v1/oauth/authorize` is a GET (POST is a 404) and `/v1/oauth/token` is a POST.
-The hub allows one pairing window at a time, so a stray probe of the authorize
-endpoint blocks the next attempt until it lapses.
+PAIRING, which is where this example starts rather than something you arrange
+beforehand. Every call but one needs a bearer token, and the only way to get one
+is an OAuth2 PKCE exchange finished by pressing the hub's physical action button:
+
+    GET  /v1/oauth/authorize?audience=homesmart.local&response_type=code
+                            &code_challenge=<S256>&code_challenge_method=S256
+         -> {"code": "..."}      and opens a pairing window on the hub
+    ... press the action button on the underside of the hub ...
+    POST /v1/oauth/token    (form: code, name, grant_type, code_verifier)
+         -> {"access_token": "..."}
+
+On firmware 2.975.3 the methods are the REVERSE of most published examples:
+authorize is a GET -- POSTing it is a 404 -- and token is a POST. Getting it
+backwards produces a 404 that reads like a wrong path, which sends you looking in
+entirely the wrong place.
+
+Two ways in, both running the same code in pair.zig:
+
+    dirigera-bridge --host <ip:port> --pair     # on the terminal
+    dirigera-home                               # the pairing panel
+
+The bridge used to read a token from a file and EXIT if it was missing, which left
+the procedure in a script outside the tree -- the example could not be run from a
+clean checkout. Now an unpaired bridge still starts: its topics come up, its
+status carries `paired: false`, and it waits for a request on the pair topic. The
+GUI covers the house with a pairing panel until that flips, so the first run of
+the whole example is: start the bridge, start the station, press the button.
+
+The panel shows the bridge's running commentary rather than a spinner, because
+the hub's refusals carry the one fact a person standing at it cannot guess. The
+hub allows ONE pairing window at a time and answers a second with "Already one
+ongoing pairing request" -- so a stray probe of the authorize endpoint locks out
+the next attempt until it lapses, which is exactly what happened while this
+protocol was being worked out. "Invalid authorization code" means the opposite:
+the window is yours and the button has not been pressed yet. A spinner says
+neither. The flow waits the first out and keeps polling through the second.
+
+WHAT THE REAL HUB CORRECTED, after all of the above passed offline. Two bugs,
+and neither could have been found without the device:
+
+  * The waiting reply was measured wrong. Probing the token endpoint with a
+    MADE-UP code answers "Invalid authorization code", and that had been taken for
+    what an unpressed button looks like. It is not. A real, live code with the
+    button unpressed answers
+
+        403 {"error":"Button not pressed or presence time stamp timed out."}
+
+    so the flow classified the ordinary waiting state as a dead window and
+    reopened the pairing on every poll -- churning through windows seconds apart
+    while nobody was given time to press. The lesson generalises: a dummy value
+    exercises the error path, not the waiting path, and those are different
+    sentences. Both strings are now pinned in the tests, verbatim.
+  * `--pair` segfaulted on its first call. It used `qnnt.nowMicros()` and
+    `qnnt.sleepMs()`, which go through the LIBRARY's `Io` -- valid only after
+    `qnnt.run()`. `--pair` never starts a node, exactly like `--list`. This file's
+    own header warns about that trap for the token read and `--list`; pairing was
+    the third thing outside a running node and walked straight into it. The
+    callbacks use `bridge_io`, which is valid from the first line of `main`.
+
+Paired against the real hub afterwards, with the retry logic plainly earning its
+keep: a window lapsed, a second was refused with "Already one ongoing pairing
+request" because the first still held the slot, a third opened, and the press
+landed on that one. The token then listed 17 devices and brought the push stream
+up, so it is accepted on both the REST and WebSocket paths.
+
+THE EXCHANGE IS TESTED WITHOUT A HUB. pair.zig takes its HTTP, clock, sleep and
+entropy as callbacks, so it imports nothing -- not even the TLS client -- and the
+whole state machine runs against a fake hub in `zig build test`: the button
+pressed late, the window lapsing and reopening, another client holding the slot,
+a dead code, a cancel, and giving up. The PKCE derivation is checked against RFC
+7636's published vector, which matters because a padded or non-url-safe challenge
+is still a plausible 43-character string and the hub would simply reject every
+pairing without saying why. None of that could be exercised through a real client:
+it would need a hub on the bench and a finger on its button for each case.
 
 WHY OPENSSL, in a repository that otherwise has no dependencies. Zig 0.16's
 `std.crypto.tls.Client` cannot complete a handshake with this hub, and the gap is

@@ -136,6 +136,24 @@ pub fn decodeResponse(
     out: *std.ArrayList(u8),
     allocator: Allocator,
 ) !void {
+    const status = try decodeResponseStatus(response, out, allocator);
+    if (status < 200 or status > 299) return error.Rejected;
+}
+
+/// The same, but hands back the status instead of refusing a non-2xx, and decodes the body
+/// either way.
+///
+/// For most callers a non-2xx is simply a failure and `decodeResponse` is the right door.
+/// This one exists because some exchanges carry their meaning in a 4xx body: the DIRIGERA
+/// pairing flow answers "Invalid authorization code" until the operator presses the hub's
+/// button, and "Already one ongoing pairing request" if a previous attempt is still open.
+/// Those two need telling apart -- one means keep waiting, the other means start over --
+/// and a bare `error.Rejected` cannot say which.
+pub fn decodeResponseStatus(
+    response: []const u8,
+    out: *std.ArrayList(u8),
+    allocator: Allocator,
+) !u16 {
     const split = std.mem.indexOf(u8, response, "\r\n\r\n") orelse return error.Rejected;
     const head = response[0..split];
     const body = response[split + 4 ..];
@@ -148,13 +166,12 @@ pub fn decodeResponse(
     const code_end = std.mem.indexOfScalar(u8, status_text, ' ') orelse status_text.len;
     const status = std.fmt.parseInt(u16, status_text[0..code_end], 10) catch
         return error.Rejected;
-    if (status < 200 or status > 299) return error.Rejected;
 
     out.clearRetainingCapacity();
 
     if (!headerHasValue(head, "transfer-encoding", "chunked")) {
         try out.appendSlice(allocator, body);
-        return;
+        return status;
     }
 
     // <hex length>\r\n<data>\r\n ... 0\r\n\r\n
@@ -179,6 +196,7 @@ pub fn decodeResponse(
         const next = data_start + size;
         rest = if (next + 2 <= rest.len) rest[next + 2 ..] else "";
     }
+    return status;
 }
 
 /// Whether a header names a value, case-insensitively on both. Written out because the

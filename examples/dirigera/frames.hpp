@@ -81,9 +81,23 @@ struct StatusFrame {
     std::uint64_t commands_failed{};
     std::uint64_t commands_refused{};
     std::uint64_t reconnects{};
+    /// A bearer token is in hand. False means the bridge is up but unpaired, and a
+    /// controller should offer to pair rather than show an empty house.
+    bool paired{};
+    /// An exchange is under way and the hub is waiting for its action button.
+    bool pairing{};
+    /// The last thing that exchange said, meant for whoever is standing at the hub.
+    std::string pair_detail;
     TLD_DEFINE_MAP(t_us, hub, firmware, api_link, event_link, devices, events_received,
                    events_unparsed, dropped_fragments, commands_sent, commands_failed,
-                   commands_refused, reconnects)
+                   commands_refused, reconnects, paired, pairing, pair_detail)
+};
+
+/// A request to pair, sent by the pairing panel. The bridge runs the exchange.
+struct PairRequest {
+    std::string name{"qnnt-bridge"};
+    bool cancel{};
+    TLD_DEFINE_MAP(name, cancel)
 };
 
 /// What goes on the command topic. Optional throughout, so dimming a light does not also

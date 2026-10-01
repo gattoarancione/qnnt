@@ -647,4 +647,172 @@ Window {
             anchors.verticalCenter: parent.verticalCenter
         }
     }
+
+    // ------------------------------------------------------------------- pairing
+    //
+    // Shown instead of the house when the bridge has no token. It is an overlay rather than
+    // a separate screen because the state it covers is temporary and one-shot: pair once,
+    // and the house appears underneath for good.
+    //
+    // The bridge runs the exchange -- it owns the hub connection -- so everything here is a
+    // request and a readout. The decisive step is not on screen at all: someone has to walk
+    // to the hub and press the button on its underside, and the hub keeps a pairing window
+    // open for about a minute at a time. That is why the panel shows the bridge's own
+    // running commentary instead of a spinner; "Already one ongoing pairing request" means
+    // wait, and a spinner would say nothing.
+    Rectangle {
+        id: pairing
+        anchors.fill: parent
+        color: "#0c0e13"
+        opacity: 0.97
+        visible: home.haveStatus && !home.paired
+        // Swallow clicks so the house underneath cannot be operated while unpaired.
+        MouseArea { anchors.fill: parent }
+
+        ColumnLayout {
+            anchors.centerIn: parent
+            width: Math.min(520, parent.width - 80)
+            spacing: 18
+
+            Text {
+                text: "Pair with " + home.hub
+                color: "white"
+                font.pixelSize: 24
+                font.bold: true
+                Layout.alignment: Qt.AlignHCenter
+            }
+
+            Text {
+                // The hub answers its own name and firmware without a token, so this is
+                // real even before pairing -- proof the bridge is talking to the right box.
+                text: home.firmware.length > 0
+                      ? "firmware " + home.firmware + " -- no token yet"
+                      : "the bridge has no token for this hub"
+                color: root.dim
+                font.pixelSize: 12
+                Layout.alignment: Qt.AlignHCenter
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                Layout.preferredHeight: steps.implicitHeight + 32
+                radius: 10
+                color: root.panel
+                border.width: 1
+                border.color: root.panelEdge
+
+                ColumnLayout {
+                    id: steps
+                    anchors.fill: parent
+                    anchors.margins: 16
+                    spacing: 10
+
+                    Text {
+                        text: home.pairing
+                              ? "2.  Press the action button on the underside of the hub"
+                              : "1.  Start the exchange, then press the hub's action button"
+                        color: home.pairing ? root.accent : "white"
+                        font.pixelSize: 14
+                        font.bold: home.pairing
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                    }
+
+                    Text {
+                        visible: home.pairing
+                        text: "The hub holds a pairing window open for about a minute; the "
+                              + "bridge opens a fresh one as each lapses, for ten minutes."
+                        color: root.dim
+                        font.pixelSize: 11
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                    }
+
+                    // The bridge's own words, which carry the one message a person needs
+                    // and cannot guess: whether to press, or to wait for another client's
+                    // pairing window to lapse.
+                    Text {
+                        visible: home.pairDetail.length > 0
+                        text: home.pairDetail
+                        color: home.pairDetail === "paired" ? root.ok : root.cool
+                        font.pixelSize: 12
+                        font.family: "Menlo"
+                        Layout.fillWidth: true
+                        wrapMode: Text.WordWrap
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 10
+
+                TextField {
+                    id: clientName
+                    Layout.fillWidth: true
+                    enabled: !home.pairing
+                    text: "qnnt-home"
+                    // The hub lists this name in IKEA's own app, so it is worth one a
+                    // person would recognise months later.
+                    placeholderText: "name to appear in the IKEA app"
+                    color: "white"
+                    font.pixelSize: 13
+                    background: Rectangle {
+                        radius: 6
+                        color: root.card
+                        border.width: 1
+                        border.color: root.panelEdge
+                    }
+                }
+
+                Button {
+                    text: home.pairing ? "Cancel" : "Start pairing"
+                    onClicked: home.pairing ? home.cancelPairing()
+                                            : home.startPairing(clientName.text)
+                    background: Rectangle {
+                        radius: 6
+                        implicitWidth: 130
+                        implicitHeight: 38
+                        color: parent.pressed ? "#3a4252"
+                             : home.pairing ? root.card : root.accent
+                        border.width: 1
+                        border.color: home.pairing ? root.panelEdge : "transparent"
+                    }
+                    contentItem: Text {
+                        text: parent.text
+                        color: home.pairing ? "white" : "#201a08"
+                        font.pixelSize: 13
+                        font.bold: !home.pairing
+                        horizontalAlignment: Text.AlignHCenter
+                        verticalAlignment: Text.AlignVCenter
+                    }
+                }
+            }
+
+            Text {
+                text: "The token is written beside the bridge, readable only by its owner. "
+                      + "Pairing once is enough; this panel will not appear again."
+                color: root.dim
+                font.pixelSize: 11
+                Layout.fillWidth: true
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+            }
+        }
+    }
+
+    // Before the bridge has said anything at all there is nothing to show and no pairing to
+    // offer -- distinguishing "unpaired" from "no bridge running" matters, because the
+    // remedy is different.
+    Rectangle {
+        anchors.fill: parent
+        color: "#0c0e13"
+        visible: !home.haveStatus
+        Text {
+            anchors.centerIn: parent
+            text: "waiting for dirigera-bridge"
+            color: root.dim
+            font.pixelSize: 14
+        }
+    }
 }
