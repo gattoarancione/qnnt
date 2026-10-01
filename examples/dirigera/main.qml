@@ -411,7 +411,7 @@ Window {
                     // Appears only if the hub accepts `isOn` for this device. A click marks
                     // it pending; it moves when the hub confirms through the state topic.
                     Switch {
-                        visible: dev && dev.canSetOn
+                        visible: dev !== undefined && dev.canSetOn
                         checked: dev ? dev.isOn : false
                         enabled: dev ? dev.reachable : false
                         onToggled: home.setOn(dev.deviceId, checked)
@@ -434,7 +434,7 @@ Window {
                 // Brightness, only where the hub accepts `lightLevel`.
                 RowLayout {
                     Layout.fillWidth: true
-                    visible: dev && dev.canSetLevel
+                    visible: dev !== undefined && dev.canSetLevel
                     spacing: 8
                     Text {
                         text: "level"; color: root.dim; font.pixelSize: 10
@@ -460,7 +460,7 @@ Window {
                 // because the hub reports its min above its max.
                 RowLayout {
                     Layout.fillWidth: true
-                    visible: dev && dev.canSetKelvin
+                    visible: dev !== undefined && dev.canSetKelvin
                     spacing: 8
                     Text {
                         text: "warmth"; color: root.dim; font.pixelSize: 10
@@ -534,7 +534,7 @@ Window {
 
                 // When it last fired, which is the fact that matters for an event device.
                 Column {
-                    visible: dev && dev.hasMotion
+                    visible: dev !== undefined && dev.hasMotion
                     Text {
                         text: dev ? dev.lastMotion : ""
                         color: dev && dev.recentMotion ? root.ok : root.dim
@@ -621,7 +621,7 @@ Window {
     // presentation wherever it appears.
     component BatteryPip: Row {
         property var dev
-        visible: dev && dev.hasBattery
+        visible: dev !== undefined && dev.hasBattery
         spacing: 5
 
         Rectangle {
