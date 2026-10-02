@@ -5,6 +5,21 @@ pub fn build(b: *Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // The C and C++ examples keep _Atomic uint64_t counters. On a target with no lock-free
+    // 8-byte atomic -- riscv32, where x86-32 and arm32 both have one -- clang still emits
+    // correct code, as a libatomic call, but warns about the cost, and -Werror turns that
+    // warning into a build failure. The counters are meant to count past four billion, so
+    // the answer is to accept the libatomic call rather than narrow them.
+    const wide_atomics_lock_free = target.result.ptrBitWidth() >= 64;
+    const c_flags: []const []const u8 = if (wide_atomics_lock_free)
+        &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" }
+    else
+        &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-atomic-alignment" };
+    const cpp_flags: []const []const u8 = if (wide_atomics_lock_free)
+        &.{ "-std=c++20", "-Wall", "-Wextra", "-Werror" }
+    else
+        &.{ "-std=c++20", "-Wall", "-Wextra", "-Werror", "-Wno-atomic-alignment" };
+
     const qnnt_lib_mod = b.createModule(.{
         .root_source_file = b.path("lib/qnnt.zig"),
         .target = target,
@@ -203,6 +218,16 @@ pub fn build(b: *Build) void {
     b.installArtifact(ugv_bridge);
     ugv_step.dependOn(&b.addInstallArtifact(ugv_bridge, .{}).step);
 
+    // The ZED example is 64-bit only, and unlike the rest of the tree that is not an
+    // oversight. Its shared-memory region places 64-bit atomics at fixed offsets so two
+    // processes can agree on them, and a 32-bit CPU has no lock-free 64-bit atomic -- the
+    // Atomic64 used everywhere else cannot stand in, because its fallback carries a lock
+    // byte and so changes the layout both ends have to agree on. Fixing it properly means
+    // redesigning the handoff (a seqlock over two 32-bit halves, say), which is a decision
+    // about that protocol rather than part of making the library portable. The ZED SDK it
+    // bridges ships for x86-64 and aarch64 only in any case.
+    const zed_supported = target.result.ptrBitWidth() >= 64;
+
     // The camera-to-driver handoff. Its own module because both ends use it and neither
     // owns it: the fake writes, the driver reads.
     const zed_shm_mod = b.createModule(.{
@@ -251,8 +276,10 @@ pub fn build(b: *Build) void {
     fake_zed_mod.addImport("shm", zed_shm_mod);
 
     const fake_zed = b.addExecutable(.{ .name = "fake-zed", .root_module = fake_zed_mod });
-    b.installArtifact(fake_zed);
-    zed_step.dependOn(&b.addInstallArtifact(fake_zed, .{}).step);
+    if (zed_supported) {
+        b.installArtifact(fake_zed);
+        zed_step.dependOn(&b.addInstallArtifact(fake_zed, .{}).step);
+    }
 
     // The bridge: the driver on one side, qnnt topics on the other.
     const camera_mod = b.createModule(.{
@@ -268,8 +295,10 @@ pub fn build(b: *Build) void {
     camera_mod.linkLibrary(qnnt_lib);
 
     const camera_sensor = b.addExecutable(.{ .name = "camera-sensor", .root_module = camera_mod });
-    b.installArtifact(camera_sensor);
-    zed_step.dependOn(&b.addInstallArtifact(camera_sensor, .{}).step);
+    if (zed_supported) {
+        b.installArtifact(camera_sensor);
+        zed_step.dependOn(&b.addInstallArtifact(camera_sensor, .{}).step);
+    }
 
     // The REAL camera's producer, in place of the fake: reads a ZED over UVC and fills the
     // same shared region. Objective-C against AVFoundation, so macOS only and opt-in --
@@ -687,9 +716,9 @@ pub fn build(b: *Build) void {
         mod.addCSourceFile(.{
             .file = b.path(node.src),
             .flags = if (node.cpp)
-                &.{ "-std=c++20", "-Wall", "-Wextra", "-Werror" }
+                cpp_flags
             else
-                &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+                c_flags,
         });
         mod.addIncludePath(b.path("include"));
         mod.linkLibrary(qnnt_c_static);
@@ -894,7 +923,7 @@ pub fn build(b: *Build) void {
     });
     c_demo_mod.addCSourceFile(.{
         .file = b.path("examples/tld_demo.c"),
-        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+        .flags = c_flags,
     });
     c_demo_mod.addIncludePath(b.path("include"));
     c_demo_mod.linkLibrary(tld_c_static);
@@ -915,7 +944,7 @@ pub fn build(b: *Build) void {
     });
     cpp_demo_mod.addCSourceFile(.{
         .file = b.path("examples/tld_demo.cpp"),
-        .flags = &.{ "-std=c++20", "-Wall", "-Wextra", "-Werror" },
+        .flags = cpp_flags,
     });
     cpp_demo_mod.addIncludePath(b.path("include"));
     cpp_demo_mod.linkLibrary(tld_c_static);
@@ -939,7 +968,7 @@ pub fn build(b: *Build) void {
     cpp_logic_mod.link_libcpp = true;
     cpp_logic_mod.addCSourceFile(.{
         .file = b.path("examples/cpp_logic_test.cpp"),
-        .flags = &.{ "-std=c++20", "-Wall", "-Wextra", "-Werror" },
+        .flags = cpp_flags,
     });
     // The golden-frame checks decode real TLD, so this needs the wrapper and the C library
     // behind it -- but still no Qt.
@@ -963,7 +992,7 @@ pub fn build(b: *Build) void {
     });
     tld_map_mod.addCSourceFile(.{
         .file = b.path("examples/tld_map.cpp"),
-        .flags = &.{ "-std=c++20", "-Wall", "-Wextra", "-Werror" },
+        .flags = cpp_flags,
     });
     tld_map_mod.addIncludePath(b.path("include"));
     tld_map_mod.linkLibrary(tld_c_static);
@@ -987,7 +1016,7 @@ pub fn build(b: *Build) void {
     });
     tld_map_c_mod.addCSourceFile(.{
         .file = b.path("examples/tld_map.c"),
-        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+        .flags = c_flags,
     });
     tld_map_c_mod.addIncludePath(b.path("include"));
     tld_map_c_mod.linkLibrary(tld_c_static);
@@ -1009,7 +1038,7 @@ pub fn build(b: *Build) void {
     });
     node_demo_mod.addCSourceFile(.{
         .file = b.path("examples/node_demo.c"),
-        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+        .flags = c_flags,
     });
     node_demo_mod.addIncludePath(b.path("include"));
     node_demo_mod.linkLibrary(qnnt_c_static);
@@ -1077,10 +1106,7 @@ pub fn build(b: *Build) void {
         });
         mod.addCSourceFile(.{
             .file = b.path(lang.src),
-            .flags = if (lang.cpp)
-                &.{ "-std=c++20", "-Wall", "-Wextra", "-Werror" }
-            else
-                &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
+            .flags = if (lang.cpp) cpp_flags else c_flags,
         });
         mod.addIncludePath(b.path("include"));
         mod.linkLibrary(qnnt_c_static);

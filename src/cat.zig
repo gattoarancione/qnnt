@@ -59,9 +59,9 @@ var opt_throttle: f64 = 1.0;
 /// because multiplying an absolute epoch time by the throttle would move the capture to
 /// some point in the next century. Set once by whichever subscriber thread gets there
 /// first -- with a glob there are several, and they all need the same origin.
-var dump_base_us = std.atomic.Value(u64).init(0);
+var dump_base_us = @import("qnnt").Atomic64.Value.init(0);
 
-var seen = std.atomic.Value(u64).init(0);
+var seen = @import("qnnt").Atomic64.Value.init(0);
 var limit_reached = std.atomic.Value(bool).init(false);
 
 /// One subscriber thread per topic, all writing to the same fd: without this a glob over

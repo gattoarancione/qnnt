@@ -10,12 +10,15 @@ const Stream = net.Stream;
 /// The TLD binary framing, re-exported so users get the encoder and decoder without a
 /// second import. See `subscribeFrames` for how it meets the pub/sub data path.
 pub const Tld = @import("tld.zig");
+/// 64-bit counters that also work on 32-bit CPUs; see atomic64.zig.
+pub const Atomic64 = @import("atomic64.zig");
 
 // Federating the registry across hosts. Kept in its own file: separate protocol, separate
 // listener, separate workers. What it reaches back into here is marked below under
 // "internal surface"; what this file uses from it is only the four calls named there.
 const federation = @import("federation.zig");
 const resolve = @import("resolve.zig");
+
 
 const allocator = @import("alloc.zig").allocator;
 
@@ -152,7 +155,7 @@ pub var directory: std.StringHashMap(TopicEntry) = .init(allocator);
 /// Paired with the holder's NodeId on the wire, because the counter is per-process: a
 /// standby that mirrored epoch 42 from one holder must not think it is current against a
 /// different holder that happens to be at epoch 42.
-pub var directory_epoch: std.atomic.Value(u64) = .init(0);
+pub var directory_epoch: Atomic64.Value = .init(0);
 pub var directory_mutex: Io.Mutex = .init;
 
 /// One place that says "the directory really changed": bump the epoch, then wake
@@ -179,7 +182,7 @@ pub fn bumpDirectoryEpoch() void {
 
 // When the current registry role was acquired, for `status`. Written by the registry
 // thread and read by client handlers, hence atomic.
-var registry_since_us: std.atomic.Value(u64) = .init(0);
+var registry_since_us: Atomic64.Value = .init(0);
 
 // ---------------------------------------------------------------- shutdown
 //
@@ -991,7 +994,7 @@ var event_ring: [event_queue_capacity]EventSlot = undefined;
 var event_ring_head: usize = 0;
 var event_ring_count: usize = 0;
 var event_ring_mutex: Io.Mutex = .init;
-var event_dropped = std.atomic.Value(u64).init(0);
+var event_dropped = Atomic64.Value.init(0);
 
 // Where a drain copies to, so the slices handed out stay valid until the next drain -- the
 // same contract as `poll` for messages.
@@ -4265,7 +4268,7 @@ var replies_done: std.ArrayList(ReplySlot) = .empty;
 var replies_staging: std.ArrayList(ReplySlot) = .empty;
 var replies_mutex: Io.Mutex = .init;
 var replies_seq: std.atomic.Value(u32) = .init(0);
-var request_seq: std.atomic.Value(u64) = .init(0);
+var request_seq: Atomic64.Value = .init(0);
 var requests_in_flight: std.atomic.Value(usize) = .init(0);
 
 /// What a request worker owns for the duration of its call. Copied because the caller's

@@ -23,8 +23,8 @@ const allocator = std.heap.page_allocator;
 const topic = "test/bench";
 
 // Written by the scheduler thread, read by the reporting loop in main.
-var sent = std.atomic.Value(u64).init(0);
-var sent_bytes = std.atomic.Value(u64).init(0);
+var sent = @import("qnnt").Atomic64.Value.init(0);
+var sent_bytes = @import("qnnt").Atomic64.Value.init(0);
 
 // Touched only by the scheduler thread, which is the only caller of benchSource.
 var frame: std.ArrayList(u8) = .empty;

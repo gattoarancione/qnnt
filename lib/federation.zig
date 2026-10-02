@@ -39,6 +39,7 @@ const NodeId = qnnt.NodeId;
 const TopicEntry = qnnt.TopicEntry;
 const Reply = qnnt.Reply;
 const resolve = @import("resolve.zig");
+const atomic64 = @import("atomic64.zig");
 
 const max_peers = 32;
 const fed_sync_interval_ms = 5_000;
@@ -65,9 +66,9 @@ const Peer = struct {
     // Status, for the `peers` command. Written by that peer's connector, read by a
     // registry client handler, so they are atomics rather than plain fields.
     connected: std.atomic.Value(bool) = .init(false),
-    last_sync_us: std.atomic.Value(u64) = .init(0),
-    learned: std.atomic.Value(u64) = .init(0),
-    attempts: std.atomic.Value(u64) = .init(0),
+    last_sync_us: atomic64.Value = .init(0),
+    learned: atomic64.Value = .init(0),
+    attempts: atomic64.Value = .init(0),
 
     fn hostText(p: *const Peer) []const u8 {
         return p.host[0..p.host_len];
@@ -102,7 +103,7 @@ var fed_change_seq: std.atomic.Value(u32) = .init(0);
 // chose to talk to them -- so they cannot be attributed in the per-peer counters, and
 // leaving them out entirely made `peers` report "learned 0" on a node whose whole
 // directory had arrived that way.
-var inbound_applied: std.atomic.Value(u64) = .init(0);
+var inbound_applied: atomic64.Value = .init(0);
 
 pub fn notifyChange() void {
     // `enabled()`, not the port: with a port but no key nothing is waiting on this word,

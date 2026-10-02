@@ -64,10 +64,10 @@ fn expected(seq: u64, from: []const u8) Sample {
 const Peer = struct {
     name: []const u8,
     expected: bool = true,
-    received: std.atomic.Value(u64) = .init(0),
-    last_seq: std.atomic.Value(u64) = .init(0),
-    first_seq: std.atomic.Value(u64) = .init(0),
-    problems: std.atomic.Value(u64) = .init(0),
+    received: @import("qnnt").Atomic64.Value = .init(0),
+    last_seq: @import("qnnt").Atomic64.Value = .init(0),
+    first_seq: @import("qnnt").Atomic64.Value = .init(0),
+    problems: @import("qnnt").Atomic64.Value = .init(0),
 };
 
 var peer_state: [peers.len]Peer = undefined;
