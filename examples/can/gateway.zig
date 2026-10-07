@@ -55,16 +55,16 @@ const Bus = struct {
     /// `can/<name>/*`, what we subscribe to.
     pattern: []const u8 = "",
 
-    read_frames: std.atomic.Value(u64) = .init(0),
-    published: std.atomic.Value(u64) = .init(0),
+    read_frames: @import("qnnt").Atomic64.Value = .init(0),
+    published: @import("qnnt").Atomic64.Value = .init(0),
     /// Frames from other gateways, written to the local interface.
-    injected: std.atomic.Value(u64) = .init(0),
+    injected: @import("qnnt").Atomic64.Value = .init(0),
     /// Frames we declined to write: error frames, and anything malformed.
-    refused: std.atomic.Value(u64) = .init(0),
+    refused: @import("qnnt").Atomic64.Value = .init(0),
     /// Local writes the kernel would not take -- almost always a full transmit queue.
-    write_failed: std.atomic.Value(u64) = .init(0),
+    write_failed: @import("qnnt").Atomic64.Value = .init(0),
     /// Deliveries on our own topic, which the pattern matches by design.
-    own: std.atomic.Value(u64) = .init(0),
+    own: @import("qnnt").Atomic64.Value = .init(0),
 };
 
 var buses: [max_buses]Bus = undefined;

@@ -24,8 +24,8 @@ const in_topic = "test/bench";
 const out_topic = "test/bench-echo";
 
 // Written by the subscriber thread, read by the reporting loop in main.
-var echoed = std.atomic.Value(u64).init(0);
-var failed = std.atomic.Value(u64).init(0);
+var echoed = @import("qnnt").Atomic64.Value.init(0);
+var failed = @import("qnnt").Atomic64.Value.init(0);
 
 fn onFrame(_: []const u8, f: tld.Frame, _: ?*anyopaque) void {
     qnnt.publish(out_topic, f.raw) catch {

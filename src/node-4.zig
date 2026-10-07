@@ -197,7 +197,9 @@ fn onFrame(_: []const u8, f: tld.Frame, _: ?*anyopaque) void {
     window_lat_max = @max(window_lat_max, latency);
 
     const bucket = latency / bucket_us;
-    if (bucket < bucket_count) hist[bucket] += 1 else hist_overflow += 1;
+    // @intCast rather than a usize bucket: the guard to its left already proves the
+    // value fits, and on a 32-bit target usize is narrower than the u64 it came from.
+    if (bucket < bucket_count) hist[@intCast(bucket)] += 1 else hist_overflow += 1;
 
     if (f.raw.len <= sample.len) {
         @memcpy(sample[0..f.raw.len], f.raw);

@@ -48,7 +48,7 @@ var payload: []u8 = &.{};
 var seq: u64 = 0;
 
 // Written by the publishing loop in main, read by the subscriber thread when it reports.
-var sent = std.atomic.Value(u64).init(0);
+var sent = @import("qnnt").Atomic64.Value.init(0);
 
 // Frames published before the echo responder had subscribed. Captured at the first echo
 // and subtracted from the loss count, because otherwise every window reports a constant
@@ -134,7 +134,9 @@ fn onEcho(_: []const u8, f: tld.Frame, _: ?*anyopaque) void {
     window_max = @max(window_max, rtt);
 
     const bucket = rtt / bucket_us;
-    if (bucket < bucket_count) hist[bucket] += 1 else overflow += 1;
+    // @intCast rather than a usize bucket: the guard to its left already proves the
+    // value fits, and on a 32-bit target usize is narrower than the u64 it came from.
+    if (bucket < bucket_count) hist[@intCast(bucket)] += 1 else overflow += 1;
 
     if (window_start_us == 0) window_start_us = now_us;
     if (now_us -| window_start_us >= report_interval_us) report(now_us);
