@@ -624,7 +624,7 @@ fn listenerRun() void {
                 client.close(qnnt.io);
                 return;
             }
-            if (!qnnt.spawnWorker(handleFederationClient, .{client})) {
+            if (!qnnt.spawnHandler(handleFederationClient, .{client})) {
                 client.close(qnnt.io);
                 if (qnnt.isShuttingDown()) return;
             }

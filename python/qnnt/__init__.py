@@ -192,6 +192,7 @@ class Node:
         peers: Sequence[str] | None = None,
         realtime_priority: int | None = None,
         lock_memory: bool = False,
+        handler_stack_bytes: int | None = None,
         queue_capacity: int = 4096,
         handle_signals: bool = False,
     ) -> None:
@@ -225,6 +226,11 @@ class Node:
         if lock_memory:
             # The companion to realtime_priority: no scheduling policy stops a page fault.
             _check(self._lib, self._lib.qnnt_set_lock_memory(1), "set_lock_memory")
+        if handler_stack_bytes is not None:
+            # For small targets: the per-connection threads' stack, rounded up to a page.
+            # 0 restores the default; below 128 KiB is refused. See qnnt.h.
+            _check(self._lib, self._lib.qnnt_set_handler_stack_bytes(handler_stack_bytes),
+                   f"set_handler_stack_bytes({handler_stack_bytes})")
         if advertise_addr:
             _check(self._lib, self._lib.qnnt_set_advertise_address(advertise_addr.encode()),
                    "set_advertise_address")

@@ -86,8 +86,25 @@ int main(void) {
 
     /* Our own registry, so this demo is independent of anything else running. */
     CHECK(qnnt_set_registry_port(22301));
+
+    /* Small handler stacks, so every registry connection this demo makes runs on one. Below
+     * the floor is refused; an accepted size comes back rounded up to a page. */
+    if (qnnt_set_handler_stack_bytes(4096) == QNNT_OK) {
+        printf("FAIL: a 4 KiB handler stack was accepted\n");
+        return 1;
+    }
+    CHECK(qnnt_set_handler_stack_bytes(200000));
+    if (qnnt_handler_stack_bytes() < 200000) {
+        printf("FAIL: handler stack %zu, asked for 200000\n", qnnt_handler_stack_bytes());
+        return 1;
+    }
+
     CHECK(qnnt_init());
     printf("registry port %u\n", qnnt_registry_port());
+    if (qnnt_set_handler_stack_bytes(0) == QNNT_OK) {
+        printf("FAIL: the handler stack changed under a running node\n");
+        return 1;
+    }
     /* Not installing signal handlers: this demo exits on its own. */
 
     CHECK(qnnt_publisher_start(TOPIC, strlen(TOPIC), source, 1000 /* us -> 1 kHz */, &sent));

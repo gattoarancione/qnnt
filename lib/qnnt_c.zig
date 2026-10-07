@@ -172,6 +172,17 @@ export fn qnnt_lock_memory() callconv(.c) u8 {
     return if (qnnt.lockMemoryFn()) 1 else 0;
 }
 
+/// Stack size for the threads that serve one connection or one request and exit. 0 (the
+/// default) leaves them on std.Thread's 16 MiB; below 128 KiB is refused, and anything
+/// else is rounded up to a page. Before qnnt_init.
+export fn qnnt_set_handler_stack_bytes(bytes: usize) callconv(.c) Status {
+    return if (qnnt.setHandlerStackBytesFn(bytes)) .ok else .failed;
+}
+
+export fn qnnt_handler_stack_bytes() callconv(.c) usize {
+    return qnnt.handlerStackBytesFn();
+}
+
 /// The address remote subscribers should dial. Optional: leave it unset and observers
 /// fill it in from the connection they reached this host on, which is what lets a node
 /// behind a gateway work without knowing its own public address.

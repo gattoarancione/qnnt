@@ -59,6 +59,11 @@ int main(int argc, char** argv) {
     QObject::connect(node, &qnnt::QnntNode::errorOccurred, &probe, &Probe::onError);
 
     node->setRegistryPort(22450);
+    // Small handler stacks, so the demo's registry connections are served on them.
+    if (!node->setHandlerStackBytes(256 * 1024)) {
+        qCritical() << "setHandlerStackBytes refused";
+        return 1;
+    }
     if (!node->start()) {
         qCritical() << "start failed";
         return 1;

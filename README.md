@@ -226,6 +226,7 @@ All optional, all read by `configureFromEnvironment()` — an explicit call, nev
 | `QNNT_RT_PRIORITY` | `SCHED_FIFO` priority for workers (Linux) |
 | `QNNT_LOCK_MEMORY` | `1` to pin pages with `mlockall` (Linux) |
 | `QNNT_MAX_FRAME_BYTES` | Largest TLD frame published or accepted (default 16 MiB) |
+| `QNNT_HANDLER_STACK_BYTES` | Stack for per-connection and per-request threads (default 16 MiB; at least 128 KiB, rounded up to a page). For small targets |
 
 ## Network topologies
 

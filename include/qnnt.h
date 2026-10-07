@@ -87,6 +87,22 @@ uint8_t qnnt_realtime_priority(void);
  */
 qnnt_status qnnt_set_lock_memory(uint8_t enabled);
 uint8_t qnnt_lock_memory(void);
+
+/*
+ * Stack size, in bytes, for the threads qnnt starts per connection or per request and that
+ * exit when it is served: the registry's and federation's client handlers, and the worker
+ * behind qnnt_request_begin. Call before qnnt_init. Same as QNNT_HANDLER_STACK_BYTES.
+ *
+ * For a small target. Each of these threads otherwise reserves std.Thread's 16 MiB default,
+ * and a burst of connections on a 32-bit board with no overcommit is what runs out of
+ * memory. Long-lived threads -- one per topic or per node -- keep the default regardless.
+ *
+ * 0 restores the default. Values below 128 KiB are refused, because a handler that
+ * overflows its stack takes the process down; anything else is rounded up to a whole page,
+ * which qnnt_handler_stack_bytes then reports.
+ */
+qnnt_status qnnt_set_handler_stack_bytes(size_t bytes);
+size_t qnnt_handler_stack_bytes(void);
 uint16_t    qnnt_registry_port(void);
 
 /* This node's identity as 32 hex characters plus a NUL: `cap` must be >= 33. Copied out,

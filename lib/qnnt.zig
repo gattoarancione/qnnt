@@ -767,6 +767,21 @@ fn applyRealtimePriority() void {
 // the flag lands in the fresh list, is never joined, and outlives `io` — which shows up
 // as the process failing at exit long after every visible operation succeeded.
 pub fn spawnWorker(comptime function: anytype, args: anytype) bool {
+    return spawnWorkerWith(.{}, function, args);
+}
+
+/// `spawnWorker` for a thread that serves one connection or one request and exits: the
+/// registry's and federation's client handlers and `requestBegin`'s worker. These are the
+/// only threads started per event rather than once per node or topic, so a burst of them
+/// is where a 16 MiB default stack reservation adds up -- on a 32-bit target with no
+/// overcommit, it is what runs out. QNNT_HANDLER_STACK_BYTES sizes them; unset, they get
+/// the default like every other worker.
+pub fn spawnHandler(comptime function: anytype, args: anytype) bool {
+    const bytes = handler_stack_bytes.load(.monotonic);
+    return spawnWorkerWith(if (bytes == 0) .{} else .{ .stack_size = bytes }, function, args);
+}
+
+fn spawnWorkerWith(config: std.Thread.SpawnConfig, comptime function: anytype, args: anytype) bool {
     workers_mutex.lockUncancelable(io);
     defer workers_mutex.unlock(io);
 
@@ -792,7 +807,7 @@ pub fn spawnWorker(comptime function: anytype, args: anytype) bool {
         }
     };
 
-    worker.thread = std.Thread.spawn(.{}, Shim.run, .{ worker, args }) catch {
+    worker.thread = std.Thread.spawn(config, Shim.run, .{ worker, args }) catch {
         allocator.destroy(worker);
         return false;
     };
@@ -1370,6 +1385,12 @@ pub const Qnnt = struct {
     pub const realtimePriority = &realtimePriorityFn;
     pub const setLockMemory = &setLockMemoryFn;
     pub const lockMemory = &lockMemoryFn;
+
+    /// Stack for the threads that serve one connection or request and exit; see
+    /// `spawnHandler`. 0 (the default) is std.Thread's 16 MiB. Before `run()`.
+    pub const setHandlerStackBytes = &setHandlerStackBytesFn;
+    pub const handlerStackBytes = &handlerStackBytesFn;
+    pub const min_handler_stack_bytes = @import("qnnt.zig").min_handler_stack_bytes;
 
     /// Addressing. Both must be set before `run()`. Defaults keep everything on
     /// loopback, so a local deployment is unchanged and nothing is exposed unasked.
@@ -2810,7 +2831,7 @@ fn registryRun() void {
                 return;
             }
 
-            if (!spawnWorker(handleRegistryClient, .{client})) {
+            if (!spawnHandler(handleRegistryClient, .{client})) {
                 client.close(io);
                 // spawnWorker also refuses once a shutdown is under way, and by then the
                 // listener has already been woken, so going back to accept would block
@@ -3498,6 +3519,30 @@ pub fn setMaxFrameBytesFn(bytes: usize) bool {
     if (bytes < 1024) return false; // below any useful frame; almost certainly a typo
     max_frame_bytes_value.store(bytes, .monotonic);
     return true;
+}
+
+/// Stack for the per-connection and per-request threads; see `spawnHandler`. 0 means the
+/// std.Thread default.
+var handler_stack_bytes = std.atomic.Value(usize).init(0);
+
+/// The smallest stack a handler is given. A handler that overflows hits the guard page and
+/// takes the whole process with it, so a value below what the handlers are measured to need
+/// is refused rather than honoured.
+pub const min_handler_stack_bytes = 128 * 1024;
+
+/// Rounded up to the page size: macOS refuses a pthread stack that is not a whole number of
+/// pages, and std.Thread asserts that the call succeeds, so an unrounded value would crash
+/// the first handler rather than fail here. Refused once the node runs, like the other
+/// pre-start knobs. 0 restores the default.
+pub fn setHandlerStackBytesFn(bytes: usize) bool {
+    if (node_running) return false;
+    if (bytes != 0 and bytes < min_handler_stack_bytes) return false;
+    handler_stack_bytes.store(std.mem.alignForward(usize, bytes, std.heap.pageSize()), .monotonic);
+    return true;
+}
+
+pub fn handlerStackBytesFn() usize {
+    return handler_stack_bytes.load(.monotonic);
 }
 
 // As `subscribeLoop`, but the stream carries TLD frames instead of newline-delimited
@@ -4351,7 +4396,7 @@ pub fn requestBeginRun(procedure: []const u8, payload: []const u8, timeout_ms: u
     job.* = .{ .id = id, .procedure = name, .payload = body, .timeout_ms = timeout_ms };
 
     _ = requests_in_flight.fetchAdd(1, .monotonic);
-    if (!spawnWorker(requestWorker, .{job})) {
+    if (!spawnHandler(requestWorker, .{job})) {
         _ = requests_in_flight.fetchSub(1, .monotonic);
         allocator.free(body);
         allocator.free(name);
@@ -4651,6 +4696,27 @@ test "a finished worker is joined when the next one spawns, not kept until shutd
     // A handler can still be finishing the last few replies; what must not happen is one
     // retained per connection served.
     try testing.expect(workerCount() < before + 20);
+}
+
+test "a handler stack is refused below the floor, rounded to a page, and fixed once running" {
+    const testing = std.testing;
+    defer _ = setHandlerStackBytesFn(0);
+
+    try testing.expect(!setHandlerStackBytesFn(4096)); // would overflow; refused, not honoured
+    try testing.expectEqual(@as(usize, 0), handlerStackBytesFn());
+
+    // Not a page multiple: macOS refuses that outright, and std.Thread asserts on the refusal.
+    try testing.expect(setHandlerStackBytesFn(200_000));
+    try testing.expect(handlerStackBytesFn() >= 200_000);
+    try testing.expectEqual(@as(usize, 0), handlerStackBytesFn() % std.heap.pageSize());
+
+    try testing.expect(setHandlerStackBytesFn(0));
+    try testing.expectEqual(@as(usize, 0), handlerStackBytesFn());
+
+    try testing.expect(setRegistryPortFn(22319));
+    try testing.expect(nodeRun());
+    defer nodeDeinit();
+    try testing.expect(!setHandlerStackBytesFn(min_handler_stack_bytes));
 }
 
 fn workerCount() usize {

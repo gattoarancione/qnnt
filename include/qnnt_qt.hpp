@@ -229,6 +229,8 @@ public:
     /// Linux only, and needs privilege; see qnnt.h. Refusal is reported on stderr.
     bool setRealtimePriority(quint8 priority);
     bool setLockMemory(bool enabled);
+    /// Stack for per-connection and per-request threads; 0 is the default. See qnnt.h.
+    bool setHandlerStackBytes(size_t bytes);
     /// Size the poll queue before the first subscription. Optional.
     bool reserveQueue(int capacity);
     /// Apply every QNNT_* environment variable, so a Qt program configures like the others.
@@ -631,6 +633,10 @@ inline bool QnntNode::setRealtimePriority(quint8 priority) {
 
 inline bool QnntNode::setLockMemory(bool enabled) {
     return check(qnnt_set_lock_memory(enabled ? 1 : 0), QStringLiteral("setLockMemory"));
+}
+
+inline bool QnntNode::setHandlerStackBytes(size_t bytes) {
+    return check(qnnt_set_handler_stack_bytes(bytes), QStringLiteral("setHandlerStackBytes"));
 }
 
 inline bool QnntNode::reserveQueue(int capacity) {
