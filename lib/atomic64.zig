@@ -133,33 +133,72 @@ const Guarded = struct {
     }
 };
 
+// Guarded is tested on every host: a 64-bit build would otherwise select Native and never
+// execute Guarded, leaving the 32-bit path compiled but unrun. Native only where it compiles.
+const implementations = if (lock_free) .{ Native, Guarded } else .{Guarded};
+
 test "counts the same on either path" {
-    var v: Value = .init(7);
-    try std.testing.expectEqual(@as(u64, 7), v.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 7), v.fetchAdd(5, .monotonic));
-    try std.testing.expectEqual(@as(u64, 12), v.load(.monotonic));
-    v.store(std.math.maxInt(u64), .monotonic);
-    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), v.load(.monotonic));
-    // wraps rather than traps, matching std.atomic.Value
-    _ = v.fetchAdd(1, .monotonic);
-    try std.testing.expectEqual(@as(u64, 0), v.load(.monotonic));
+    inline for (implementations) |T| {
+        var v: T = .init(7);
+        try std.testing.expectEqual(@as(u64, 7), v.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 7), v.fetchAdd(5, .monotonic));
+        try std.testing.expectEqual(@as(u64, 12), v.load(.monotonic));
+        v.store(std.math.maxInt(u64), .monotonic);
+        try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), v.load(.monotonic));
+        // wraps rather than traps, matching std.atomic.Value
+        _ = v.fetchAdd(1, .monotonic);
+        try std.testing.expectEqual(@as(u64, 0), v.load(.monotonic));
 
-    try std.testing.expectEqual(@as(u64, 0), v.swap(99, .monotonic));
-    try std.testing.expectEqual(@as(u64, 99), v.load(.monotonic));
+        try std.testing.expectEqual(@as(u64, 0), v.swap(99, .monotonic));
+        try std.testing.expectEqual(@as(u64, 99), v.load(.monotonic));
 
-    // null means it took; a mismatch returns what was actually there
-    try std.testing.expectEqual(@as(?u64, null), v.cmpxchgStrong(99, 100, .monotonic, .monotonic));
-    try std.testing.expectEqual(@as(u64, 100), v.load(.monotonic));
-    try std.testing.expectEqual(@as(?u64, 100), v.cmpxchgStrong(7, 8, .monotonic, .monotonic));
-    try std.testing.expectEqual(@as(u64, 100), v.load(.monotonic));
+        // null means it took; a mismatch returns what was actually there
+        try std.testing.expectEqual(@as(?u64, null), v.cmpxchgStrong(99, 100, .monotonic, .monotonic));
+        try std.testing.expectEqual(@as(u64, 100), v.load(.monotonic));
+        try std.testing.expectEqual(@as(?u64, 100), v.cmpxchgStrong(7, 8, .monotonic, .monotonic));
+        try std.testing.expectEqual(@as(u64, 100), v.load(.monotonic));
+    }
 }
 
 test "holds a value no 32-bit counter could" {
     // The reason these are not simply narrowed to u32: a microsecond timestamp passes
     // 2^32 about 71 minutes after the epoch it counts from.
-    var v: Value = .init(0);
-    const two_hours_us: u64 = 2 * 60 * 60 * std.time.us_per_s;
-    v.store(two_hours_us, .monotonic);
-    try std.testing.expectEqual(two_hours_us, v.load(.monotonic));
-    try std.testing.expect(two_hours_us > std.math.maxInt(u32));
+    inline for (implementations) |T| {
+        var v: T = .init(0);
+        const two_hours_us: u64 = 2 * 60 * 60 * std.time.us_per_s;
+        v.store(two_hours_us, .monotonic);
+        try std.testing.expectEqual(two_hours_us, v.load(.monotonic));
+        try std.testing.expect(two_hours_us > std.math.maxInt(u32));
+    }
+}
+
+test "no update is lost when threads contend" {
+    // Guarded's fetchAdd is a plain read-modify-write, so without the lock concurrent
+    // increments overwrite each other and the total comes up short. cmpxchgStrong is
+    // driven the same way, as a retry loop, since that is the other path that reads
+    // before it writes.
+    const threads = 4;
+    const per_thread = 100_000;
+
+    inline for (implementations) |T| {
+        const Worker = struct {
+            fn add(v: *T) void {
+                for (0..per_thread) |_| _ = v.fetchAdd(1, .monotonic);
+            }
+            fn cas(v: *T) void {
+                for (0..per_thread) |_| {
+                    var seen = v.load(.monotonic);
+                    while (v.cmpxchgStrong(seen, seen + 1, .monotonic, .monotonic)) |actual| seen = actual;
+                }
+            }
+        };
+
+        inline for (.{ Worker.add, Worker.cas }) |work| {
+            var v: T = .init(0);
+            var spawned: [threads]std.Thread = undefined;
+            for (&spawned) |*t| t.* = try std.Thread.spawn(.{}, work, .{&v});
+            for (spawned) |t| t.join();
+            try std.testing.expectEqual(@as(u64, threads * per_thread), v.load(.monotonic));
+        }
+    }
 }
