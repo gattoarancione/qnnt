@@ -63,15 +63,37 @@ const Peer = struct {
     host_len: usize = 0,
     port: u16 = 0,
 
+    /// Reached only through `live`, never as `peer.status` directly.
+    status: Status = .{},
+
     // Status, for the `peers` command. Written by that peer's connector, read by a
     // registry client handler, so they are atomics rather than plain fields.
-    connected: std.atomic.Value(bool) = .init(false),
-    last_sync_us: atomic64.Value = .init(0),
-    learned: atomic64.Value = .init(0),
-    attempts: atomic64.Value = .init(0),
+    const Status = struct {
+        connected: std.atomic.Value(bool) = .init(false),
+        last_sync_us: atomic64.Value = .init(0),
+        learned: atomic64.Value = .init(0),
+        attempts: atomic64.Value = .init(0),
+    };
 
     fn hostText(p: *const Peer) []const u8 {
         return p.host[0..p.host_len];
+    }
+
+    /// The status counters, after checking that `p` is a slot of `fed_peers` rather than a
+    /// copy of one. A copy's counters are a snapshot that nobody else updates, and on a
+    /// 32-bit CPU worse: an Atomic64 copied while another thread held its lock is born
+    /// locked, and the first use of it spins forever. Checked on every host, so a copy
+    /// fails on a 64-bit build too rather than only where the lock exists.
+    fn live(p: *Peer) *Status {
+        std.debug.assert(isSlot(p));
+        return &p.status;
+    }
+
+    fn isSlot(p: *const Peer) bool {
+        const at = @intFromPtr(p);
+        const base = @intFromPtr(&fed_peers);
+        return at >= base and at < base + @sizeOf(@TypeOf(fed_peers)) and
+            (at - base) % @sizeOf(Peer) == 0;
     }
 };
 
@@ -158,11 +180,12 @@ pub fn addPeer(host: []const u8, port: u16) bool {
     if (qnnt.node_running or peer_count == max_peers or host.len == 0) return false;
     if (host.len > fed_peers[0].host.len) return false;
 
-    var peer: Peer = .{};
+    // Built in its slot rather than copied in, so no Peer is ever copied; see Peer.live.
+    const peer = &fed_peers[peer_count];
+    peer.* = .{};
     @memcpy(peer.host[0..host.len], host);
     peer.host_len = host.len;
     peer.port = if (port == 0) federation_port else port;
-    fed_peers[peer_count] = peer;
     peer_count += 1;
     return true;
 }
@@ -618,7 +641,7 @@ fn peerConnectorRun(index: usize) void {
     var announced_failure = false;
 
     while (!qnnt.isShuttingDown()) {
-        _ = peer.attempts.fetchAdd(1, .monotonic);
+        _ = peer.live().attempts.fetchAdd(1, .monotonic);
 
         // One connection, many exchanges. Reconnecting per round would put a connect and
         // a TIME_WAIT socket on every change, which is exactly the churn that once left
@@ -626,7 +649,7 @@ fn peerConnectorRun(index: usize) void {
         if (serveePeer(peer, &announced_failure)) |_| {
             backoff_ms = 500;
         } else |err| {
-            peer.connected.store(false, .monotonic);
+            peer.live().connected.store(false, .monotonic);
             if (!announced_failure) {
                 std.debug.print("federation: {s}:{d} unreachable ({}); retrying\n", .{
                     peer.hostText(), peer.port, err,
@@ -683,7 +706,7 @@ fn serveePeer(peer: *Peer, announced_failure: *bool) SyncError!void {
 
     // Announce a first connection and a recovery, but not every reconnect in a flapping
     // loop -- the failure side is already rate-limited the same way.
-    if (announced_failure.* or peer.last_sync_us.load(.monotonic) == 0) {
+    if (announced_failure.* or peer.live().last_sync_us.load(.monotonic) == 0) {
         // Naming the resolved address too, when the peer was configured as a name: which
         // address a name landed on is the first thing worth knowing when a peer that
         // "should" be reachable is not.
@@ -704,8 +727,8 @@ fn serveePeer(peer: *Peer, announced_failure: *bool) SyncError!void {
 
         try exchangeWithPeer(peer, &reader.interface, &writer.interface, observed);
 
-        peer.connected.store(true, .monotonic);
-        peer.last_sync_us.store(@intCast(qnnt.nowMicrosFn()), .monotonic);
+        peer.live().connected.store(true, .monotonic);
+        peer.live().last_sync_us.store(@intCast(qnnt.nowMicrosFn()), .monotonic);
 
         // Wakes on the next local change, on the anti-entropy deadline, or on shutdown.
         if (!waitForChangeOrDeadline(observed_seq, fed_sync_interval_ms)) return;
@@ -765,7 +788,7 @@ fn exchangeWithPeer(
     }
 
     if (learned > 0) {
-        _ = peer.learned.fetchAdd(learned, .monotonic);
+        _ = peer.live().learned.fetchAdd(learned, .monotonic);
         // Something new arrived, so the OTHER peers have not seen it either. Relaying is
         // what lets a partial peer list converge; it cannot loop, because a peer that
         // already holds this version rejects it and relays nothing further.
@@ -879,19 +902,20 @@ pub fn writePeerList(buffer: *std.ArrayList(u8)) !void {
         var addr_buf: [64]u8 = undefined;
         const addr = std.fmt.bufPrint(&addr_buf, "{s}:{d}", .{ peer.hostText(), peer.port }) catch "?";
 
-        const last = peer.last_sync_us.load(.monotonic);
+        const status = peer.live();
+        const last = status.last_sync_us.load(.monotonic);
         var age_buf: [16]u8 = undefined;
         const since = if (last == 0) "never" else qnnt.formatAge(&age_buf, now_us -| last);
 
         try buffer.appendSlice(allocator, "  ");
         try qnnt.writePadded(buffer, addr, 22);
         try buffer.appendSlice(allocator, "  ");
-        try qnnt.writePadded(buffer, if (peer.connected.load(.monotonic)) "connected" else "down", 9);
+        try qnnt.writePadded(buffer, if (status.connected.load(.monotonic)) "connected" else "down", 9);
         try buffer.appendSlice(allocator, "  ");
         try qnnt.writePadded(buffer, since, 9);
         try buffer.print(allocator, "  {d:>7}  {d:>8}\n", .{
-            peer.learned.load(.monotonic),
-            peer.attempts.load(.monotonic),
+            status.learned.load(.monotonic),
+            status.attempts.load(.monotonic),
         });
     }
 
@@ -1011,6 +1035,26 @@ fn heldPort(topic: []const u8) u16 {
     qnnt.directory_mutex.lockUncancelable(qnnt.io);
     defer qnnt.directory_mutex.unlock(qnnt.io);
     return qnnt.directory.getPtr(topic).?.endpoint.getPort();
+}
+
+test "a peer's status is reachable only from its slot, not from a copy" {
+    try testing.expect(addPeer("10.0.0.9", 0));
+    defer peer_count = 0;
+
+    const slot = &fed_peers[0];
+    try testing.expect(slot.isSlot());
+    try testing.expect(fed_peers[max_peers - 1].isSlot());
+    _ = slot.live().attempts.fetchAdd(1, .monotonic);
+
+    // What live() refuses: the copy reads a snapshot, and its updates go nowhere.
+    var copy = fed_peers[0];
+    try testing.expect(!copy.isSlot());
+    _ = copy.status.attempts.fetchAdd(1, .monotonic);
+    try testing.expectEqual(@as(u64, 1), slot.live().attempts.load(.monotonic));
+
+    // An address inside the array that is not the start of a slot is not one either.
+    const inside: *const Peer = @ptrFromInt(@intFromPtr(slot) + @alignOf(Peer));
+    try testing.expect(!inside.isSlot());
 }
 
 test "peers reports why federation is off, rather than a port it is not listening on" {

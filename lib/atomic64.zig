@@ -21,11 +21,12 @@
 //! Affordable because of where these are used: each is bumped once per event, per request
 //! or per sync, never read in a tight loop.
 //!
-//! One constraint the guarded path imposes: a struct holding one of these must not be
-//! copied once threads are running, because each copy would carry its own lock and the two
-//! would no longer exclude each other. `federation.Peer` copies a default-initialised value
-//! into its array in `addPeer`, which is safe only because `addPeer` refuses to run after
-//! the node has started; every later access is through a pointer.
+//! One constraint the guarded path makes worse: a struct holding one of these must not be
+//! copied once threads are using it. A copy is a separate counter that no longer sees the
+//! original's updates -- true of std.atomic.Value as well -- but a Guarded copied while
+//! another thread holds its lock is born locked, and the first use of the copy spins
+//! forever. Zig cannot forbid the copy, so `federation.Peer` checks for it at every use:
+//! see `Peer.live`.
 
 const std = @import("std");
 
