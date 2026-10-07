@@ -197,7 +197,14 @@ var registry_since_us: Atomic64.Value = .init(0);
 
 var shutting_down: std.atomic.Value(bool) = .init(false);
 
-var workers: std.ArrayList(std.Thread) = .empty;
+/// A global worker, and whether it has returned. Heap-allocated so the flag stays put while
+/// the list grows: the thread holds a pointer to it.
+const Worker = struct {
+    thread: std.Thread = undefined,
+    done: std.atomic.Value(bool) = .init(false),
+};
+
+var workers: std.ArrayList(*Worker) = .empty;
 var workers_mutex: Io.Mutex = .init;
 
 // Sockets a worker may be blocked on, and how to wake it. The two kinds need different
@@ -765,7 +772,10 @@ pub fn spawnWorker(comptime function: anytype, args: anytype) bool {
 
     if (isShuttingDown()) return false;
 
+    reapFinishedWorkers();
     workers.ensureUnusedCapacity(allocator, 1) catch return false;
+    const worker = allocator.create(Worker) catch return false;
+    worker.* = .{};
 
     // Every worker enters through this shim so it can promote itself before doing any
     // work. Setting the policy from inside the thread, rather than on it from outside,
@@ -773,15 +783,41 @@ pub fn spawnWorker(comptime function: anytype, args: anytype) bool {
     // priority. The return type is preserved so error-returning workers behave exactly
     // as they did before.
     const Shim = struct {
-        fn run(a: @TypeOf(args)) @typeInfo(@TypeOf(function)).@"fn".return_type.? {
+        fn run(w: *Worker, a: @TypeOf(args)) @typeInfo(@TypeOf(function)).@"fn".return_type.? {
+            // Last thing the thread does with our state, so a reaper that sees it set
+            // waits only for the thread's own exit.
+            defer w.done.store(true, .release);
             applyRealtimePriority();
             return @call(.auto, function, a);
         }
     };
 
-    const thread = std.Thread.spawn(.{}, Shim.run, .{args}) catch return false;
-    workers.appendAssumeCapacity(thread);
+    worker.thread = std.Thread.spawn(.{}, Shim.run, .{ worker, args }) catch {
+        allocator.destroy(worker);
+        return false;
+    };
+    workers.appendAssumeCapacity(worker);
     return true;
+}
+
+// Join the workers that have already returned, under `workers_mutex`. Most workers live as
+// long as the node, but the registry, the federation listener and `requestBegin` each spawn
+// one per connection or request, and a thread that is never joined keeps its stack until it
+// is -- which used to be shutdown. Reaping on the next spawn bounds the list by what is
+// actually running. The join cannot stall: `done` is set as the thread's last act, so all
+// that is left is its exit.
+fn reapFinishedWorkers() void {
+    var i: usize = 0;
+    while (i < workers.items.len) {
+        const worker = workers.items[i];
+        if (!worker.done.load(.acquire)) {
+            i += 1;
+            continue;
+        }
+        worker.thread.join();
+        allocator.destroy(worker);
+        _ = workers.swapRemove(i);
+    }
 }
 
 // Register a socket a worker is about to block on, returning false if the caller must
@@ -865,7 +901,10 @@ fn joinWorkers() void {
     workers = .empty;
     workers_mutex.unlock(io);
 
-    for (pending.items) |thread| thread.join();
+    for (pending.items) |worker| {
+        worker.thread.join();
+        allocator.destroy(worker);
+    }
     pending.deinit(allocator);
 }
 
@@ -4586,6 +4625,38 @@ test "the directory epoch counts material changes and ignores refresh heartbeats
     // And so is going away.
     try testing.expect(unregisterTopic("epoch/one"));
     try testing.expect(directory_epoch.load(.monotonic) > after_move);
+}
+
+test "a finished worker is joined when the next one spawns, not kept until shutdown" {
+    // Every publisher re-registers every couple of seconds on a fresh connection, and the
+    // registry serves each connection on a worker of its own. Joined only at shutdown, those
+    // finished threads kept their stacks and their slots for the life of the node: a registry
+    // with ten publishers carried another ten dead threads every two seconds.
+    const testing = std.testing;
+
+    try testing.expect(setRegistryPortFn(22318));
+    try testing.expect(nodeRun());
+    defer nodeDeinit();
+
+    var waited: usize = 0;
+    while (registry_since_us.load(.monotonic) == 0 and waited < 3000) : (waited += 10) {
+        sleepUsFn(10_000);
+    }
+    try testing.expect(registry_since_us.load(.monotonic) != 0);
+
+    const before = workerCount();
+    var buf: [4096]u8 = undefined;
+    for (0..200) |_| _ = try registryCommand("list", &buf);
+
+    // A handler can still be finishing the last few replies; what must not happen is one
+    // retained per connection served.
+    try testing.expect(workerCount() < before + 20);
+}
+
+fn workerCount() usize {
+    workers_mutex.lockUncancelable(io);
+    defer workers_mutex.unlock(io);
+    return workers.items.len;
 }
 
 test "a client node declines the registry role" {
