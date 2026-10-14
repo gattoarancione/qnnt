@@ -99,7 +99,7 @@ rebuild after switching contexts. Details and the traps in `docker/README.md`.
 
 ```sh
 zig build                       # the library, the tools, the Zig examples
-zig build test                  # 291 tests
+zig build test                  # the whole test suite
 
 zig build run-0                 # a node publishing test/topic-a and test/topic-b
 zig build ls -- --tree          # what is published
@@ -283,7 +283,7 @@ Full walkthroughs, with the reasoning behind each decision: **`EXAMPLES.txt`**.
 ## Testing
 
 ```sh
-zig build test                      # 291 unit tests, incl. federation merge logic
+zig build test                      # unit tests, incl. federation merge logic
 zig build cpp-logic                 # C++ logic and cross-language golden frames
 zig build python-demo               # the Python package against the built library
 
