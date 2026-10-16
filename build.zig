@@ -819,6 +819,7 @@ pub fn build(b: *Build) void {
         "examples/zed/shm.zig",
         "src/ls.zig",
         "src/cat.zig",
+        "src/perf.zig",
         "examples/net/wire.zig",
         "examples/dirigera/https.zig",
         "examples/dirigera/hub.zig",
@@ -1163,6 +1164,8 @@ pub fn build(b: *Build) void {
         // moves data. `zig build ls -- --tree` passes arguments through.
         .{ .name = "qnnt-ls", .src = "src/ls.zig", .step = "ls" },
         .{ .name = "qnnt-cat", .src = "src/cat.zig", .step = "cat" },
+        // And one measures it: rates, sizes, bandwidth and misses per topic.
+        .{ .name = "qnnt-perf", .src = "src/perf.zig", .step = "perf" },
     };
 
 

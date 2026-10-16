@@ -196,10 +196,18 @@ qnnt-cat --dump 'can/*' > cap # capture with times and topics
 qnnt-cat --restore < cap      # replay at the recorded pace
 qnnt-cat --publish t < file   # the other direction
 
+qnnt-perf                     # every topic: rates, sizes, bandwidth, misses — live
+qnnt-perf --text 'bus/*'      # text topics; framing is not recorded, so say which
+qnnt-perf --duration 10 t     # ten seconds, then the summary
+qnnt-perf 'lidar/*' | awk ... # piped: tab-separated records on stdout instead
+
 qnnt-ls 'test/*' | xargs qnnt-cat --text     # they compose
 ```
 
 Data goes to stdout and notices to stderr, so a redirect carries only payload.
+`qnnt-perf` reads that the other way round: at a terminal its table goes to stderr,
+and piped it writes records to stdout. Misses are counted from a sequence field in the
+payload (`seq`, or `--seq <field>`); a topic without one shows `-`, meaning unknown.
 
 The registry speaks a plain line protocol on 2222 — `nc 127.0.0.1 2222`, then:
 
