@@ -29,7 +29,9 @@ pub var io: Io = undefined;
 
 const QnntNode = struct {
     client: Stream,
-    address: net.IpAddress, // peer, filled in by accept; for inspection only
+    /// Peer, filled in by accept; for inspection only. Port 0 marks a subscriber on the
+    /// Unix socket, which has no address -- no TCP peer ever has port 0.
+    address: net.IpAddress,
     since_us: u64, // when it connected
     messages: u64, // messages successfully written to it
 };
@@ -89,6 +91,10 @@ pub const EntryKind = enum(u8) {
 
 pub const TopicEntry = struct {
     endpoint: net.IpAddress,
+    /// The same publisher's Unix socket, for subscribers on this host. Only meaningful
+    /// while `local` is set: federation takes an entry over by clearing that, and never
+    /// carries a path, since one means nothing on another machine. See "local sockets".
+    local_path: LocalPath = .{},
     /// Stream or procedure. See `EntryKind`.
     kind: EntryKind = .topic,
     first_us: u64, // first time this topic was registered
@@ -213,7 +219,10 @@ var workers_mutex: Io.Mutex = .init;
 // `accept` blocked forever. Waking an accept portably takes a real connection.
 const TrackedSocket = struct {
     socket: net.Socket,
-    kind: enum { listener, stream },
+    kind: enum { listener, stream, local_listener },
+    /// A `local_listener`'s path. Its `socket.address` is a placeholder -- std gives a Unix
+    /// listener none -- so waking its accept means connecting to the path instead.
+    wake: LocalPath = .{},
 };
 
 var live_sockets: std.ArrayList(TrackedSocket) = .empty;
@@ -252,6 +261,10 @@ const TopicToken = struct {
     threads: std.ArrayList(std.Thread) = .empty,
     sockets: std.ArrayList(TrackedSocket) = .empty,
     mutex: Io.Mutex = .init,
+    /// A responder answers one request at a time, which is what lets a handler touch shared
+    /// state without a lock of its own. It now accepts on two sockets, TCP and Unix, so the
+    /// two loops take this around each request to keep that promise.
+    serve_mutex: Io.Mutex = .init,
 
     fn stopping(t: *const TopicToken) bool {
         return isShuttingDown() or t.cancelled.load(.monotonic);
@@ -372,6 +385,16 @@ fn trackSocketFor(
     return true;
 }
 
+/// `trackSocketFor` for a Unix listener, which needs its path to be woken.
+fn trackLocalListenerFor(token: *TopicToken, socket: net.Socket, path: LocalPath) bool {
+    token.mutex.lockUncancelable(io);
+    defer token.mutex.unlock(io);
+
+    if (token.stopping() or isShuttingDown()) return false;
+    token.sockets.append(allocator, .{ .socket = socket, .kind = .local_listener, .wake = path }) catch return false;
+    return true;
+}
+
 fn untrackSocketFor(token: *TopicToken, socket: net.Socket) void {
     token.mutex.lockUncancelable(io);
     defer token.mutex.unlock(io);
@@ -399,6 +422,7 @@ fn breakTopicSockets(token: *TopicToken) void {
             var waker = tracked.socket.address.connect(io, .{ .mode = .stream }) catch continue;
             waker.close(io);
         },
+        .local_listener => wakeLocalListener(tracked.wake),
     };
 }
 
@@ -891,6 +915,7 @@ fn breakLiveSockets() void {
             var waker = tracked.socket.address.connect(io, .{ .mode = .stream }) catch continue;
             waker.close(io);
         },
+        .local_listener => wakeLocalListener(tracked.wake),
     };
 }
 
@@ -1386,6 +1411,13 @@ pub const Qnnt = struct {
     pub const setLockMemory = &setLockMemoryFn;
     pub const lockMemory = &lockMemoryFn;
 
+    /// Same-host traffic over Unix sockets, everything else over TCP; on by default. The
+    /// directory defaults to /tmp/qnnt-<uid>. Both before `run()`. See "local sockets".
+    pub const setLocalSockets = &setLocalSocketsFn;
+    pub const localSockets = &localSocketsFn;
+    pub const setSocketDir = &setSocketDirFn;
+    pub const socketDir = &socketDirFn;
+
     /// Stack for the threads that serve one connection or request and exit; see
     /// `spawnHandler`. 0 (the default) is std.Thread's 16 MiB. Before `run()`.
     pub const setHandlerStackBytes = &setHandlerStackBytesFn;
@@ -1502,7 +1534,9 @@ fn clientCommand(command: []const u8) !Reply {
             try buffer.print(allocator, "error: malformed uri '{s}', expected tcp://<host>:<port>\n", .{uri});
             return ownedReply(&buffer);
         };
-        try registerTopic(topic, endpoint, node_id, .topic);
+        // An optional `unix://` after the TCP endpoint: the same publisher, for this host.
+        const local = if (it.next()) |extra| parseUnixUri(extra) orelse LocalPath{} else LocalPath{};
+        try registerTopic(topic, endpoint, node_id, .topic, local);
         try buffer.print(allocator, "ok\n", .{});
     } else if (eqlAny(verb, &.{"rpc"})) {
         // "rpc <procedure> tcp://<host>:<port>" — a responder registering its endpoint.
@@ -1514,7 +1548,8 @@ fn clientCommand(command: []const u8) !Reply {
             try buffer.print(allocator, "error: malformed uri '{s}', expected tcp://<host>:<port>\n", .{uri});
             return ownedReply(&buffer);
         };
-        try registerTopic(name, endpoint, node_id, .responder);
+        const local = if (it.next()) |extra| parseUnixUri(extra) orelse LocalPath{} else LocalPath{};
+        try registerTopic(name, endpoint, node_id, .responder, local);
         try buffer.print(allocator, "ok\n", .{});
     } else if (eqlAny(verb, &.{"rpc-find"})) {
         // `sub` for procedures, and deliberately a separate verb: it refuses to answer for
@@ -1530,6 +1565,11 @@ fn clientCommand(command: []const u8) !Reply {
                 try buffer.print(allocator, "error: procedure {s} expired\n", .{name});
             } else {
                 try buffer.print(allocator, "tcp://{f}\n", .{entry.endpoint});
+                // An extra line, which an older client never reads: `takeReply` takes the
+                // first and `drainReply` discards the rest.
+                if (entry.local and entry.local_path.isSet()) {
+                    try buffer.print(allocator, "unix://{s}\n", .{entry.local_path.slice()});
+                }
             }
         } else {
             try buffer.print(allocator, "error: procedure {s} not found\n", .{name});
@@ -1552,6 +1592,11 @@ fn clientCommand(command: []const u8) !Reply {
                 try buffer.print(allocator, "error: topic {s} expired\n", .{topic});
             } else {
                 try buffer.print(allocator, "tcp://{f}\n", .{entry.endpoint});
+                // An extra line, which an older client never reads: `takeReply` takes the
+                // first and `drainReply` discards the rest.
+                if (entry.local and entry.local_path.isSet()) {
+                    try buffer.print(allocator, "unix://{s}\n", .{entry.local_path.slice()});
+                }
             }
         } else {
             try buffer.print(allocator, "error: topic {s} not found\n", .{topic});
@@ -1685,8 +1730,10 @@ fn writeHelp(buffer: *std.ArrayList(u8)) !void {
         \\# commands (case-insensitive):
         \\#   list                 registered topics: publisher, subscribers, age, state
         \\#   subs <topic>         who is subscribed to a topic: address, connected, messages
-        \\#   sub <topic>          resolve a topic to its publisher URI
-        \\#   pub <topic> <uri>    register or refresh a topic's publisher endpoint
+        \\#   sub <topic>          resolve a topic to its publisher URI, plus its unix://
+        \\#                        path when the publisher is on this host
+        \\#   pub <topic> <uri> [unix://path]
+        \\#                        register or refresh a topic's publisher endpoint
         \\#   epoch                who holds the directory, and its version
         \\#   port <topic> [skip n] the port that topic should listen on, 0 for 'any'
         \\#   mirror [id epoch]    the directory, or 'unchanged' if you are current
@@ -1901,7 +1948,7 @@ fn writeSubscriberList(buffer: *std.ArrayList(u8), topic: []const u8) !void {
     var peer_width: usize = "subscriber".len;
     for (entry.peers.items) |peer| {
         var buf: [64]u8 = undefined;
-        const text = std.fmt.bufPrint(&buf, "{f}", .{peer.address}) catch "?";
+        const text = peerText(&buf, peer.address);
         peer_width = @max(peer_width, text.len);
     }
 
@@ -1916,7 +1963,7 @@ fn writeSubscriberList(buffer: *std.ArrayList(u8), topic: []const u8) !void {
         var connected_buf: [16]u8 = undefined;
 
         try buffer.appendSlice(allocator, "  ");
-        try writePadded(buffer, std.fmt.bufPrint(&peer_buf, "{f}", .{peer.address}) catch "?", peer_width);
+        try writePadded(buffer, peerText(&peer_buf, peer.address), peer_width);
         try buffer.appendSlice(allocator, "  ");
         try writePadded(buffer, formatAge(&connected_buf, peer.connected_us), age_column_width);
         try buffer.print(allocator, "  {d}\n", .{peer.messages});
@@ -1969,7 +2016,7 @@ fn writeStatus(buffer: *std.ArrayList(u8)) !void {
 // Record (or refresh) a topic's publisher endpoint in the discovery directory.
 // The topic key arrives in a transient network buffer, so it is heap-owned on
 // first insert and left untouched on refresh.
-fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId, kind: EntryKind) !void {
+fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId, kind: EntryKind, local_path: LocalPath) !void {
     const now_us: u64 = @intCast(nowMicrosFn());
 
     // Notified after the lock is released: waking a connector while holding the directory
@@ -1989,6 +2036,7 @@ fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId, kin
         };
         gop.value_ptr.* = .{
             .endpoint = endpoint,
+            .local_path = local_path,
             .first_us = now_us,
             .last_us = now_us,
             .peers = .empty,
@@ -2014,6 +2062,7 @@ fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId, kin
         // version bump on its own is just the refresh heartbeat.
         if (!std.meta.eql(gop.value_ptr.endpoint, endpoint)) changed = true;
         gop.value_ptr.endpoint = endpoint;
+        gop.value_ptr.local_path = local_path;
         gop.value_ptr.last_us = now_us;
         gop.value_ptr.version = now_us;
         gop.value_ptr.local = true;
@@ -2035,6 +2084,7 @@ fn registerTopic(topic: []const u8, endpoint: net.IpAddress, origin: NodeId, kin
     gop.value_ptr.kind = kind;
     gop.value_ptr.origin = origin;
     gop.value_ptr.endpoint = endpoint;
+    gop.value_ptr.local_path = local_path;
     gop.value_ptr.last_us = now_us;
     gop.value_ptr.version = now_us;
     gop.value_ptr.learned_us = now_us;
@@ -2361,6 +2411,356 @@ const publisher_port_attempts = 8;
 
 /// Bind the listener a publisher will accept on, taking its port from the registry when a
 /// range is configured.
+// ---------------------------------------------------------------- local sockets
+//
+// Same-host traffic goes over a Unix domain socket, everything else over TCP. Measured
+// against loopback TCP, a Unix socket cut the round trip 3.6x on macOS (14.8 -> 4.1 us) and
+// 1.35x on Linux, and raised bulk throughput 2.4x and 1.5x.
+//
+// Every publisher and responder listens on both. The TCP endpoint is what the directory
+// federates and what remote nodes dial. The Unix path rides alongside it in a `pub` or `rpc`
+// registration, is kept only on entries registered through this host's registry -- which
+// listens on loopback, so its clients are on this host by construction -- and is handed out
+// on an extra line of the `sub` or `rpc-find` reply. Federation never carries it.
+//
+// A subscriber tries the path first and falls back to TCP on any failure. That covers a node
+// run by another user (the directory is 0700), a container that shares the network but not
+// /tmp, a publisher that died since registering, and an older node on either end: an old
+// subscriber reads the TCP line and drains the rest, and an old publisher registers no path.
+// Socket names carry the node's random id, so a path from some other namespace cannot
+// resolve to the wrong process -- it fails, and TCP takes over.
+
+/// macOS's sockaddr_un holds 104 bytes with the terminator, Linux's 108. The smaller wins,
+/// or a path that binds on Linux would overflow the struct on a Mac.
+pub const max_local_path = 103;
+
+/// Longest socket directory accepted, leaving room for "/<16 hex>-<n>.sock" under the limit.
+pub const max_socket_dir = 64;
+
+pub const LocalPath = struct {
+    buf: [max_local_path]u8 = undefined,
+    len: u8 = 0,
+
+    pub fn slice(p: *const LocalPath) []const u8 {
+        return p.buf[0..p.len];
+    }
+
+    pub fn isSet(p: LocalPath) bool {
+        return p.len != 0;
+    }
+
+    pub fn from(text: []const u8) ?LocalPath {
+        if (text.len == 0 or text.len > max_local_path) return null;
+        var p: LocalPath = .{};
+        @memcpy(p.buf[0..text.len], text);
+        p.len = @intCast(text.len);
+        return p;
+    }
+
+    /// NUL-terminated, for libc.
+    fn z(p: *const LocalPath, out: *[max_local_path + 1]u8) [*:0]const u8 {
+        @memcpy(out[0..p.len], p.slice());
+        out[p.len] = 0;
+        return out[0..p.len :0];
+    }
+};
+
+/// `unix:///absolute/path` to a path, or null for anything else.
+fn parseUnixUri(text: []const u8) ?LocalPath {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (!std.mem.startsWith(u8, trimmed, "unix://")) return null;
+    const path = trimmed["unix://".len..];
+    if (path.len == 0 or path[0] != '/') return null;
+    return LocalPath.from(path);
+}
+
+var local_sockets_enabled = true;
+var socket_dir_override: LocalPath = .{};
+/// The directory in use, resolved and checked by `prepareSocketDir` when the node starts.
+/// Unset means local sockets are off for this run, whatever was asked for.
+var socket_dir: LocalPath = .{};
+var local_seq = std.atomic.Value(u32).init(0);
+
+/// On by default. Refused once the node runs, like the other pre-start knobs.
+pub fn setLocalSocketsFn(enabled: bool) bool {
+    if (node_running) return false;
+    local_sockets_enabled = enabled;
+    return true;
+}
+
+pub fn localSocketsFn() bool {
+    return local_sockets_enabled;
+}
+
+/// Where the sockets go; empty restores the default, /tmp/qnnt-<uid>. Absolute, and short
+/// enough to leave room for the socket names under the platform's path limit.
+pub fn setSocketDirFn(path: []const u8) bool {
+    if (node_running) return false;
+    if (path.len == 0) {
+        socket_dir_override = .{};
+        return true;
+    }
+    const trimmed = std.mem.trimEnd(u8, path, "/");
+    if (trimmed.len == 0 or trimmed[0] != '/' or trimmed.len > max_socket_dir) return false;
+    socket_dir_override = LocalPath.from(trimmed) orelse return false;
+    return true;
+}
+
+/// The directory this run uses, or empty when local sockets are off. Set when the node
+/// starts, so before that it is empty.
+pub fn socketDirFn() []const u8 {
+    return socket_dir.slice();
+}
+
+/// Owner and mode of `path` itself, not of whatever a symlink there points at. statx on
+/// Linux, because it is the stat every architecture has -- riscv32 has no fstatat.
+fn lstatOwner(path: [*:0]const u8) ?struct { mode: u32, uid: u32 } {
+    if (@import("builtin").os.tag == .linux) {
+        const linux = std.os.linux;
+        var st: linux.Statx = undefined;
+        const rc = linux.statx(linux.AT.FDCWD, path, linux.AT.SYMLINK_NOFOLLOW, .{ .TYPE = true, .MODE = true, .UID = true }, &st);
+        if (linux.errno(rc) != .SUCCESS) return null;
+        return .{ .mode = st.mode, .uid = st.uid };
+    }
+    var st: std.c.Stat = undefined;
+    if (std.c.fstatat(std.c.AT.FDCWD, path, &st, std.c.AT.SYMLINK_NOFOLLOW) != 0) return null;
+    return .{ .mode = @intCast(st.mode), .uid = @intCast(st.uid) };
+}
+
+/// Resolve the socket directory and make sure it is ours: created 0700 when missing, and
+/// otherwise a real directory -- not a symlink -- owned by this user and writable by nobody
+/// else. Anything less and another user could put their own socket where a publisher's
+/// should be, so local sockets are turned off for the run, said so, and TCP carries it all.
+fn prepareSocketDir() void {
+    socket_dir = .{};
+    if (!local_sockets_enabled) return;
+
+    var dir = socket_dir_override;
+    if (!dir.isSet()) {
+        var name: [64]u8 = undefined;
+        const text = std.fmt.bufPrint(&name, "/tmp/qnnt-{d}", .{std.c.geteuid()}) catch return;
+        dir = LocalPath.from(text) orelse return;
+    }
+
+    var zbuf: [max_local_path + 1]u8 = undefined;
+    const zpath = dir.z(&zbuf);
+    const made = std.posix.errno(std.c.mkdir(zpath, 0o700));
+    if (made != .SUCCESS and made != .EXIST) {
+        std.debug.print("local sockets off: cannot create {s} ({t}); TCP on this host too\n", .{ dir.slice(), made });
+        return;
+    }
+
+    const info = lstatOwner(zpath) orelse {
+        std.debug.print("local sockets off: cannot inspect {s}; TCP on this host too\n", .{dir.slice()});
+        return;
+    };
+    if (info.mode & 0o170000 != 0o040000 or info.uid != std.c.geteuid()) {
+        std.debug.print(
+            "local sockets off: {s} is not a directory owned by this user; TCP on this host too\n",
+            .{dir.slice()},
+        );
+        return;
+    }
+    if (info.mode & 0o022 != 0 and std.c.chmod(zpath, 0o700) != 0) {
+        std.debug.print(
+            "local sockets off: {s} is writable by others and cannot be fixed; TCP on this host too\n",
+            .{dir.slice()},
+        );
+        return;
+    }
+
+    socket_dir = dir;
+    sweepStaleSockets();
+}
+
+/// Socket files left by nodes that died without unlinking them. Each is probed, and one
+/// whose connection is refused has nothing listening and goes. Only names this library makes
+/// are looked at, and the directory is this user's alone.
+///
+/// Refused twice, 100 ms apart, before anything is removed: a node starting at the same
+/// moment has bound its path but not yet called listen, and in that gap its socket refuses
+/// too. Several nodes coming up together -- at boot, or this repository's tests running in
+/// parallel -- would otherwise delete each other's sockets.
+fn sweepStaleSockets() void {
+    var candidates: [32]LocalPath = undefined;
+    var count: usize = 0;
+    {
+        var dir = Io.Dir.openDirAbsolute(io, socket_dir.slice(), .{ .iterate = true }) catch return;
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (count == candidates.len) break; // the rest wait for the next start
+            if (entry.kind != .unix_domain_socket or !std.mem.endsWith(u8, entry.name, ".sock")) continue;
+            var buf: [max_local_path]u8 = undefined;
+            const text = std.fmt.bufPrint(&buf, "{s}/{s}", .{ socket_dir.slice(), entry.name }) catch continue;
+            const path = LocalPath.from(text) orelse continue;
+            if (probeRefused(path)) {
+                candidates[count] = path;
+                count += 1;
+            }
+        }
+    }
+    if (count == 0) return;
+
+    sleepMsFn(100);
+    for (candidates[0..count]) |*path| {
+        if (!probeRefused(path.*)) continue;
+        var zbuf: [max_local_path + 1]u8 = undefined;
+        _ = std.c.unlink(path.z(&zbuf));
+    }
+}
+
+fn probeRefused(path: LocalPath) bool {
+    switch (openLocal(path)) {
+        .fd => |fd| {
+            _ = std.c.close(fd);
+            return false;
+        },
+        .refused => return true,
+        .failed => return false,
+    }
+}
+
+/// Connect to a Unix socket through libc rather than std, for one reason: std reports a
+/// refused connection as an unexpected errno, which in a debug build prints a stack trace --
+/// and a refused path is ordinary here, the mark of a publisher that died since registering.
+fn openLocal(path: LocalPath) union(enum) { fd: std.c.fd_t, refused, failed } {
+    const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+    if (fd < 0) return .failed;
+    _ = std.c.fcntl(fd, std.c.F.SETFD, @as(c_int, std.c.FD_CLOEXEC));
+
+    var addr = std.mem.zeroes(std.c.sockaddr.un);
+    if (@hasField(std.c.sockaddr.un, "len")) addr.len = @sizeOf(std.c.sockaddr.un);
+    addr.family = std.c.AF.UNIX;
+    @memcpy(addr.path[0..path.len], path.slice());
+
+    while (true) {
+        switch (std.posix.errno(std.c.connect(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)))) {
+            .SUCCESS => return .{ .fd = fd },
+            .INTR => continue,
+            .CONNREFUSED => {
+                _ = std.c.close(fd);
+                return .refused;
+            },
+            else => {
+                _ = std.c.close(fd);
+                return .failed;
+            },
+        }
+    }
+}
+
+/// macOS gives a Unix socket an 8 KiB buffer, which held bulk throughput to a tenth of what
+/// TCP managed on the same host; at 1 MiB it ran at 2.4x TCP instead. Linux clamps the
+/// request to its own ceiling, which is already generous.
+fn widenBuffers(handle: net.Socket.Handle) void {
+    const size: c_int = 1 << 20;
+    _ = std.c.setsockopt(handle, std.c.SOL.SOCKET, std.c.SO.SNDBUF, &size, @sizeOf(c_int));
+    _ = std.c.setsockopt(handle, std.c.SOL.SOCKET, std.c.SO.RCVBUF, &size, @sizeOf(c_int));
+}
+
+fn connectLocal(path: LocalPath) ?net.Stream {
+    switch (openLocal(path)) {
+        .fd => |fd| {
+            widenBuffers(fd);
+            return .{ .socket = .{ .handle = fd, .address = .{ .ip4 = .loopback(0) } } };
+        },
+        .refused, .failed => return null,
+    }
+}
+
+fn wakeLocalListener(path: LocalPath) void {
+    if (connectLocal(path)) |stream| stream.close(io);
+}
+
+/// Wait for a connection on a Unix listener, looking at `token` every 100 ms.
+///
+/// Connecting to the path, as `breakTopicSockets` does, is the quick way to wake this --
+/// but the path can be gone: /tmp cleaned under a running node, or a file someone deleted.
+/// Then that connection cannot be made, and without this timeout the accept never returns
+/// and the shutdown that joins it never finishes. A test that unlinked the file found that.
+fn acceptLocal(token: *TopicToken, server: *net.Server) ?net.Stream {
+    while (!token.stopping()) {
+        var fds = [_]std.c.pollfd{.{ .fd = server.socket.handle, .events = std.c.POLL.IN, .revents = 0 }};
+        const ready = std.c.poll(&fds, fds.len, 100);
+        if (ready < 0) {
+            if (std.posix.errno(ready) == .INTR) continue;
+            return null;
+        }
+        if (ready == 0) continue;
+        return server.accept(io) catch null;
+    }
+    return null;
+}
+
+/// A Unix listener and the path it is bound to. Closing it unlinks the path, so a topic that
+/// stops leaves nothing behind in the directory.
+const LocalListener = struct {
+    server: net.Server,
+    path: LocalPath,
+
+    fn close(l: *LocalListener) void {
+        l.server.deinit(io);
+        var zbuf: [max_local_path + 1]u8 = undefined;
+        _ = std.c.unlink(l.path.z(&zbuf));
+    }
+};
+
+/// A fresh Unix listener, or null when local sockets are off or this one cannot be had --
+/// either way the endpoint is simply TCP only.
+fn listenLocal() ?LocalListener {
+    if (!socket_dir.isSet()) return null;
+    const id = std.fmt.bytesToHex(node_id[0..8].*, .lower);
+    var buf: [max_local_path]u8 = undefined;
+    const text = std.fmt.bufPrint(&buf, "{s}/{s}-{d}.sock", .{
+        socket_dir.slice(), &id, local_seq.fetchAdd(1, .monotonic),
+    }) catch return null;
+    const path = LocalPath.from(text) orelse return null;
+    const address = net.UnixAddress.init(path.slice()) catch return null;
+    const server = address.listen(io, .{}) catch |err| {
+        std.debug.print("local socket {s} unavailable ({t}); this endpoint is TCP only\n", .{ path.slice(), err });
+        return null;
+    };
+    return .{ .server = server, .path = path };
+}
+
+/// Where to reach a topic or a procedure: always over TCP, and over a Unix socket too when
+/// it is on this host.
+const Resolved = struct {
+    endpoint: net.IpAddress,
+    local: LocalPath = .{},
+};
+
+const Dialed = struct { stream: net.Stream, local: bool };
+
+/// The Unix socket when there is one and it answers, TCP otherwise.
+fn dial(r: *const Resolved) !Dialed {
+    if (r.local.isSet()) {
+        if (connectLocal(r.local)) |stream| return .{ .stream = stream, .local = true };
+    }
+    return .{ .stream = try r.endpoint.connect(io, .{ .mode = .stream }), .local = false };
+}
+
+/// What a connection went to, for the "subscribed to" line.
+fn describeDialed(buf: []u8, r: *const Resolved, local: bool) []const u8 {
+    if (local) return std.fmt.bufPrint(buf, "unix://{s}", .{r.local.slice()}) catch "unix";
+    return std.fmt.bufPrint(buf, "tcp://{f}", .{r.endpoint}) catch "tcp";
+}
+
+/// The peer as events name it: the publisher's address over TCP, as it always was, and
+/// "unix" over a Unix socket, which has none.
+fn dialedPeer(buf: []u8, r: *const Resolved, local: bool) []const u8 {
+    if (local) return "unix";
+    return std.fmt.bufPrint(buf, "{f}", .{r.endpoint}) catch "?";
+}
+
+/// A subscriber as `subs` shows it. Port 0 is how a publisher reports a Unix subscriber --
+/// no TCP peer ever has it -- so it is shown as what it is.
+fn peerText(buf: []u8, address: net.IpAddress) []const u8 {
+    if (address.getPort() == 0) return "unix";
+    return std.fmt.bufPrint(buf, "{f}", .{address}) catch "?";
+}
+
 fn listenForPublisher(topic: []const u8) !net.Server {
     if (!publisherPortsConfigured()) {
         const addr: net.IpAddress = try .parse(bindText(), 0);
@@ -2984,13 +3384,30 @@ fn nodePublish(token: *TopicToken, source: ?Qnnt.SourceHandler, period_us: u64, 
         try subscribers.put(topic, .empty);
     }
 
-    std.debug.print("publisher {s} listening on tcp://{f}\n", .{ topic, endpoint });
+    // The same topic on a Unix socket, for subscribers on this host. Its accept loop owns
+    // the listener and unlinks the path when it ends, so failing here costs only the fast
+    // path: the topic is still served over TCP.
+    var local: LocalPath = .{};
+    if (listenLocal()) |listener| {
+        if (spawnWorkerFor(token, localPublisherLoop, .{ token, listener })) {
+            local = listener.path;
+        } else {
+            var unused = listener;
+            unused.close();
+        }
+    }
+
+    if (local.isSet()) {
+        std.debug.print("publisher {s} listening on tcp://{f} and unix://{s}\n", .{ topic, endpoint, local.slice() });
+    } else {
+        std.debug.print("publisher {s} listening on tcp://{f}\n", .{ topic, endpoint });
+    }
 
     // Keep the registry's directory pointed at us. This runs regardless of which
     // node holds the registry (we register over the network, even to ourselves),
     // retries until a registry exists, and refreshes so a newly-elected registry
     // after a failover re-learns this publisher.
-    if (!spawnWorkerFor(token, registerLoop, .{ token, endpoint })) {
+    if (!spawnWorkerFor(token, registerLoop, .{ token, endpoint, local })) {
         std.debug.print("failed to spawn register loop for {s}\n", .{topic});
     }
 
@@ -3022,26 +3439,54 @@ fn nodePublish(token: *TopicToken, source: ?Qnnt.SourceHandler, period_us: u64, 
         // late enough that the waker's FIN has certainly arrived and the close is an
         // ordinary passive one.
 
-        var now_count: usize = 0;
-        {
-            subscribers_mutex.lockUncancelable(io);
-            defer subscribers_mutex.unlock(io);
-            if (subscribers.getPtr(topic)) |list_ptr| {
-                try list_ptr.append(allocator, .{
-                    .client = client,
-                    .address = client.socket.address, // peer address, resolved by accept
-                    .since_us = @intCast(nowMicrosFn()),
-                    .messages = 0,
-                });
-                now_count = list_ptr.items.len;
-            }
-        }
+        try addSubscriber(topic, client, false);
+    }
+}
 
-        // Emitted after the lock is released: a handler is free to call back into the
-        // library, and `subscriberCount` would deadlock against this very mutex.
-        var peer_buf: [64]u8 = undefined;
-        const peer = std.fmt.bufPrint(&peer_buf, "{f}", .{client.socket.address}) catch "?";
-        emitEvent(.subscriber_connected, topic, peer, now_count);
+/// Put an accepted connection on `topic`'s delivery list and announce it. Shared by the TCP
+/// and Unix accept loops; `local` says which, since a Unix peer has no address to show.
+fn addSubscriber(topic: []const u8, client: net.Stream, local: bool) !void {
+    const address: net.IpAddress = if (local) .{ .ip4 = .loopback(0) } else client.socket.address;
+    var now_count: usize = 0;
+    {
+        subscribers_mutex.lockUncancelable(io);
+        defer subscribers_mutex.unlock(io);
+        if (subscribers.getPtr(topic)) |list_ptr| {
+            try list_ptr.append(allocator, .{
+                .client = client,
+                .address = address,
+                .since_us = @intCast(nowMicrosFn()),
+                .messages = 0,
+            });
+            now_count = list_ptr.items.len;
+        }
+    }
+
+    // Emitted after the lock is released: a handler is free to call back into the
+    // library, and `subscriberCount` would deadlock against this very mutex.
+    var peer_buf: [64]u8 = undefined;
+    const peer = if (local) "unix" else std.fmt.bufPrint(&peer_buf, "{f}", .{address}) catch "?";
+    emitEvent(.subscriber_connected, topic, peer, now_count);
+}
+
+/// The Unix half of a publisher: accept on the path and deliver like any other subscriber.
+/// Owns the listener, so the path is unlinked when the topic stops.
+fn localPublisherLoop(token: *TopicToken, listener_in: LocalListener) void {
+    var listener = listener_in;
+    defer listener.close();
+    if (!trackLocalListenerFor(token, listener.server.socket, listener.path)) return;
+    defer untrackSocketFor(token, listener.server.socket);
+
+    while (!token.stopping()) {
+        const client = acceptLocal(token, &listener.server) orelse return;
+        // A Unix socket has no TIME_WAIT, so unlike in the TCP loop the waker that
+        // interrupted this accept can simply be closed.
+        if (token.stopping()) {
+            client.close(io);
+            return;
+        }
+        widenBuffers(client.socket.handle);
+        addSubscriber(token.topic, client, true) catch client.close(io);
     }
 }
 
@@ -3072,7 +3517,7 @@ fn snapshotPeers(topic: []const u8, now_us: u64) ![]PeerRecord {
 // current subscriber list. The registry cannot see those connections — they terminate
 // here — so piggybacking the snapshot on the refresh is how `list` and `subs` get
 // their figures, at the cost of them lagging by up to one probe interval.
-fn registerOnce(topic: []const u8, endpoint: net.IpAddress) !void {
+fn registerOnce(topic: []const u8, endpoint: net.IpAddress, local: LocalPath) !void {
     const reg: net.IpAddress = try net.IpAddress.parse("127.0.0.1", registry_port);
     var conn = try reg.connect(io, .{ .mode = .stream });
     defer conn.close(io);
@@ -3088,7 +3533,10 @@ fn registerOnce(topic: []const u8, endpoint: net.IpAddress) !void {
 
     var cmdbuf: [512]u8 = undefined;
 
-    const cmd = try std.fmt.bufPrint(&cmdbuf, "pub {s} tcp://{f}\n", .{ topic, endpoint });
+    const cmd = if (local.isSet())
+        try std.fmt.bufPrint(&cmdbuf, "pub {s} tcp://{f} unix://{s}\n", .{ topic, endpoint, local.slice() })
+    else
+        try std.fmt.bufPrint(&cmdbuf, "pub {s} tcp://{f}\n", .{ topic, endpoint });
     try writer.interface.writeAll(cmd);
     discardReply(&reader.interface); // ack; drained so the close stays orderly
 
@@ -3120,9 +3568,9 @@ fn registerOnce(topic: []const u8, endpoint: net.IpAddress) !void {
     discardReply(&reader.interface);
 }
 
-fn registerLoop(token: *TopicToken, endpoint: net.IpAddress) void {
+fn registerLoop(token: *TopicToken, endpoint: net.IpAddress, local: LocalPath) void {
     while (!token.stopping()) {
-        registerOnce(token.topic, endpoint) catch {}; // registry not up yet / mid-failover
+        registerOnce(token.topic, endpoint, local) catch {}; // registry not up yet / mid-failover
         if (!sleepMsInterruptibleFor(token, registry_probe_interval_ms)) return;
     }
 }
@@ -3215,7 +3663,7 @@ pub fn listTopics(out: [][]const u8, buf: []u8) !usize {
 // Ask the registry (well-known port) where `topic` is published and return the
 // publisher's endpoint. Fails if the registry is unreachable or doesn't know the
 // topic yet, so callers are expected to retry.
-fn resolveTopic(topic: []const u8) !net.IpAddress {
+fn resolveTopic(topic: []const u8) !Resolved {
     const reg: net.IpAddress = try net.IpAddress.parse("127.0.0.1", registry_port);
     var conn = try reg.connect(io, .{ .mode = .stream });
     defer conn.close(io);
@@ -3234,8 +3682,16 @@ fn resolveTopic(topic: []const u8) !net.IpAddress {
     var reader = conn.reader(io, &rbuf);
     const line = try takeReply(&reader.interface);
     const parsed = parseTcpUri(line); // errors (incl. "error: not found") -> caller retries
-    drainReply(&reader.interface);
-    return parsed;
+
+    // The rest of the reply: a `unix://` line when the publisher is on this host, then the
+    // terminator. Read to the end either way, for the reason `drainReply` gives.
+    var local: LocalPath = .{};
+    while (true) {
+        const more = reader.interface.takeDelimiterInclusive('\n') catch break;
+        if (std.mem.startsWith(u8, more, "# end")) break;
+        if (parseUnixUri(more)) |path| local = path;
+    }
+    return .{ .endpoint = try parsed, .local = local };
 }
 
 // Resolve `topic` through the registry, connect to its publisher, and deliver every
@@ -3245,15 +3701,16 @@ fn resolveTopic(topic: []const u8) !net.IpAddress {
 fn subscribeLoop(token: *TopicToken, handler: Qnnt.MessageHandler, context: ?*anyopaque) void {
     const topic = token.topic;
     while (!token.stopping()) {
-        const endpoint = resolveTopic(topic) catch {
+        const resolved = resolveTopic(topic) catch {
             if (!sleepMsInterruptibleFor(token, registry_probe_interval_ms)) return;
             continue;
         };
 
-        var stream = endpoint.connect(io, .{ .mode = .stream }) catch {
+        const dialed = dial(&resolved) catch {
             if (!sleepMsInterruptibleFor(token, registry_probe_interval_ms)) return;
             continue;
         };
+        var stream = dialed.stream;
         defer stream.close(io);
 
         // Tracked so shutdown -- or `removeSubscriber` on this topic -- breaks the
@@ -3261,10 +3718,11 @@ fn subscribeLoop(token: *TopicToken, handler: Qnnt.MessageHandler, context: ?*an
         if (!trackSocketFor(token, stream.socket, .stream)) return;
         defer untrackSocketFor(token, stream.socket);
 
-        std.debug.print("subscribed to {s} @ tcp://{f}\n", .{ topic, endpoint });
+        var where_buf: [128]u8 = undefined;
+        std.debug.print("subscribed to {s} @ {s}\n", .{ topic, describeDialed(&where_buf, &resolved, dialed.local) });
 
         var peer_buf: [64]u8 = undefined;
-        const peer = std.fmt.bufPrint(&peer_buf, "{f}", .{endpoint}) catch "?";
+        const peer = dialedPeer(&peer_buf, &resolved, dialed.local);
         subMark(topic, true);
         emitEvent(.publisher_connected, topic, peer, 0);
 
@@ -3560,15 +4018,16 @@ fn subscribeFramesLoop(token: *TopicToken, handler: Qnnt.FrameHandler, context: 
     defer frame_buf.deinit(allocator);
 
     while (!token.stopping()) {
-        const endpoint = resolveTopic(topic) catch {
+        const resolved = resolveTopic(topic) catch {
             if (!sleepMsInterruptibleFor(token, registry_probe_interval_ms)) return;
             continue;
         };
 
-        var stream = endpoint.connect(io, .{ .mode = .stream }) catch {
+        const dialed = dial(&resolved) catch {
             if (!sleepMsInterruptibleFor(token, registry_probe_interval_ms)) return;
             continue;
         };
+        var stream = dialed.stream;
         defer stream.close(io);
 
         // Tracked so shutdown -- or `removeSubscriber` on this topic -- breaks the
@@ -3576,10 +4035,11 @@ fn subscribeFramesLoop(token: *TopicToken, handler: Qnnt.FrameHandler, context: 
         if (!trackSocketFor(token, stream.socket, .stream)) return;
         defer untrackSocketFor(token, stream.socket);
 
-        std.debug.print("subscribed to {s} @ tcp://{f} (tld)\n", .{ topic, endpoint });
+        var where_buf: [128]u8 = undefined;
+        std.debug.print("subscribed to {s} @ {s} (tld)\n", .{ topic, describeDialed(&where_buf, &resolved, dialed.local) });
 
         var peer_buf: [64]u8 = undefined;
-        const peer = std.fmt.bufPrint(&peer_buf, "{f}", .{endpoint}) catch "?";
+        const peer = dialedPeer(&peer_buf, &resolved, dialed.local);
         subMark(topic, true);
         emitEvent(.publisher_connected, topic, peer, 0);
 
@@ -3911,6 +4371,7 @@ pub fn nodeRun() bool {
     io = io_impl.io();
 
     ensureNodeId(); // needs `io` for randomness, so it cannot happen any earlier
+    prepareSocketDir(); // after the id, which names the sockets; needs `io` for the sweep
 
     // Signal handlers are deliberately NOT installed here; see installShutdownHandlers.
 
@@ -4123,16 +4584,19 @@ fn receiveFrame(sock: *const net.Socket, buf: *std.ArrayList(u8), deadline_us: u
 /// Keep the registry's directory pointing at this responder. `registerLoop` for procedures:
 /// the same refresh cadence and the same reason -- a registry elected after a failover has
 /// to re-learn what is served here.
-fn rpcRegisterLoop(token: *TopicToken, endpoint: net.IpAddress) void {
+fn rpcRegisterLoop(token: *TopicToken, endpoint: net.IpAddress, local: LocalPath) void {
     while (!token.stopping()) {
-        rpcRegisterOnce(token.topic, endpoint) catch {}; // registry not up yet / mid-failover
+        rpcRegisterOnce(token.topic, endpoint, local) catch {}; // registry not up yet / mid-failover
         if (!sleepMsInterruptibleFor(token, registry_probe_interval_ms)) return;
     }
 }
 
-fn rpcRegisterOnce(procedure: []const u8, endpoint: net.IpAddress) !void {
-    var cmd_buf: [320]u8 = undefined;
-    const command = try std.fmt.bufPrint(&cmd_buf, "rpc {s} tcp://{f}", .{ procedure, endpoint });
+fn rpcRegisterOnce(procedure: []const u8, endpoint: net.IpAddress, local: LocalPath) !void {
+    var cmd_buf: [448]u8 = undefined;
+    const command = if (local.isSet())
+        try std.fmt.bufPrint(&cmd_buf, "rpc {s} tcp://{f} unix://{s}", .{ procedure, endpoint, local.slice() })
+    else
+        try std.fmt.bufPrint(&cmd_buf, "rpc {s} tcp://{f}", .{ procedure, endpoint });
     var reply_buf: [256]u8 = undefined;
     _ = try registryCommand(command, &reply_buf);
 }
@@ -4154,9 +4618,25 @@ fn responderLoop(token: *TopicToken, handler: ResponderHandlerFn, context: ?*any
     var endpoint: net.IpAddress = try .parse(advertiseText(), 0);
     endpoint.setPort(server.socket.address.getPort());
 
-    std.debug.print("responder {s} listening on tcp://{f}\n", .{ procedure, endpoint });
+    // The Unix half, as for a publisher. Both loops serve through `serve_mutex`, so the
+    // handler still sees one request at a time.
+    var local: LocalPath = .{};
+    if (listenLocal()) |listener| {
+        if (spawnWorkerFor(token, localResponderLoop, .{ token, listener, handler, context })) {
+            local = listener.path;
+        } else {
+            var unused = listener;
+            unused.close();
+        }
+    }
 
-    if (!spawnWorkerFor(token, rpcRegisterLoop, .{ token, endpoint })) {
+    if (local.isSet()) {
+        std.debug.print("responder {s} listening on tcp://{f} and unix://{s}\n", .{ procedure, endpoint, local.slice() });
+    } else {
+        std.debug.print("responder {s} listening on tcp://{f}\n", .{ procedure, endpoint });
+    }
+
+    if (!spawnWorkerFor(token, rpcRegisterLoop, .{ token, endpoint, local })) {
         std.debug.print("failed to spawn register loop for responder {s}\n", .{procedure});
     }
 
@@ -4179,10 +4659,44 @@ fn responderLoop(token: *TopicToken, handler: ResponderHandlerFn, context: ?*any
 
         if (token.stopping()) return;
 
+        token.serve_mutex.lockUncancelable(io);
+        defer token.serve_mutex.unlock(io);
         serveRequest(procedure, &client, handler, context, &request_buf) catch |err| {
             // One bad client is not a reason to stop answering everyone else.
             if (err != error.Broken and err != error.TimedOut) {
                 std.debug.print("responder {s}: {t}\n", .{ procedure, err });
+            }
+        };
+    }
+}
+
+/// The Unix half of a responder. Owns the listener, so the path is unlinked when the
+/// procedure stops.
+fn localResponderLoop(
+    token: *TopicToken,
+    listener_in: LocalListener,
+    handler: ResponderHandlerFn,
+    context: ?*anyopaque,
+) void {
+    var listener = listener_in;
+    defer listener.close();
+    if (!trackLocalListenerFor(token, listener.server.socket, listener.path)) return;
+    defer untrackSocketFor(token, listener.server.socket);
+
+    var request_buf: std.ArrayList(u8) = .empty;
+    defer request_buf.deinit(allocator);
+
+    while (!token.stopping()) {
+        var client = acceptLocal(token, &listener.server) orelse return;
+        defer client.close(io);
+        if (token.stopping()) return;
+        widenBuffers(client.socket.handle);
+
+        token.serve_mutex.lockUncancelable(io);
+        defer token.serve_mutex.unlock(io);
+        serveRequest(token.topic, &client, handler, context, &request_buf) catch |err| {
+            if (err != error.Broken and err != error.TimedOut) {
+                std.debug.print("responder {s}: {t}\n", .{ token.topic, err });
             }
         };
     }
@@ -4253,19 +4767,26 @@ pub fn removeResponder(procedure: []const u8) bool {
 
 // ---------------------------------------------------------------- requester side
 
-fn resolveProcedure(procedure: []const u8) ?net.IpAddress {
+fn resolveProcedure(procedure: []const u8) ?Resolved {
     var cmd_buf: [320]u8 = undefined;
     const command = std.fmt.bufPrint(&cmd_buf, "rpc-find {s}", .{procedure}) catch return null;
-    var reply_buf: [256]u8 = undefined;
+    var reply_buf: [512]u8 = undefined;
     const reply = registryCommand(command, &reply_buf) catch return null;
 
+    // The TCP endpoint first, then a `unix://` line when the responder is on this host.
+    var endpoint: ?net.IpAddress = null;
+    var local: LocalPath = .{};
     var lines = std.mem.splitScalar(u8, reply, '\n');
     while (lines.next()) |line| {
         const text = std.mem.trim(u8, line, " \t\r");
         if (text.len == 0 or text[0] == '#') continue;
-        return parseTcpUri(text) catch return null;
+        if (parseUnixUri(text)) |path| {
+            local = path;
+        } else if (endpoint == null) {
+            endpoint = parseTcpUri(text) catch return null;
+        }
     }
-    return null;
+    return .{ .endpoint = endpoint orelse return null, .local = local };
 }
 
 /// One request, start to finish, on the calling thread.
@@ -4284,9 +4805,10 @@ pub fn requestRun(
     if (payload.len > maxFrameBytes()) return .too_large;
 
     const deadline = deadlineFrom(timeout_ms);
-    const endpoint = resolveProcedure(procedure) orelse return .no_procedure;
+    const resolved = resolveProcedure(procedure) orelse return .no_procedure;
 
-    var stream = endpoint.connect(io, .{ .mode = .stream }) catch return .unreachable_host;
+    const dialed = dial(&resolved) catch return .unreachable_host;
+    var stream = dialed.stream;
     defer stream.close(io);
 
     // Tracked so a shutdown mid-request does not hold the caller until the peer answers.
@@ -4651,19 +5173,19 @@ test "the directory epoch counts material changes and ignores refresh heartbeats
     const before = directory_epoch.load(.monotonic);
 
     // A topic appearing is a change.
-    try registerTopic("epoch/one", first, node_id, .topic);
+    try registerTopic("epoch/one", first, node_id, .topic, .{});
     const after_insert = directory_epoch.load(.monotonic);
     try testing.expect(after_insert > before);
 
     // Refreshing it is not. This is the heartbeat every publisher sends every couple of
     // seconds, and it must be free.
-    try registerTopic("epoch/one", first, node_id, .topic);
-    try registerTopic("epoch/one", first, node_id, .topic);
+    try registerTopic("epoch/one", first, node_id, .topic, .{});
+    try registerTopic("epoch/one", first, node_id, .topic, .{});
     try testing.expectEqual(after_insert, directory_epoch.load(.monotonic));
 
     // The endpoint moving is a change: a standby holding the old address would hand
     // subscribers somewhere nothing is listening.
-    try registerTopic("epoch/one", moved, node_id, .topic);
+    try registerTopic("epoch/one", moved, node_id, .topic, .{});
     const after_move = directory_epoch.load(.monotonic);
     try testing.expect(after_move > after_insert);
 

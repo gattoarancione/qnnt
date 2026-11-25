@@ -103,6 +103,24 @@ uint8_t qnnt_lock_memory(void);
  */
 qnnt_status qnnt_set_handler_stack_bytes(size_t bytes);
 size_t qnnt_handler_stack_bytes(void);
+
+/*
+ * Same-host traffic over Unix domain sockets, everything else over TCP. On by default; call
+ * before qnnt_init. Same as QNNT_LOCAL_SOCKETS.
+ *
+ * Every publisher and responder listens on both, and a subscriber or requester on the same
+ * host uses the Unix socket, falling back to TCP if it cannot connect -- another user's node,
+ * a container without the shared directory, an older node on either end. Remote peers always
+ * use TCP; the socket path is never federated.
+ *
+ * qnnt_set_socket_dir chooses the directory (default /tmp/qnnt-<uid>, NULL or "" restores
+ * it). It must be absolute and at most 64 bytes. It is created 0700, and if it exists it
+ * must be a real directory owned by this user, or local sockets are turned off for the run
+ * with a notice on stderr.
+ */
+qnnt_status qnnt_set_local_sockets(uint8_t enabled);
+uint8_t qnnt_local_sockets(void);
+qnnt_status qnnt_set_socket_dir(const char *path);
 uint16_t    qnnt_registry_port(void);
 
 /* This node's identity as 32 hex characters plus a NUL: `cap` must be >= 33. Copied out,

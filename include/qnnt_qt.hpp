@@ -231,6 +231,10 @@ public:
     bool setLockMemory(bool enabled);
     /// Stack for per-connection and per-request threads; 0 is the default. See qnnt.h.
     bool setHandlerStackBytes(size_t bytes);
+    /// Same-host traffic over Unix sockets, remote over TCP; on by default. See qnnt.h.
+    bool setLocalSockets(bool enabled);
+    /// Where those sockets go; empty restores /tmp/qnnt-<uid>.
+    bool setSocketDir(const QString& path);
     /// Size the poll queue before the first subscription. Optional.
     bool reserveQueue(int capacity);
     /// Apply every QNNT_* environment variable, so a Qt program configures like the others.
@@ -637,6 +641,14 @@ inline bool QnntNode::setLockMemory(bool enabled) {
 
 inline bool QnntNode::setHandlerStackBytes(size_t bytes) {
     return check(qnnt_set_handler_stack_bytes(bytes), QStringLiteral("setHandlerStackBytes"));
+}
+
+inline bool QnntNode::setLocalSockets(bool enabled) {
+    return check(qnnt_set_local_sockets(enabled ? 1 : 0), QStringLiteral("setLocalSockets"));
+}
+
+inline bool QnntNode::setSocketDir(const QString& path) {
+    return check(qnnt_set_socket_dir(path.toUtf8().constData()), QStringLiteral("setSocketDir"));
 }
 
 inline bool QnntNode::reserveQueue(int capacity) {

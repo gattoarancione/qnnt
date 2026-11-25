@@ -115,6 +115,19 @@ This is the gap that most deserves closing in the library, and the one a tunnel 
 least well: a tunnel grants *host*-level access, so any host inside it can subscribe to any
 topic. It cannot express "this node may read sensors/* but not control/*".
 
+Same-host traffic is the one part of this plane with an access check. A publisher also
+listens on a Unix socket in /tmp/qnnt-<uid> (QNNT_SOCKET_DIR), and subscribers on the host
+use it. The directory is created 0700; an existing one must be a real directory -- not a
+symlink -- owned by the user, or local sockets are switched off for the run with a notice,
+because otherwise another user could put their own socket where a publisher's should be.
+So on one host, only processes of the same user reach a topic through the socket.
+
+That is a narrower guarantee than it sounds. The TCP endpoint is still open, so another
+local user, or anyone the TCP socket is reachable from, subscribes over TCP instead: the
+fallback exists so that such a node keeps working, not to keep it out. What the socket adds
+is that same-user traffic no longer needs the TCP port at all -- which, with local sockets
+on and federation off, still binds loopback.
+
 
 5. node identity is asserted, not proven
 ----------------------------------------

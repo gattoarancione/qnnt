@@ -193,6 +193,8 @@ class Node:
         realtime_priority: int | None = None,
         lock_memory: bool = False,
         handler_stack_bytes: int | None = None,
+        local_sockets: bool | None = None,
+        socket_dir: str | None = None,
         queue_capacity: int = 4096,
         handle_signals: bool = False,
     ) -> None:
@@ -231,6 +233,13 @@ class Node:
             # 0 restores the default; below 128 KiB is refused. See qnnt.h.
             _check(self._lib, self._lib.qnnt_set_handler_stack_bytes(handler_stack_bytes),
                    f"set_handler_stack_bytes({handler_stack_bytes})")
+        if local_sockets is not None:
+            # Same-host traffic over Unix sockets, remote over TCP; on by default. See qnnt.h.
+            _check(self._lib, self._lib.qnnt_set_local_sockets(1 if local_sockets else 0),
+                   f"set_local_sockets({local_sockets})")
+        if socket_dir is not None:
+            _check(self._lib, self._lib.qnnt_set_socket_dir(socket_dir.encode()),
+                   f"set_socket_dir({socket_dir!r})")
         if advertise_addr:
             _check(self._lib, self._lib.qnnt_set_advertise_address(advertise_addr.encode()),
                    "set_advertise_address")

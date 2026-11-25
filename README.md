@@ -114,6 +114,7 @@ zig build cat -- test/topic-a   # read it
 | **Directory** | `topic -> endpoint`, plus origin, version, subscriber counts. Refreshed by publishers every 2 s; entries expire when refreshes stop. |
 | **Topic** | A `/`-separated name. No hierarchy is enforced; the separator is a convention the tools and globs understand. |
 | **Direct data plane** | Subscribers dial publishers. The registry never carries a message. |
+| **Local sockets** | On one host, subscribers reach publishers over a Unix socket; between hosts, over TCP. A failed socket falls back to TCP. |
 | **Procedure** | A name in the same directory, marked as request/reply rather than a stream. One connection per call; a requester dials the responder directly, as a subscriber dials a publisher. |
 | **Federation** | Registries exchange directories over port 2223, gated by `QNNT_CLUSTER_KEY`. Entries carry their origin and version so merges converge without a coordinator. |
 | **Warm standby** | Every node keeps a mirrored copy of the directory, so registry takeover is ~0.2 s instead of a rebuild. |
@@ -235,6 +236,8 @@ All optional, all read by `configureFromEnvironment()` — an explicit call, nev
 | `QNNT_LOCK_MEMORY` | `1` to pin pages with `mlockall` (Linux) |
 | `QNNT_MAX_FRAME_BYTES` | Largest TLD frame published or accepted (default 16 MiB) |
 | `QNNT_HANDLER_STACK_BYTES` | Stack for per-connection and per-request threads (default 16 MiB; at least 128 KiB, rounded up to a page). For small targets |
+| `QNNT_LOCAL_SOCKETS` | `1` (default) or `0` — same-host traffic over Unix sockets, remote over TCP |
+| `QNNT_SOCKET_DIR` | Where those sockets go (default `/tmp/qnnt-<uid>`, created `0700`) |
 
 ## Network topologies
 

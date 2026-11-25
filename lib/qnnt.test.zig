@@ -1359,3 +1359,279 @@ test "a completing request wakes a caller parked in poll" {
     try testing.expectEqual(@as(usize, 1), replies.len);
     try testing.expectEqual(id, replies[0].id);
 }
+
+// -- local sockets ------------------------------------------------------------------------
+
+/// What each side of one topic named as its peer: "unix" over a Unix socket, an address over
+/// TCP. The publisher and the subscriber are the same process here, so both events land in
+/// one handler.
+const PeerLog = struct {
+    var topic_buf: [48]u8 = undefined;
+    var topic_len: usize = 0;
+    var seen_by_subscriber: [96]u8 = undefined;
+    var subscriber_len = std.atomic.Value(usize).init(0);
+    var seen_by_publisher: [96]u8 = undefined;
+    var publisher_len = std.atomic.Value(usize).init(0);
+    var messages = std.atomic.Value(usize).init(0);
+
+    fn watch(topic: []const u8) void {
+        @memcpy(topic_buf[0..topic.len], topic);
+        topic_len = topic.len;
+        subscriber_len.store(0, .monotonic);
+        publisher_len.store(0, .monotonic);
+        messages.store(0, .monotonic);
+    }
+
+    fn record(event: qnnt.Event, topic: []const u8, peer: []const u8, _: usize, _: ?*anyopaque) void {
+        if (!std.mem.eql(u8, topic, topic_buf[0..topic_len])) return;
+        switch (event) {
+            .publisher_connected => store(&seen_by_subscriber, &subscriber_len, peer),
+            .subscriber_connected => store(&seen_by_publisher, &publisher_len, peer),
+            else => {},
+        }
+    }
+
+    fn store(buf: *[96]u8, len: *std.atomic.Value(usize), peer: []const u8) void {
+        const n = @min(peer.len, buf.len);
+        @memcpy(buf[0..n], peer[0..n]);
+        len.store(n, .release);
+    }
+
+    fn onMessage(_: []const u8, _: []const u8, _: ?*anyopaque) void {
+        _ = messages.fetchAdd(1, .monotonic);
+    }
+
+    /// Both ends attached and at least one message through.
+    fn waitConnected(timeout_ms: usize) bool {
+        var waited: usize = 0;
+        while (waited < timeout_ms) : (waited += 20) {
+            if (subscriber_len.load(.acquire) > 0 and publisher_len.load(.acquire) > 0 and
+                messages.load(.monotonic) > 0) return true;
+            qnnt.sleepMs(20);
+        }
+        return false;
+    }
+
+    fn subscriberSaw() []const u8 {
+        return seen_by_subscriber[0..subscriber_len.load(.acquire)];
+    }
+
+    fn publisherSaw() []const u8 {
+        return seen_by_publisher[0..publisher_len.load(.acquire)];
+    }
+};
+
+test "a subscriber on this host is served over the Unix socket" {
+    try startNode();
+    defer qnnt.deinit();
+    try testing.expect(qnnt.socketDir().len > 0);
+
+    PeerLog.watch("test/local/unix");
+    qnnt.setEventHandler(PeerLog.record, null);
+    defer qnnt.setEventHandler(null, null);
+
+    try testing.expect(qnnt.runPublisher("test/local/unix", source, 10_000, null));
+    try testing.expect(qnnt.subscribe("test/local/unix", PeerLog.onMessage, null));
+    try testing.expect(PeerLog.waitConnected(5000));
+
+    try testing.expectEqualStrings("unix", PeerLog.subscriberSaw());
+    try testing.expectEqualStrings("unix", PeerLog.publisherSaw());
+}
+
+test "with local sockets off, a subscriber on this host uses TCP" {
+    // The path every remote subscriber takes, so it has to keep working locally too: with
+    // local sockets on by default, nothing else in this file goes over TCP any more.
+    try testing.expect(qnnt.setLocalSockets(false));
+    defer _ = qnnt.setLocalSockets(true);
+    try startNode();
+    defer qnnt.deinit();
+    try testing.expectEqualStrings("", qnnt.socketDir());
+
+    PeerLog.watch("test/local/tcp");
+    qnnt.setEventHandler(PeerLog.record, null);
+    defer qnnt.setEventHandler(null, null);
+
+    try testing.expect(qnnt.runPublisher("test/local/tcp", source, 10_000, null));
+    try testing.expect(qnnt.subscribe("test/local/tcp", PeerLog.onMessage, null));
+    try testing.expect(PeerLog.waitConnected(5000));
+
+    try testing.expect(std.mem.startsWith(u8, PeerLog.subscriberSaw(), "127.0.0.1:"));
+    try testing.expect(std.mem.startsWith(u8, PeerLog.publisherSaw(), "127.0.0.1:"));
+
+    // And refused while running, like every other pre-start knob.
+    try testing.expect(!qnnt.setLocalSockets(true));
+}
+
+/// The `unix://` line the registry hands out for `topic`, once the publisher has registered.
+fn waitForLocalPath(topic: []const u8, out: []u8, timeout_ms: usize) ![]const u8 {
+    var cmd: [128]u8 = undefined;
+    const command = try std.fmt.bufPrint(&cmd, "sub {s}", .{topic});
+    var reply: [512]u8 = undefined;
+    var waited: usize = 0;
+    while (waited < timeout_ms) : (waited += 25) {
+        const text = qnnt.registryCommand(command, &reply) catch "";
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (std.mem.startsWith(u8, line, "unix://")) {
+                const path = std.mem.trimEnd(u8, line["unix://".len..], "\r");
+                @memcpy(out[0..path.len], path);
+                return out[0..path.len];
+            }
+        }
+        qnnt.sleepMs(25);
+    }
+    return error.NoLocalPath;
+}
+
+test "a socket path that no longer answers falls back to TCP" {
+    // What a subscriber meets when the publisher's socket file is gone -- a cleaned /tmp,
+    // or a container that shares the network but not the filesystem. It must still connect.
+    try startNode();
+    defer qnnt.deinit();
+
+    PeerLog.watch("test/local/gone");
+    qnnt.setEventHandler(PeerLog.record, null);
+    defer qnnt.setEventHandler(null, null);
+
+    try testing.expect(qnnt.runPublisher("test/local/gone", source, 10_000, null));
+    var path_buf: [128]u8 = undefined;
+    const path = try waitForLocalPath("test/local/gone", &path_buf, 3000);
+    var zbuf: [129]u8 = undefined;
+    @memcpy(zbuf[0..path.len], path);
+    zbuf[path.len] = 0;
+    try testing.expectEqual(@as(c_int, 0), std.c.unlink(zbuf[0..path.len :0]));
+
+    try testing.expect(qnnt.subscribe("test/local/gone", PeerLog.onMessage, null));
+    try testing.expect(PeerLog.waitConnected(5000));
+    try testing.expect(std.mem.startsWith(u8, PeerLog.subscriberSaw(), "127.0.0.1:"));
+}
+
+test "a request goes over TCP when local sockets are off" {
+    try testing.expect(qnnt.setLocalSockets(false));
+    defer _ = qnnt.setLocalSockets(true);
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expect(qnnt.addResponder("test/local/rpc", &echoHandler, null));
+    try waitForProcedure("test/local/rpc", 3000);
+
+    var out: [64]u8 = undefined;
+    var len: usize = 0;
+    try testing.expectEqual(qnnt.RpcStatus.ok, qnnt.request("test/local/rpc", "over tcp", 2000, &out, &len));
+    try testing.expectEqualStrings("over tcp", out[0..len]);
+}
+
+test "the registry hands out a path only for a registration that carried one" {
+    try startNode();
+    defer qnnt.deinit();
+
+    var reply: [512]u8 = undefined;
+    _ = try qnnt.registryCommand("pub test/local/p1 tcp://127.0.0.1:5001 unix:///tmp/somewhere.sock", &reply);
+    var text = try qnnt.registryCommand("sub test/local/p1", &reply);
+    try testing.expect(std.mem.indexOf(u8, text, "tcp://127.0.0.1:5001\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "unix:///tmp/somewhere.sock\n") != null);
+
+    // An older publisher, registering TCP alone: no path, exactly as before.
+    _ = try qnnt.registryCommand("pub test/local/p2 tcp://127.0.0.1:5002", &reply);
+    text = try qnnt.registryCommand("sub test/local/p2", &reply);
+    try testing.expect(std.mem.indexOf(u8, text, "tcp://127.0.0.1:5002\n") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "unix://") == null);
+
+    // A path that is not absolute is ignored rather than handed to subscribers.
+    _ = try qnnt.registryCommand("pub test/local/p3 tcp://127.0.0.1:5003 unix://relative.sock", &reply);
+    text = try qnnt.registryCommand("sub test/local/p3", &reply);
+    try testing.expect(std.mem.indexOf(u8, text, "unix://") == null);
+}
+
+/// A socket file with nothing listening on it: what a node that died leaves behind.
+fn leaveStaleSocket(path: [:0]const u8, keep_listening: bool) !std.c.fd_t {
+    const fd = std.c.socket(std.c.AF.UNIX, std.c.SOCK.STREAM, 0);
+    if (fd < 0) return error.NoSocket;
+    var addr = std.mem.zeroes(std.c.sockaddr.un);
+    if (@hasField(std.c.sockaddr.un, "len")) addr.len = @sizeOf(std.c.sockaddr.un);
+    addr.family = std.c.AF.UNIX;
+    @memcpy(addr.path[0..path.len], path);
+    if (std.c.bind(fd, @ptrCast(&addr), @sizeOf(std.c.sockaddr.un)) != 0) return error.BindFailed;
+    if (keep_listening) {
+        if (std.c.listen(fd, 4) != 0) return error.ListenFailed;
+        return fd;
+    }
+    _ = std.c.close(fd);
+    return -1;
+}
+
+fn exists(path: [:0]const u8) bool {
+    var dir = std.Io.Dir.cwd();
+    _ = &dir;
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY });
+    if (fd >= 0) {
+        _ = std.c.close(fd);
+        return true;
+    }
+    // A socket cannot be opened, but the error says whether it is there.
+    return std.posix.errno(fd) != .NOENT;
+}
+
+test "a dead node's socket file is swept at start, and a live one is left alone" {
+    var dir_buf: [64]u8 = undefined;
+    const dir = try std.fmt.bufPrintZ(&dir_buf, "/tmp/qnnt-sweep-{d}", .{std.c.getpid()});
+    _ = std.c.mkdir(dir, 0o700);
+    defer _ = std.c.rmdir(dir);
+
+    var dead_buf: [96]u8 = undefined;
+    const dead = try std.fmt.bufPrintZ(&dead_buf, "{s}/0000000000000000-0.sock", .{dir});
+    var live_buf: [96]u8 = undefined;
+    const live = try std.fmt.bufPrintZ(&live_buf, "{s}/0000000000000000-1.sock", .{dir});
+    defer _ = std.c.unlink(dead);
+    defer _ = std.c.unlink(live);
+
+    _ = try leaveStaleSocket(dead, false);
+    const live_fd = try leaveStaleSocket(live, true);
+    defer _ = std.c.close(live_fd);
+    try testing.expect(exists(dead) and exists(live));
+
+    try testing.expect(qnnt.setSocketDir(dir));
+    defer _ = qnnt.setSocketDir("");
+    try startNode();
+    defer qnnt.deinit();
+
+    try testing.expectEqualStrings(dir, qnnt.socketDir());
+    try testing.expect(!exists(dead));
+    try testing.expect(exists(live));
+}
+
+test "a socket directory that could be someone else's turns local sockets off" {
+    var real_buf: [64]u8 = undefined;
+    const real = try std.fmt.bufPrintZ(&real_buf, "/tmp/qnnt-real-{d}", .{std.c.getpid()});
+    var link_buf: [64]u8 = undefined;
+    const link = try std.fmt.bufPrintZ(&link_buf, "/tmp/qnnt-link-{d}", .{std.c.getpid()});
+    _ = std.c.mkdir(real, 0o700);
+    defer _ = std.c.rmdir(real);
+    _ = std.c.unlink(link);
+    try testing.expectEqual(@as(c_int, 0), std.c.symlink(real, link));
+    defer _ = std.c.unlink(link);
+
+    // A symlink is refused even when it points somewhere fine: whoever made the link
+    // decides where the sockets go, and that need not be this user.
+    try testing.expect(qnnt.setSocketDir(link));
+    defer _ = qnnt.setSocketDir("");
+    try startNode();
+    try testing.expectEqualStrings("", qnnt.socketDir());
+    qnnt.deinit();
+
+    // A real directory of ours that others could write to is tightened, then used.
+    _ = std.c.chmod(real, 0o777);
+    try testing.expect(qnnt.setSocketDir(real));
+    try startNode();
+    defer qnnt.deinit();
+    try testing.expectEqualStrings(real, qnnt.socketDir());
+}
+
+test "the socket directory must be absolute and short enough for the names under it" {
+    defer _ = qnnt.setSocketDir("");
+    try testing.expect(!qnnt.setSocketDir("relative/dir"));
+    try testing.expect(!qnnt.setSocketDir("/"));
+    try testing.expect(!qnnt.setSocketDir("/" ++ "x" ** 64));
+    try testing.expect(qnnt.setSocketDir("/tmp/somewhere/"));
+    try testing.expect(qnnt.setSocketDir(""));
+}

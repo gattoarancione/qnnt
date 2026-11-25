@@ -27,6 +27,8 @@
 //!   QNNT_MAX_FRAME_BYTES   largest TLD frame published or accepted (default 16 MiB)
 //!   QNNT_HANDLER_STACK_BYTES  stack for per-connection/per-request threads (default:
 //!                          std.Thread's 16 MiB; at least 128 KiB, rounded up to a page)
+//!   QNNT_LOCAL_SOCKETS     1 (default) or 0: same-host traffic over Unix sockets
+//!   QNNT_SOCKET_DIR        where those sockets go (default /tmp/qnnt-<uid>)
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -139,6 +141,16 @@ pub fn configureFromEnvironment() void {
         if (std.fmt.parseInt(usize, text, 10)) |value| {
             if (!qnnt.setHandlerStackBytesFn(value)) reject("QNNT_HANDLER_STACK_BYTES", text);
         } else |_| reject("QNNT_HANDLER_STACK_BYTES", text);
+    }
+
+    if (get("QNNT_LOCAL_SOCKETS")) |text| {
+        if (parseBool(text)) |on| {
+            _ = qnnt.setLocalSocketsFn(on);
+        } else reject("QNNT_LOCAL_SOCKETS", text);
+    }
+
+    if (get("QNNT_SOCKET_DIR")) |text| {
+        if (!qnnt.setSocketDirFn(text)) reject("QNNT_SOCKET_DIR", text);
     }
 
     if (get("QNNT_REGISTRY_PORT")) |text| {

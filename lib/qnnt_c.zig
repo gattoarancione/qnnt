@@ -183,6 +183,21 @@ export fn qnnt_handler_stack_bytes() callconv(.c) usize {
     return qnnt.handlerStackBytesFn();
 }
 
+/// Same-host traffic over Unix sockets, remote over TCP. On by default. Before qnnt_init.
+export fn qnnt_set_local_sockets(enabled: u8) callconv(.c) Status {
+    return if (qnnt.setLocalSocketsFn(enabled != 0)) .ok else .failed;
+}
+
+export fn qnnt_local_sockets() callconv(.c) u8 {
+    return if (qnnt.localSocketsFn()) 1 else 0;
+}
+
+/// Where the Unix sockets go; NULL or "" restores /tmp/qnnt-<uid>. Before qnnt_init.
+export fn qnnt_set_socket_dir(path: ?[*:0]const u8) callconv(.c) Status {
+    const text = if (path) |p| std.mem.span(p) else "";
+    return if (qnnt.setSocketDirFn(text)) .ok else .failed;
+}
+
 /// The address remote subscribers should dial. Optional: leave it unset and observers
 /// fill it in from the connection they reached this host on, which is what lets a node
 /// behind a gateway work without knowing its own public address.

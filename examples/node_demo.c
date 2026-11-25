@@ -99,6 +99,13 @@ int main(void) {
         return 1;
     }
 
+    /* Local sockets are on by default; a relative directory is refused, not created
+     * somewhere surprising. */
+    if (!qnnt_local_sockets() || qnnt_set_socket_dir("relative/dir") == QNNT_OK) {
+        printf("FAIL: local socket defaults\n");
+        return 1;
+    }
+
     CHECK(qnnt_init());
     printf("registry port %u\n", qnnt_registry_port());
     if (qnnt_set_handler_stack_bytes(0) == QNNT_OK) {

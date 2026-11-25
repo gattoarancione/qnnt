@@ -60,6 +60,11 @@ int main(int argc, char** argv) {
 
     node->setRegistryPort(22450);
     // Small handler stacks, so the demo's registry connections are served on them.
+    // Explicitly on (it is the default): same-host traffic over a Unix socket.
+    if (!node->setLocalSockets(true)) {
+        qCritical() << "setLocalSockets refused";
+        return 1;
+    }
     if (!node->setHandlerStackBytes(256 * 1024)) {
         qCritical() << "setHandlerStackBytes refused";
         return 1;
