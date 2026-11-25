@@ -4043,7 +4043,10 @@ fn subscribeFramesLoop(token: *TopicToken, handler: Qnnt.FrameHandler, context: 
         subMark(topic, true);
         emitEvent(.publisher_connected, topic, peer, 0);
 
-        var rbuf: [4096]u8 = undefined;
+        // 64 KiB, not 4: a smaller buffer means a read syscall per few KiB, and over a Unix
+        // socket on macOS that was the bottleneck -- 1 KiB frames went from 1.88 to 2.41 GB/s
+        // with this, and TCP did not move. Measured unchanged on Linux.
+        var rbuf: [64 * 1024]u8 = undefined;
         var reader = stream.reader(io, &rbuf);
         while (true) {
             const frame = Tld.readFrame(&reader.interface, allocator, &frame_buf, maxFrameBytes()) catch |err| {
