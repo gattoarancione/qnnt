@@ -1635,3 +1635,134 @@ test "the socket directory must be absolute and short enough for the names under
     try testing.expect(qnnt.setSocketDir("/tmp/somewhere/"));
     try testing.expect(qnnt.setSocketDir(""));
 }
+
+// -- coalescing ---------------------------------------------------------------------------
+
+/// A numbered line per call, so a subscriber can tell a gap, a repeat or a swap from the
+/// numbers alone. Text topic: lines delimit themselves, batched or not.
+const Counted = struct {
+    var next: u64 = 0;
+    var line: [32]u8 = undefined;
+    var first = std.atomic.Value(u64).init(0);
+    var last = std.atomic.Value(u64).init(0);
+    var received = std.atomic.Value(u64).init(0);
+    var out_of_order = std.atomic.Value(u64).init(0);
+    /// For a stream of an exact length: nothing until armed, then `limit` messages.
+    var gated = false;
+    var armed = std.atomic.Value(bool).init(false);
+    var limit: u64 = 0;
+
+    fn reset() void {
+        next = 0;
+        gated = false;
+        armed.store(false, .monotonic);
+        limit = 0;
+        first.store(0, .monotonic);
+        last.store(0, .monotonic);
+        received.store(0, .monotonic);
+        out_of_order.store(0, .monotonic);
+    }
+
+    fn source(_: []const u8, _: ?*anyopaque) ?[]const u8 {
+        if (gated and !armed.load(.acquire)) return null;
+        if (limit != 0 and next >= limit) return null;
+        next += 1;
+        return std.fmt.bufPrint(&line, "{d}\n", .{next}) catch null;
+    }
+
+    fn sink(_: []const u8, msg: []const u8, _: ?*anyopaque) void {
+        const n = std.fmt.parseInt(u64, std.mem.trimEnd(u8, msg, "\n"), 10) catch {
+            _ = out_of_order.fetchAdd(1, .monotonic);
+            return;
+        };
+        // The subscriber joins mid-stream, so it starts wherever it lands; from there every
+        // number must follow the one before it.
+        if (first.load(.monotonic) == 0) first.store(n, .monotonic) else if (n != last.load(.monotonic) + 1) _ = out_of_order.fetchAdd(1, .monotonic);
+        last.store(n, .monotonic);
+        _ = received.fetchAdd(1, .monotonic);
+    }
+
+    fn waitFor(count: u64, timeout_ms: usize) bool {
+        var waited: usize = 0;
+        while (waited < timeout_ms) : (waited += 10) {
+            if (received.load(.monotonic) >= count) return true;
+            qnnt.sleepMs(10);
+        }
+        return false;
+    }
+};
+
+fn coalescedStreamIsWhole(topic: []const u8) !void {
+    Counted.reset();
+    try testing.expect(qnnt.runPublisher(topic, Counted.source, 0, null)); // unpaced
+    try testing.expect(qnnt.subscribe(topic, Counted.sink, null));
+    try testing.expect(Counted.waitFor(20_000, 10_000));
+    try testing.expectEqual(@as(u64, 0), Counted.out_of_order.load(.monotonic));
+}
+
+test "coalesced messages arrive whole, once each and in order" {
+    // Unpaced, so batches fill to their limit: the shape most likely to split or merge a
+    // message at a batch boundary.
+    try startNode();
+    defer qnnt.deinit();
+    try testing.expect(qnnt.coalesce());
+    try coalescedStreamIsWhole("test/coalesce/on");
+    // A pre-start knob, refused while running.
+    try testing.expect(!qnnt.setCoalesce(false));
+}
+
+test "with coalescing off the stream is just as whole" {
+    try testing.expect(qnnt.setCoalesce(false));
+    defer _ = qnnt.setCoalesce(true);
+    try startNode();
+    defer qnnt.deinit();
+    try coalescedStreamIsWhole("test/coalesce/off");
+}
+
+test "a paced publisher is never held back waiting for a batch to fill" {
+    // Ten messages a second against a batch of 32: were the flush-before-sleep missing, the
+    // first message would wait over three seconds for 31 more.
+    try startNode();
+    defer qnnt.deinit();
+    Counted.reset();
+    try testing.expect(qnnt.runPublisher("test/coalesce/paced", Counted.source, 100_000, null));
+    try testing.expect(qnnt.subscribe("test/coalesce/paced", Counted.sink, null));
+    try testing.expect(Counted.waitFor(1, 5000));
+    const at_first = Counted.received.load(.monotonic);
+    qnnt.sleepMs(650);
+    try testing.expect(Counted.received.load(.monotonic) >= at_first + 4);
+}
+
+test "the registry counts coalesced messages, not the writes that carried them" {
+    // Exactly 10,000 messages, all sent once the subscriber is attached, so the publisher's
+    // count for it must be exactly that. Counting writes would report about 313.
+    try startNode();
+    defer qnnt.deinit();
+    Counted.reset();
+    Counted.gated = true;
+    Counted.limit = 10_000;
+    try testing.expect(qnnt.runPublisher("test/coalesce/count", Counted.source, 0, null));
+    try testing.expect(qnnt.subscribe("test/coalesce/count", Counted.sink, null));
+    try testing.expect(qnnt.waitForSubscriber("test/coalesce/count", 5000));
+    Counted.armed.store(true, .release);
+    try testing.expect(Counted.waitFor(10_000, 10_000));
+
+    // The publisher reports every couple of seconds; wait for a report that has seen all of
+    // it, then read its msgs column.
+    var reply: [2048]u8 = undefined;
+    var msgs: u64 = 0;
+    var waited: usize = 0;
+    while (waited < 8000 and msgs < 10_000) : (waited += 250) {
+        qnnt.sleepMs(250);
+        const text = qnnt.registryCommand("subs test/coalesce/count", &reply) catch continue;
+        var lines = std.mem.splitScalar(u8, text, '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0 or line[0] == '#') continue;
+            var it = std.mem.tokenizeAny(u8, line, " \t\r");
+            var last_field: []const u8 = "";
+            while (it.next()) |f| last_field = f;
+            msgs = std.fmt.parseInt(u64, last_field, 10) catch 0;
+        }
+    }
+    try testing.expectEqual(@as(u64, 10_000), msgs);
+}

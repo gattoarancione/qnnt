@@ -238,6 +238,7 @@ All optional, all read by `configureFromEnvironment()` — an explicit call, nev
 | `QNNT_HANDLER_STACK_BYTES` | Stack for per-connection and per-request threads (default 16 MiB; at least 128 KiB, rounded up to a page). For small targets |
 | `QNNT_LOCAL_SOCKETS` | `1` (default) or `0` — same-host traffic over Unix sockets, remote over TCP |
 | `QNNT_SOCKET_DIR` | Where those sockets go (default `/tmp/qnnt-<uid>`, created `0700`) |
+| `QNNT_COALESCE` | `1` (default) or `0` — a scheduled publisher writes its small messages up to 32 at a time, flushed before it sleeps |
 
 ## Network topologies
 

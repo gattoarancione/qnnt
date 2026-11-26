@@ -1418,6 +1418,11 @@ pub const Qnnt = struct {
     pub const setSocketDir = &setSocketDirFn;
     pub const socketDir = &socketDirFn;
 
+    /// A scheduled publisher's small messages, written up to 32 at a time and flushed
+    /// before it sleeps; on by default. Before `run()`. See `publisherSchedule`.
+    pub const setCoalesce = &setCoalesceFn;
+    pub const coalesce = &coalesceFn;
+
     /// Stack for the threads that serve one connection or request and exit; see
     /// `spawnHandler`. 0 (the default) is std.Thread's 16 MiB. Before `run()`.
     pub const setHandlerStackBytes = &setHandlerStackBytesFn;
@@ -3257,7 +3262,14 @@ pub fn publishAll(topic: []const u8, data: []const u8) !void {
         );
         return error.FrameTooLarge;
     }
+    return deliver(topic, data, 1);
+}
 
+/// Write `data` -- `count` whole messages, back to back -- to every subscriber of `topic`.
+/// One write per subscriber however many messages it holds, which is what coalescing buys:
+/// a stream is self-delimiting (lines, or TLD frames carrying their own length), so the
+/// subscriber splits it exactly as if each had arrived alone.
+fn deliver(topic: []const u8, data: []const u8, count: u64) !void {
     // Peers whose write failed, reported after the lock is released.
     var lost: [8][64]u8 = undefined;
     var lost_len: [8]usize = @splat(0);
@@ -3301,7 +3313,7 @@ pub fn publishAll(topic: []const u8, data: []const u8) !void {
                     _ = list_ptr.swapRemove(idx);
                     continue;
                 };
-                list_ptr.items[idx].messages += 1;
+                list_ptr.items[idx].messages += count; // messages, not writes
             }
             remaining = list_ptr.items.len;
         } else {
@@ -3317,9 +3329,24 @@ pub fn publishAll(topic: []const u8, data: []const u8) !void {
 // Drive `source` at a fixed rate, publishing whatever it returns. Paced against an
 // absolute deadline rather than "sleep(period) after the work", so the callback's own
 // cost and wake-up jitter don't accumulate into drift. A period of 0 is unpaced.
+//
+// Small messages are coalesced: up to `coalesce_max_messages` of them, or
+// `coalesce_max_bytes`, go out in one write per subscriber, and the batch is always
+// flushed before the loop sleeps -- so a paced publisher delivers every message within its
+// own tick, exactly as before, and an unpaced one holds a message back only while its source
+// keeps producing -- for at most 31 more, since a source returning null flushes too. Why: a Unix socket gives every write its own kernel buffer and usually a wake-up
+// of the reader, where loopback TCP merges small writes (Nagle). On the i.MX8M Plus that
+// made the Unix socket 24-30% slower than TCP for 64 B-1 KiB frames; written 32 at a time
+// it ran 8.9x faster at 64 B. QNNT_COALESCE=0 turns it off.
 fn publisherSchedule(token: *TopicToken, source: Qnnt.SourceHandler, period_us: u64, context: ?*anyopaque) void {
     const topic = token.topic;
     var next_us: u64 = @intCast(nowMicrosFn());
+
+    var batch: std.ArrayList(u8) = .empty;
+    defer batch.deinit(allocator);
+    var batched: u64 = 0;
+    const coalesce = coalesce_enabled.load(.monotonic);
+    defer flushBatch(topic, &batch, &batched); // whatever is left when the topic stops
 
     while (!token.stopping()) {
         // Unpaced has no deadline to wait for, so it skips the clock read as well as
@@ -3329,6 +3356,7 @@ fn publisherSchedule(token: *TopicToken, source: Qnnt.SourceHandler, period_us: 
             const now_us: u64 = @intCast(nowMicrosFn());
 
             if (next_us > now_us) {
+                flushBatch(topic, &batch, &batched); // about to sleep: nothing waits past this tick
                 if (!sleepUsInterruptibleFor(token, next_us - now_us)) return;
             } else if (now_us - next_us >= period_us) {
                 // More than a full period behind (slow callback, scheduling hiccup):
@@ -3339,11 +3367,59 @@ fn publisherSchedule(token: *TopicToken, source: Qnnt.SourceHandler, period_us: 
         }
 
         if (source(topic, context)) |payload| {
-            publishAll(topic, payload) catch |err| {
-                std.debug.print("error publishing on {s}: {}\n", .{ topic, err });
+            // Large messages, and any the frame limit will refuse, go alone -- after the
+            // batch, so order holds. publishAll reports the refusal.
+            if (!coalesce or payload.len > coalesce_max_message or payload.len > maxFrameBytes()) {
+                flushBatch(topic, &batch, &batched);
+                publishAll(topic, payload) catch |err| {
+                    std.debug.print("error publishing on {s}: {}\n", .{ topic, err });
+                };
+                continue;
+            }
+            if (batch.items.len + payload.len > coalesce_max_bytes) flushBatch(topic, &batch, &batched);
+            // Copied: the source's slice is only promised until its next call.
+            batch.appendSlice(allocator, payload) catch {
+                flushBatch(topic, &batch, &batched);
+                publishAll(topic, payload) catch {};
+                continue;
             };
+            batched += 1;
+            if (batched >= coalesce_max_messages) flushBatch(topic, &batch, &batched);
+        } else {
+            // Nothing this time: the source is idle, so what is queued goes now. Unpaced, this
+            // is the only flush point short of a full batch -- without it a source that stops,
+            // or pauses, would strand its last few messages until the topic was removed.
+            flushBatch(topic, &batch, &batched);
         }
     }
+}
+
+const coalesce_max_messages = 32;
+const coalesce_max_bytes = 64 * 1024;
+/// Larger messages gain nothing from sharing a write and would only be copied for it.
+const coalesce_max_message = 16 * 1024;
+
+var coalesce_enabled = std.atomic.Value(bool).init(true);
+
+/// Coalescing of a scheduled publisher's small messages; on by default. Refused once the
+/// node runs, like the other pre-start knobs. See `publisherSchedule`.
+pub fn setCoalesceFn(enabled: bool) bool {
+    if (node_running) return false;
+    coalesce_enabled.store(enabled, .monotonic);
+    return true;
+}
+
+pub fn coalesceFn() bool {
+    return coalesce_enabled.load(.monotonic);
+}
+
+fn flushBatch(topic: []const u8, batch: *std.ArrayList(u8), batched: *u64) void {
+    if (batched.* == 0) return;
+    deliver(topic, batch.items, batched.*) catch |err| {
+        std.debug.print("error publishing on {s}: {}\n", .{ topic, err });
+    };
+    batch.clearRetainingCapacity();
+    batched.* = 0;
 }
 
 fn nodePublish(token: *TopicToken, source: ?Qnnt.SourceHandler, period_us: u64, context: ?*anyopaque) !void {
@@ -5142,6 +5218,18 @@ pub fn nodeDeinit() void {
 
     queueDeinit();
     repliesDeinit();
+
+    // The event queue too. It used to outlive the node: a stop left its connection events
+    // behind for the next run to drain, and once 64 had piled up a restarted node's own
+    // events were dropped -- found as a test that failed only when earlier tests happened to
+    // leave enough behind.
+    {
+        event_ring_mutex.lockUncancelable(io);
+        defer event_ring_mutex.unlock(io);
+        event_ring_head = 0;
+        event_ring_count = 0;
+        event_dropped.store(0, .monotonic);
+    }
 
     io_impl.deinit();
     node_running = false;
