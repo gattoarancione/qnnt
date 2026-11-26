@@ -1,7 +1,7 @@
 <p align="center">
   <img src="qnnt.png" alt="QNNT" width="384">
 </p>
-<p align="center"><b>QNNT NaNp Transport</b></p>
+<p align="center"><b>QNNT NaNo Transport</b></p>
 
 A pub/sub library for machines that have to talk to each other and to their own
 processes, without a broker. Zig core, with C, C++/Qt and Python on the same
