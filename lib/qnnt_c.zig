@@ -791,6 +791,13 @@ export fn qnnt_rpc_status_name(status: RpcStatus) callconv(.c) [*:0]const u8 {
 
 // ---------------------------------------------------------------- diagnostics
 
+/// qnnt's release version, e.g. "0.2.0". The wire format's is told_version().
+export fn qnnt_version() callconv(.c) [*:0]const u8 {
+    return version_z;
+}
+
+const version_z: [:0]const u8 = @import("build_options").version ++ "";
+
 export fn qnnt_status_name(status: Status) callconv(.c) [*:0]const u8 {
     return switch (status) {
         .ok => "ok",

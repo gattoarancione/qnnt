@@ -43,6 +43,11 @@ pub fn build(b: *Build) void {
     const told_include = told_dep.path("include");
     qnnt_lib_mod.addImport("told", told_dep.module("told"));
 
+    // qnnt's version, read from build.zig.zon so it is declared once.
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    qnnt_lib_mod.addOptions("build_options", build_options);
+
     // Glob matching and the '/'-segment tree, shared by the console tools so qnnt-ls and
     // qnnt-cat cannot disagree about what a pattern means -- what one lists must be what
     // the other subscribes to.
@@ -402,6 +407,7 @@ pub fn build(b: *Build) void {
     });
     qnnt_c_mod.addImport("told_abi", told_dep.module("told_abi"));
     qnnt_c_mod.addImport("told", told_dep.module("told"));
+    qnnt_c_mod.addOptions("build_options", build_options);
 
     var qnnt_c_static: *Build.Step.Compile = undefined;
     var qnnt_c_dynamic: *Build.Step.Compile = undefined;
@@ -868,6 +874,7 @@ pub fn build(b: *Build) void {
         // The library itself imports TOLD as a module, the way qnnt_lib_mod does.
         if (std.mem.startsWith(u8, src, "lib/")) {
             test_mod.addImport("told", told_dep.module("told"));
+            test_mod.addOptions("build_options", build_options);
         }
         // The tools under src/ reach the library through the `qnnt` module the way any
         // consumer does, so their tests need it wired up; the lib/ files are the library.

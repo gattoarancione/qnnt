@@ -10,6 +10,9 @@ const Stream = net.Stream;
 /// The TOLD binary framing (deps/told), re-exported so users get the encoder and decoder
 /// without a second import. See `subscribeFrames` for how it meets the pub/sub data path.
 pub const Told = @import("told");
+/// qnnt's release version, from build.zig.zon. Not the wire format's: that is
+/// `Told.version`, and the two move independently.
+pub const release_version: []const u8 = @import("build_options").version;
 /// 64-bit counters that also work on 32-bit CPUs; see atomic64.zig.
 pub const Atomic64 = @import("atomic64.zig");
 
@@ -1283,6 +1286,9 @@ fn staleSweepRun() void {
 
 
 pub const Qnnt = struct {
+    /// qnnt's release version, e.g. "0.2.0". The wire format's is `Told.version`.
+    pub const version = @import("qnnt.zig").release_version;
+
     // Every callback takes the `context` pointer given at registration and hands it
     // back untouched. Without it a callback can only reach module-level state, which
     // means one handler cannot serve two subscriptions, and no closure, C++ lambda or

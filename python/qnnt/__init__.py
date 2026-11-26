@@ -674,5 +674,14 @@ class Node:
 
 
 def version() -> str:
-    """The TOLD wire-format version this build speaks."""
+    """The TOLD wire-format version this build speaks. qnnt's own is `__version__`."""
     return told.version()
+
+
+def _library_version() -> str:
+    return declare(load()).qnnt_version().decode()
+
+
+# qnnt's release version, as the library it loaded reports it -- so it cannot drift from the
+# build, which reads it from build.zig.zon.
+__version__ = _library_version()

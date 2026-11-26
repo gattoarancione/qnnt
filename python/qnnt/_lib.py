@@ -145,6 +145,7 @@ def declare(lib: C.CDLL) -> C.CDLL:
     lib.qnnt_set_socket_dir.argtypes = [C.c_char_p]
     lib.qnnt_set_socket_dir.restype = C.c_int
     lib.qnnt_registry_port.argtypes, lib.qnnt_registry_port.restype = [], C.c_uint16
+    lib.qnnt_version.argtypes, lib.qnnt_version.restype = [], C.c_char_p
 
     for name in ("qnnt_set_advertise_address", "qnnt_set_bind_address", "qnnt_set_cluster_key"):
         fn = getattr(lib, name)

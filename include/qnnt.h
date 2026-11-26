@@ -42,6 +42,9 @@ typedef enum {
 
 const char *qnnt_status_name(qnnt_status status);
 
+/* qnnt's release version, e.g. "0.2.0". Not the wire format's: that is told_version(). */
+const char *qnnt_version(void);
+
 /* --- lifecycle --------------------------------------------------------------- */
 
 /* Choose the registry port used by the next qnnt_init. Returns QNNT_FAILED while a node is

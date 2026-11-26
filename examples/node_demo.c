@@ -108,6 +108,11 @@ int main(void) {
 
     CHECK(qnnt_init());
     printf("registry port %u\n", qnnt_registry_port());
+    printf("qnnt %s, wire format TOLD %s\n", qnnt_version(), told_version());
+    if (qnnt_version()[0] < '0' || qnnt_version()[0] > '9') {
+        printf("FAIL: qnnt_version() is not a version\n");
+        return 1;
+    }
     if (qnnt_set_handler_stack_bytes(0) == QNNT_OK) {
         printf("FAIL: the handler stack changed under a running node\n");
         return 1;

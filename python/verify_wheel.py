@@ -57,6 +57,18 @@ try:
     # registry role.
     env["QNNT_REGISTRY_PORT"] = "22303"
 
+    # pyproject.toml repeats the version build.zig.zon declares, because packaging needs a
+    # literal. The wheel's metadata and the library inside it must agree.
+    probe = subprocess.run(
+        [str(py), "-c", "import importlib.metadata as m, qnnt; print(m.version('qnnt'), qnnt.__version__)"],
+        cwd=tmp, env=env, capture_output=True, text=True,
+    )
+    packaged, built = (probe.stdout.split() + ["?", "?"])[:2]
+    print(f"version: wheel {packaged}, library {built}")
+    if probe.returncode != 0 or packaged != built:
+        print(probe.stderr.strip()[-2000:])
+        sys.exit("FAIL: python/pyproject.toml and build.zig.zon disagree on the version")
+
     result = subprocess.run([str(py), str(demo)], cwd=tmp, env=env,
                             capture_output=True, text=True)
     tail = result.stdout.strip().splitlines()[-6:]
