@@ -1,4 +1,4 @@
-//! TLD load generator. Publishes `test/bench` as TLD frames at a chosen rate and
+//! TOLD load generator. Publishes `test/bench` as TOLD frames at a chosen rate and
 //! payload size, for node-4 to measure.
 //!
 //!   zig build run-3 -- [period_us] [payload_bytes]      defaults: 1000 64
@@ -11,12 +11,12 @@
 //! Each frame carries a sequence number and the send timestamp, which is what lets
 //! node-4 report end-to-end latency and spot gaps. The payload is a repeating 0..255
 //! pattern, so it contains 0x0A and 0xFF on purpose: a benchmark that only moved
-//! plain text would not be exercising the thing TLD framing is for, and node-4
+//! plain text would not be exercising the thing TOLD framing is for, and node-4
 //! verifies the pattern byte-for-byte.
 
 const std = @import("std");
 const qnnt = @import("qnnt").Qnnt;
-const tld = @import("qnnt").Tld;
+const told = @import("qnnt").Told;
 
 const allocator = std.heap.page_allocator;
 
@@ -33,7 +33,7 @@ var seq: u64 = 0;
 
 fn benchSource(_: []const u8, _: ?*anyopaque) ?[]const u8 {
     frame.clearRetainingCapacity();
-    var enc = tld.Encoder.init(allocator, &frame);
+    var enc = told.Encoder.init(allocator, &frame);
 
     seq += 1;
 

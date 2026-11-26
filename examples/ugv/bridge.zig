@@ -44,7 +44,7 @@ const std = @import("std");
 const Io = std.Io;
 const qnnt_mod = @import("qnnt");
 const qnnt = qnnt_mod.Qnnt;
-const tld = qnnt_mod.Tld;
+const told = qnnt_mod.Told;
 const sio = @import("sio");
 const beast = @import("beast");
 const wire = @import("wire");
@@ -104,7 +104,7 @@ const CameraFrame = struct {
     seq: u64,
     t_us: u64,
     bytes: u32,
-    jpeg: tld.Bytes,
+    jpeg: told.Bytes,
 };
 
 /// Cycle a light. Not a level: the robot offers no absolute set for either of them, so this
@@ -330,10 +330,10 @@ var topic_status: []const u8 = "";
 /// Stores the setpoint and returns. Deliberately does no I/O: this runs on qnnt's
 /// subscriber thread, and an HTTP round trip here would stall delivery of the *next*
 /// command behind the robot's response to this one.
-fn onLights(topic: []const u8, frame: tld.Frame, context: ?*anyopaque) void {
+fn onLights(topic: []const u8, frame: told.Frame, context: ?*anyopaque) void {
     _ = topic;
     _ = context;
-    const cmd = tld.unpack(LightCommand, frame, null) catch |err| return reject("lights", err);
+    const cmd = told.unpack(LightCommand, frame, null) catch |err| return reject("lights", err);
     if (!cmd.base and !cmd.head) return;
 
     shared.mutex.lockUncancelable(qnnt_mod.io);
@@ -343,10 +343,10 @@ fn onLights(topic: []const u8, frame: tld.Frame, context: ?*anyopaque) void {
     if (cmd.head) shared.light_head = true;
 }
 
-fn onDrive(topic: []const u8, frame: tld.Frame, context: ?*anyopaque) void {
+fn onDrive(topic: []const u8, frame: told.Frame, context: ?*anyopaque) void {
     _ = topic;
     _ = context;
-    const cmd = tld.unpack(Drive, frame, null) catch |err| return reject("drive", err);
+    const cmd = told.unpack(Drive, frame, null) catch |err| return reject("drive", err);
     if (!std.math.isFinite(cmd.left) or !std.math.isFinite(cmd.right))
         return reject("drive", error.NotFinite);
 
@@ -362,10 +362,10 @@ fn onDrive(topic: []const u8, frame: tld.Frame, context: ?*anyopaque) void {
     shared.ever_driven = true;
 }
 
-fn onGimbal(topic: []const u8, frame: tld.Frame, context: ?*anyopaque) void {
+fn onGimbal(topic: []const u8, frame: told.Frame, context: ?*anyopaque) void {
     _ = topic;
     _ = context;
-    const cmd = tld.unpack(Gimbal, frame, null) catch |err| return reject("gimbal", err);
+    const cmd = told.unpack(Gimbal, frame, null) catch |err| return reject("gimbal", err);
     if (!std.math.isFinite(cmd.pan) or !std.math.isFinite(cmd.tilt))
         return reject("gimbal", error.NotFinite);
 
@@ -664,7 +664,7 @@ fn videoLoop(authority: []const u8) void {
                     .bytes = @intCast(jpeg.len),
                     .jpeg = .{ .data = jpeg },
                 };
-                tld.packTo(allocator, &pack, out) catch continue;
+                told.packTo(allocator, &pack, out) catch continue;
                 qnnt.publish(topic_camera, pack.items) catch {};
 
                 shared.mutex.lockUncancelable(qnnt_mod.io);
@@ -877,7 +877,7 @@ fn publishTelemetry() !void {
         .detect_react = t.detect_react,
         .motion_mode = t.motion_mode,
     };
-    try tld.packTo(allocator, &publish_buf, out);
+    try told.packTo(allocator, &publish_buf, out);
     try qnnt.publish(topic_telemetry, publish_buf.items);
 }
 
@@ -919,7 +919,7 @@ fn publishStatus() !void {
     };
     shared.mutex.unlock(qnnt_mod.io);
 
-    try tld.packTo(allocator, &publish_buf, out);
+    try told.packTo(allocator, &publish_buf, out);
     try qnnt.publish(topic_status, publish_buf.items);
 }
 
@@ -1077,8 +1077,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("ugv-bridge: could not register the published topics\n", .{});
         return;
     }
-    // Frame delivery, not text: the commands are TLD objects. A text subscription waits
-    // for a newline delimiter that binary TLD never contains, so the handler is never
+    // Frame delivery, not text: the commands are TOLD objects. A text subscription waits
+    // for a newline delimiter that binary TOLD never contains, so the handler is never
     // called and nothing anywhere reports why.
     if (!qnnt.subscribeFrames(topic_lights, onLights, null)) {
         std.debug.print("ugv-bridge: could not subscribe to {s}\n", .{topic_lights});

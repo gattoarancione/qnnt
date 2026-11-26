@@ -7,11 +7,16 @@
     // None of that exists in 0.15, so declaring 0.15 bought a wall of compile errors
     // instead of one sentence saying which compiler to use.
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    // The TOLD codec, as a git submodule: `git submodule update --init` after cloning.
+    // It was qnnt's TLD before it became a project of its own.
+    .dependencies = .{
+        .told = .{ .path = "deps/told" },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "lib",
+        "deps",
         "LICENSE",
         "README.md",
     },

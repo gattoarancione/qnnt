@@ -6,7 +6,7 @@
 #   bash examples/can/demo.sh
 #
 # Four gateways and two buses, produced by examples/can/wire_check.py rather than read off
-# a vcan interface. It publishes exactly the topics and exactly the TLD frames a real
+# a vcan interface. It publishes exactly the topics and exactly the TOLD frames a real
 # gateway publishes, so the station cannot tell the difference -- which is the point: the
 # station is a topic consumer, and nothing about it needs a kernel with CAN. For the real
 # thing, with gateways on real interfaces, see docker/can.sh.

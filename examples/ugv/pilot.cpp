@@ -51,11 +51,11 @@
 namespace {
 
 /// What the bridge subscribes to. Field names and types match the Zig structs in
-/// examples/ugv/bridge.zig; TLD matches on names, so the two have to agree.
+/// examples/ugv/bridge.zig; TOLD matches on names, so the two have to agree.
 struct Drive {
     float left{};
     float right{};
-    TLD_DEFINE_MAP(left, right)
+    TOLD_DEFINE_MAP(left, right)
 };
 
 struct GimbalCmd {
@@ -63,7 +63,7 @@ struct GimbalCmd {
     float tilt{};
     quint16 speed{};
     quint16 accel{};
-    TLD_DEFINE_MAP(pan, tilt, speed, accel)
+    TOLD_DEFINE_MAP(pan, tilt, speed, accel)
 };
 
 /// One camera frame, as the bridge republished it. Mirrors CameraFrame in bridge.zig.
@@ -129,7 +129,7 @@ struct CameraFrame {
     quint64 t_us{};
     quint32 bytes{};
     std::vector<std::uint8_t> jpeg;
-    TLD_DEFINE_MAP(seq, t_us, bytes, jpeg)
+    TOLD_DEFINE_MAP(seq, t_us, bytes, jpeg)
 };
 
 /// Cycle a light. Mirrors LightCommand in bridge.zig: a step, not a level, because the
@@ -137,7 +137,7 @@ struct CameraFrame {
 struct LightCommand {
     bool base{};
     bool head{};
-    TLD_DEFINE_MAP(base, head)
+    TOLD_DEFINE_MAP(base, head)
 };
 
 struct TelemetryFrame {
@@ -156,7 +156,7 @@ struct TelemetryFrame {
     quint32 detect_type{};
     quint32 detect_react{};
     bool motion_mode{};
-    TLD_DEFINE_MAP(seq, t_us, voltage, pan_deg, tilt_deg, cpu_load, cpu_temp_c, ram_usage,
+    TOLD_DEFINE_MAP(seq, t_us, voltage, pan_deg, tilt_deg, cpu_load, cpu_temp_c, ram_usage,
                    video_fps, wifi_rssi, led_mode, base_light, detect_type, detect_react,
                    motion_mode)
 };
@@ -185,7 +185,7 @@ struct StatusFrame {
     bool video_link{};
     quint64 video_frames{};
     quint64 video_dropped{};
-    TLD_DEFINE_MAP(t_us, link, telemetry_link, limits_from_robot, robot, max_speed,
+    TOLD_DEFINE_MAP(t_us, link, telemetry_link, limits_from_robot, robot, max_speed,
                    pan_min_deg, pan_max_deg, tilt_min_deg, tilt_max_deg, commanded_left,
                    commanded_right, deadman, since_command_ms, commands_sent,
                    commands_failed, telemetry_frames, telemetry_errors, clamped, rejected,

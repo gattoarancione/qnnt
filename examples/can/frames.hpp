@@ -2,7 +2,7 @@
 // station that are not Qt.
 //
 // The counterpart of examples/can/frame.zig, and the two must agree FIELD BY FIELD. Neither
-// side errors when they do not: TLD ignores a key the receiving struct does not declare,
+// side errors when they do not: TOLD ignores a key the receiving struct does not declare,
 // and the macros below leave a member the frame did not carry exactly as its constructor
 // left it. A renamed field is a frame that arrives with identifier 0 and no payload, drawn
 // on screen as a real one. examples/cpp_logic_test.cpp pins the agreement to
@@ -16,7 +16,7 @@
 #ifndef QNNT_CAN_FRAMES_HPP
 #define QNNT_CAN_FRAMES_HPP
 
-#include "qnnt_tld.hpp"
+#include "told.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -44,7 +44,7 @@ struct Frame {
     std::uint8_t dlc{};
     std::vector<std::uint8_t> data;
     std::int64_t us{};
-    TLD_DEFINE_MAP(id, ext, rtr, err, fd, brs, esi, dlc, data, us)
+    TOLD_DEFINE_MAP(id, ext, rtr, err, fd, brs, esi, dlc, data, us)
 };
 
 /// The payload lengths CAN FD can express. Mirrors fd_lengths in examples/can/frame.zig:

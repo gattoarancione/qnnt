@@ -1,4 +1,4 @@
-Fake RoboSense LiDAR over TLD
+Fake RoboSense LiDAR over TOLD
 =============================
 
 Two sensors, one pipeline, because that is how this looks with real hardware:
@@ -50,7 +50,7 @@ driver would not error, it would produce plausible nonsense at half or double th
 
 Replacing the fake with a real RS-LiDAR-16 means pointing the sensor at this host and
 running nothing differently: the driver binds the same port either way. That is the reason
-for the split -- the earlier version of this example generated the scene and packed TLD in
+for the split -- the earlier version of this example generated the scene and packed TOLD in
 one process, which demonstrated the transport but not how a driver is actually written.
 
 what is being imitated
@@ -65,7 +65,7 @@ RS-LiDAR-16 output, from its MSOP (Main data Stream Output Protocol) shape:
     -> 900 blocks/rev, 75 packets/rev, 750 packets/s, 28,800 points/rev
     -> 288,000 points/s, about 0.94 MB/s on the wire
 
-The sensor here publishes at that rate: one TLD frame per MSOP packet, 750 frames/s, paced
+The sensor here publishes at that rate: one TOLD frame per MSOP packet, 750 frames/s, paced
 by the library's scheduler at a 1333 us period.
 
 Deliberate simplifications, since this is a fake and says so: one return per beam (no dual
@@ -85,13 +85,13 @@ the frame, and why it is shaped this way
             rpm           u16     600
             blocks        [12]Block
 
-The judgment worth noticing is where the structure stops. Mapping every channel to a TLD
+The judgment worth noticing is where the structure stops. Mapping every channel to a TOLD
 object -- 384 objects per packet, each with named fields -- would put roughly ten times more
 key bytes on the wire than sample bytes. Instead the block keeps its azimuth as a named
 field, because a consumer wants it without parsing anything, and the 32 samples travel as
 one BUFFER in exactly MSOP's layout.
 
-That is TLD used where self-description pays and got out of the way where it does not. The
+That is TOLD used where self-description pays and got out of the way where it does not. The
 sensor prints the comparison at startup; measured:
 
     raw MSOP              1248 bytes    no self-description at all

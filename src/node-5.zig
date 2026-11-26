@@ -18,7 +18,7 @@
 
 const std = @import("std");
 const qnnt = @import("qnnt").Qnnt;
-const tld = @import("qnnt").Tld;
+const told = @import("qnnt").Told;
 
 const in_topic = "test/bench";
 const out_topic = "test/bench-echo";
@@ -27,7 +27,7 @@ const out_topic = "test/bench-echo";
 var echoed = @import("qnnt").Atomic64.Value.init(0);
 var failed = @import("qnnt").Atomic64.Value.init(0);
 
-fn onFrame(_: []const u8, f: tld.Frame, _: ?*anyopaque) void {
+fn onFrame(_: []const u8, f: told.Frame, _: ?*anyopaque) void {
     qnnt.publish(out_topic, f.raw) catch {
         _ = failed.fetchAdd(1, .monotonic);
         return;

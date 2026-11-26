@@ -5,13 +5,14 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "qnnt"
 version = "0.1.0"
-description = "Python interface to the qnnt pub/sub node and its TLD wire format"
+description = "Python interface to the qnnt pub/sub node and its TOLD wire format"
 requires-python = ">=3.10"
 
 [tool.setuptools]
-packages = ["qnnt"]
+packages = ["qnnt", "told"]
 
 # The shared library is expected inside the package as qnnt/_lib/. A wheel-building step
 # copies it there; a checkout is found via ../zig-out/lib, and QNNT_LIBRARY overrides both.
 [tool.setuptools.package-data]
 qnnt = ["_lib/*"]
+told = ["_lib/*"]

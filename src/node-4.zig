@@ -1,4 +1,4 @@
-//! TLD benchmark subscriber. Subscribes to `test/bench`, decodes every frame and
+//! TOLD benchmark subscriber. Subscribes to `test/bench`, decodes every frame and
 //! reports throughput, end-to-end latency, integrity and raw decoder cost.
 //!
 //!   zig build run-4 -- [report_interval_ms]      default: 1000
@@ -29,7 +29,7 @@
 
 const std = @import("std");
 const qnnt = @import("qnnt").Qnnt;
-const tld = @import("qnnt").Tld;
+const told = @import("qnnt").Told;
 
 const allocator = std.heap.page_allocator;
 
@@ -69,7 +69,7 @@ var sample_len: usize = 0;
 
 /// Consume every field the way a real application would, and check the payload
 /// pattern. Returns the send timestamp and payload length.
-fn readFrame(f: tld.Frame) !struct { sent_us: u64, payload_len: usize } {
+fn readFrame(f: told.Frame) !struct { sent_us: u64, payload_len: usize } {
     var sent_us: u64 = 0;
     var payload_len: usize = 0;
     var seq: u64 = 0;
@@ -109,7 +109,7 @@ fn decodeBenchmark(bytes: []const u8, iterations: usize) u64 {
     const start_us: u64 = @intCast(qnnt.nowMicros());
 
     for (0..iterations) |_| {
-        const f = tld.decode(bytes) catch continue;
+        const f = told.decode(bytes) catch continue;
         var it = f.objectIterator() catch continue;
         while (it.next() catch continue) |pair| {
             checksum +%= pair.key.len;
@@ -177,7 +177,7 @@ fn report(now_us: u64) void {
     hist_overflow = 0;
 }
 
-fn onFrame(_: []const u8, f: tld.Frame, _: ?*anyopaque) void {
+fn onFrame(_: []const u8, f: told.Frame, _: ?*anyopaque) void {
     const info = readFrame(f) catch {
         decode_errors += 1;
         return;

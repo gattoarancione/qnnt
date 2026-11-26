@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const qnnt_mod = @import("qnnt");
-const tld = qnnt_mod.Tld;
+const told = qnnt_mod.Told;
 
 /// One CAN frame, as published.
 pub const Frame = struct {
@@ -51,7 +51,7 @@ pub const Frame = struct {
     /// The same as `data.len` for an ordinary frame; for an RTR frame it is the length
     /// being REQUESTED, and `data` is empty.
     dlc: u8,
-    data: tld.Bytes,
+    data: told.Bytes,
     /// When the originating gateway read it: microseconds since the epoch, on THAT host's
     /// clock. Nothing synchronises clocks across the mesh, so this orders frames from one
     /// origin and must not be used to compare two.
@@ -207,7 +207,7 @@ pub fn validName(name: []const u8) bool {
 // ---------------------------------------------------------------- the golden frame
 //
 // `frames.hpp` declares the same struct in C++, for the station in examples/can/station.cpp,
-// and the two must agree FIELD BY FIELD. Neither side errors when they do not: TLD ignores
+// and the two must agree FIELD BY FIELD. Neither side errors when they do not: TOLD ignores
 // a key the receiving struct does not declare, and the C++ macros leave a member the frame
 // did not carry exactly as its constructor left it. A renamed field is therefore a frame
 // that arrives with id 0 and no payload, drawn on screen as a real frame.
@@ -248,7 +248,7 @@ test "the canonical frame still packs to the golden bytes" {
     // change is the point of having it.
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
-    try tld.packTo(testing.allocator, &buf, canonical_frame);
+    try told.packTo(testing.allocator, &buf, canonical_frame);
 
     if (std.c.getenv("QNNT_WRITE_GOLDEN") != null) {
         std.debug.print("can_frame.tld = {x}\n", .{buf.items});
@@ -257,7 +257,7 @@ test "the canonical frame still packs to the golden bytes" {
 }
 
 test "the golden frame unpacks back to the canonical values" {
-    const back = try tld.unpackFrom(Frame, golden_frame, null);
+    const back = try told.unpackFrom(Frame, golden_frame, null);
     try testing.expectEqual(canonical_frame.id, back.id);
     try testing.expectEqual(canonical_frame.ext, back.ext);
     try testing.expectEqual(canonical_frame.rtr, back.rtr);
@@ -482,7 +482,7 @@ test "names that would make a topic ambiguous are refused" {
     try testing.expect(!validName("a" ** 65));
 }
 
-test "a frame survives the TLD round trip" {
+test "a frame survives the TOLD round trip" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
 
@@ -491,16 +491,16 @@ test "a frame survives the TLD round trip" {
         .dlc = 8, .data = .{ .data = &.{ 0x00, 0xFF, 0x0A, 0x0D, 1, 2, 3, 4 } },
         .us = 1_700_000_000_000_000,
     };
-    try tld.packTo(testing.allocator, &buf, sent);
+    try told.packTo(testing.allocator, &buf, sent);
     const packed_bytes = buf.items;
 
     // No allocator: the decoded payload borrows the buffer, which is what the subscriber
     // handler does -- it writes the bytes to the socket and returns.
-    const got = try tld.unpackFrom(Frame, packed_bytes, null);
+    const got = try told.unpackFrom(Frame, packed_bytes, null);
     try testing.expectEqual(sent.id, got.id);
     try testing.expectEqual(sent.ext, got.ext);
     try testing.expectEqual(sent.dlc, got.dlc);
     try testing.expectEqual(sent.us, got.us);
-    // 0x0A and 0x0D inside the payload: the reason these topics are TLD and not text.
+    // 0x0A and 0x0D inside the payload: the reason these topics are TOLD and not text.
     try testing.expectEqualSlices(u8, sent.data.data, got.data.data);
 }

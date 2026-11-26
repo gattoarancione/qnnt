@@ -3,11 +3,11 @@
 //   zig build mesh && bash examples/mesh/run.sh
 //
 // Publishes mesh/cpp and subscribes to the other four topics. Uses the C ABI directly for
-// the node and the TLD_DEFINE_MAP macros for the schema; the Qt node next door does the
+// the node and the TOLD_DEFINE_MAP macros for the schema; the Qt node next door does the
 // same thing through the QObject wrapper, with Qt types in the struct.
 
 #include "qnnt.h"
-#include "qnnt_tld.hpp"
+#include "told.hpp"
 
 #include <atomic>
 #include <cmath>
@@ -34,19 +34,19 @@ constexpr PeerInfo kPeers[] = {
 };
 
 enum class Mode : std::int32_t { idle = 0, running = 1, faulted = 2 };
-TLD_ADD_ENUM(Mode)
+TOLD_ADD_ENUM(Mode)
 
 struct Reading {
     std::uint8_t channel{};
     double value{};
     bool valid{};
-    TLD_DEFINE_MAP(channel, value, valid)
+    TOLD_DEFINE_MAP(channel, value, valid)
 };
 
 struct Origin {
     double x{};
     double y{};
-    TLD_DEFINE_MAP(x, y)
+    TOLD_DEFINE_MAP(x, y)
 };
 
 struct Sample {
@@ -58,7 +58,7 @@ struct Sample {
     std::vector<std::uint8_t> blob;
     Origin origin;
     std::vector<Reading> readings;
-    TLD_DEFINE_MAP(seq, source, mode, count, temp, blob, origin, readings)
+    TOLD_DEFINE_MAP(seq, source, mode, count, temp, blob, origin, readings)
 };
 
 Sample expected(std::uint64_t seq, const char* source) {
@@ -111,13 +111,13 @@ struct PeerState {
 PeerState g_peers[std::size(kPeers)];
 
 /// Called on the subscriber's own thread, one per topic, so each slot has a single writer.
-void onFrame(const char*, std::size_t, const qnnt_tld_frame* raw, void* user) {
+void onFrame(const char*, std::size_t, const told_frame* raw, void* user) {
     auto* peer = static_cast<PeerState*>(user);
     bool bad = false;
     std::uint64_t seq = 0;
 
     try {
-        const Sample got = qnnt::tld::unpack<Sample>(qnnt::tld::Frame{*raw});
+        const Sample got = told::unpack<Sample>(told::Frame{*raw});
         seq = got.seq;
         const Sample want = expected(seq, peer->name);
 
@@ -136,7 +136,7 @@ void onFrame(const char*, std::size_t, const qnnt_tld_frame* raw, void* user) {
                 if (got.readings[i].valid != want.readings[i].valid) bad = true;
             }
         }
-    } catch (const qnnt::tld::Error&) {
+    } catch (const told::Error&) {
         bad = true;
     }
 
@@ -164,7 +164,7 @@ const std::uint8_t* sourceFn(const char*, std::size_t, std::size_t* out_len, voi
         return nullptr;
     }
     ++g_seq;
-    g_out = qnnt::tld::pack(expected(g_seq, kMe));
+    g_out = told::pack(expected(g_seq, kMe));
     *out_len = g_out.size();
     return g_out.data();
 }

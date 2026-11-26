@@ -175,8 +175,8 @@ std::vector<std::uint8_t> readGolden(const char* path)
 /// Do the C++ structs still agree with the Zig ones, field by field?
 ///
 /// This is the check that nothing else makes. A renamed or retyped field is not a compile
-/// error on either side and not a runtime error either: TLD ignores a key the receiving
-/// struct does not declare, and the TLD_DEFINE_MAP macros leave a member the frame did not
+/// error on either side and not a runtime error either: TOLD ignores a key the receiving
+/// struct does not declare, and the TOLD_DEFINE_MAP macros leave a member the frame did not
 /// carry exactly as its constructor left it. So the failure mode is a station showing
 /// plausible defaults -- a light that reports itself uncontrollable, a sensor with no room.
 ///
@@ -189,7 +189,7 @@ void boundary()
     check(!device_bytes.empty(), "the device golden frame is readable");
     if (device_bytes.empty()) return;
 
-    const auto d = qnnt::tld::unpack<dirigera::DeviceFrame>(device_bytes);
+    const auto d = told::unpack<dirigera::DeviceFrame>(device_bytes);
 
     // Every field, because checking a few would let the others drift. The values are all
     // distinct in the canonical frame, so a pair of fields swapped between the languages
@@ -230,7 +230,7 @@ void boundary()
     check(!command_bytes.empty(), "the command golden frame is readable");
     if (command_bytes.empty()) return;
 
-    const auto c = qnnt::tld::unpack<dirigera::LightCommand>(command_bytes);
+    const auto c = told::unpack<dirigera::LightCommand>(command_bytes);
     check(c.id == "abc123_1", "command id crosses");
     check(c.on.has_value() && *c.on, "command on crosses");
     check(c.level.has_value() && *c.level == 42, "command level crosses");
@@ -243,7 +243,7 @@ void boundary()
     mine.on = true;
     mine.level = 42;
     mine.kelvin = 2700;
-    const auto repacked = qnnt::tld::pack(mine);
+    const auto repacked = told::pack(mine);
     check(repacked.size() == command_bytes.size() &&
               std::equal(repacked.begin(), repacked.end(), command_bytes.begin()),
           "C++ packs a command to the same bytes Zig does");
@@ -385,7 +385,7 @@ void canBoundary()
     check(!bytes.empty(), "the CAN golden frame is readable");
     if (bytes.empty()) return;
 
-    const auto f = qnnt::tld::unpack<can::Frame>(bytes);
+    const auto f = told::unpack<can::Frame>(bytes);
     check(f.id == 0x1ABCDEF, "id crosses");
     check(f.ext, "ext crosses as true");
     check(!f.rtr, "rtr crosses as false");
@@ -409,9 +409,9 @@ void canBoundary()
     can::Frame empty;
     empty.id = 0x400;
     empty.dlc = 0;
-    const auto empty_bytes = qnnt::tld::pack(empty);
+    const auto empty_bytes = told::pack(empty);
     check(!empty_bytes.empty(), "a frame with no payload packs");
-    const auto empty_back = qnnt::tld::unpack<can::Frame>(empty_bytes);
+    const auto empty_back = told::unpack<can::Frame>(empty_bytes);
     check(empty_back.id == 0x400 && empty_back.dlc == 0 && empty_back.data.empty(),
           "and unpacks back to an empty payload");
 
@@ -424,7 +424,7 @@ void canBoundary()
     big.dlc = 64;
     big.data.resize(64);
     for (std::size_t i = 0; i < big.data.size(); ++i) big.data[i] = std::uint8_t(i);
-    const auto big_back = qnnt::tld::unpack<can::Frame>(qnnt::tld::pack(big));
+    const auto big_back = told::unpack<can::Frame>(told::pack(big));
     check(big_back.fd && big_back.brs && big_back.dlc == 64, "a 64-byte FD frame round-trips");
     check(big_back.data == big.data, "with all 64 bytes intact");
 
@@ -433,7 +433,7 @@ void canBoundary()
     rtr.id = 0x201;
     rtr.rtr = true;
     rtr.dlc = 8;   // an RTR frame requests bytes without carrying any
-    const auto rtr_back = qnnt::tld::unpack<can::Frame>(qnnt::tld::pack(rtr));
+    const auto rtr_back = told::unpack<can::Frame>(told::pack(rtr));
     check(rtr_back.rtr && rtr_back.dlc == 8 && rtr_back.data.empty(),
           "a remote request packs with a length but no data");
 

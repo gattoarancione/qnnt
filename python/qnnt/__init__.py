@@ -36,10 +36,37 @@ import os
 from dataclasses import dataclass
 from typing import Any, Iterator, Sequence
 
-from . import tld
 from ._lib import Error, EventRecord as _CEvent, Message as _CMessage, Reply as _CReply, declare, load
 
-__all__ = ["Node", "Message", "Reply", "RpcStatus", "Error", "tld", "version"]
+
+def _import_told():
+    """TOLD's own Python package, which qnnt uses for the wire format.
+
+    Installed from a qnnt wheel it sits beside this package, with libtold bundled inside it,
+    and needs nothing. In a checkout it is the deps/told submodule's copy, pointed at the
+    libtold that `zig build` puts beside libqnnt_c -- unless TOLD_LIBRARY already says where.
+    """
+    try:
+        import told
+        return told
+    except ImportError:
+        pass
+    from pathlib import Path
+    import sys
+    root = Path(__file__).resolve().parents[2]
+    sys.path.append(str(root / "deps" / "told" / "python"))
+    built = root / "zig-out" / "lib"
+    for name in ("libtold.dylib", "libtold.so", "told.dll"):
+        if (built / name).exists():
+            os.environ.setdefault("TOLD_LIBRARY", str(built / name))
+            break
+    import told
+    return told
+
+
+told = _import_told()
+
+__all__ = ["Node", "Message", "Reply", "RpcStatus", "Error", "told", "version"]
 
 _QUEUE_TEXT = 0
 _QUEUE_FRAMES = 1
@@ -153,16 +180,16 @@ class Message:
         return self.data.decode("utf-8")
 
     def value(self) -> Any:
-        """The payload decoded as a TLD frame, for topics carrying frames."""
-        return tld.loads(self.data)
+        """The payload decoded as a TOLD frame, for topics carrying frames."""
+        return told.loads(self.data)
 
     def unpacked(self, target: type) -> Any:
         """The payload decoded into `target` -- a dataclass, usually.
 
         The counterpart of QnntNode::unpacked<T>() in the Qt header and of
-        tld.unpackFrom(T, ...) in Zig, so the same struct crosses all three.
+        told.unpackFrom(T, ...) in Zig, so the same struct crosses all three.
         """
-        return tld.unpack(target, self.data)
+        return told.unpack(target, self.data)
 
 
 class Node:
@@ -329,8 +356,8 @@ class Node:
         _check(self._lib, self._lib.qnnt_publish(raw, len(raw), data, len(data)), f"publish({topic})")
 
     def publish_object(self, topic: str, value: Any) -> None:
-        """Encode `value` as one TLD frame and publish it."""
-        self.publish(topic, tld.dumps(value))
+        """Encode `value` as one TOLD frame and publish it."""
+        self.publish(topic, told.dumps(value))
 
     def remove_publisher(self, topic: str) -> bool:
         """Stop publishing `topic`, leaving the rest of the node running.
@@ -444,8 +471,8 @@ class Node:
         return bytes(bytearray(out[: written.value]))
 
     def request_object(self, procedure: str, value: Any, **kwargs) -> Any:
-        """`request` with a TLD frame in each direction."""
-        return tld.loads(self.request(procedure, tld.dumps(value), **kwargs))
+        """`request` with a TOLD frame in each direction."""
+        return told.loads(self.request(procedure, told.dumps(value), **kwargs))
 
     def request_begin(self, procedure: str, data: bytes = b"", *, timeout: float = 5.0) -> int:
         """Start a request and return a ticket at once; 0 if it could not be started.
@@ -480,7 +507,7 @@ class Node:
     def subscribe(self, topic: str, *, frames: bool = False) -> None:
         """Subscribe, delivering into the queue that `poll` drains.
 
-        `frames=True` for a topic carrying TLD frames, which is also what lets a payload
+        `frames=True` for a topic carrying TOLD frames, which is also what lets a payload
         contain arbitrary bytes; the default reads newline-delimited text.
         """
         raw = self._topic_bytes(topic)
@@ -647,5 +674,5 @@ class Node:
 
 
 def version() -> str:
-    """The TLD wire-format version this build speaks."""
-    return tld.version()
+    """The TOLD wire-format version this build speaks."""
+    return told.version()

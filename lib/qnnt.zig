@@ -7,9 +7,9 @@ const Io = std.Io;
 const net = std.Io.net;
 const Stream = net.Stream;
 
-/// The TLD binary framing, re-exported so users get the encoder and decoder without a
-/// second import. See `subscribeFrames` for how it meets the pub/sub data path.
-pub const Tld = @import("tld.zig");
+/// The TOLD binary framing (deps/told), re-exported so users get the encoder and decoder
+/// without a second import. See `subscribeFrames` for how it meets the pub/sub data path.
+pub const Told = @import("told");
 /// 64-bit counters that also work on 32-bit CPUs; see atomic64.zig.
 pub const Atomic64 = @import("atomic64.zig");
 
@@ -1303,10 +1303,10 @@ pub const Qnnt = struct {
     // heap memory the callback keeps alive — never a buffer on the callback's frame.
     pub const SourceHandler = *const fn (topic: []const u8, context: ?*anyopaque) ?[]const u8;
 
-    /// Callback for a TLD-framed subscription. `frame` borrows a buffer owned by the
+    /// Callback for a TOLD-framed subscription. `frame` borrows a buffer owned by the
     /// subscriber thread and is only valid for the duration of the call — copy
     /// anything you keep, including the slices its accessors return.
-    pub const FrameHandler = *const fn (topic: []const u8, frame: Tld.Frame, context: ?*anyopaque) void;
+    pub const FrameHandler = *const fn (topic: []const u8, frame: Told.Frame, context: ?*anyopaque) void;
 
     pub const run = &nodeRun;
     pub const runPublisher = &publisherRun;
@@ -1316,7 +1316,7 @@ pub const Qnnt = struct {
     /// `subscribePatternRun` for what it costs -- a poll, and one connection per match.
     pub const subscribePattern = &subscribePatternRun;
     pub const subscribeFrames = &subscribeFramesRun;
-    /// `subscribePattern` for TLD frames.
+    /// `subscribePattern` for TOLD frames.
     pub const subscribePatternFrames = &subscribePatternFramesRun;
 
     /// Stop publishing one topic without stopping the node: joins that publisher's
@@ -3267,7 +3267,7 @@ pub fn publishAll(topic: []const u8, data: []const u8) !void {
 
 /// Write `data` -- `count` whole messages, back to back -- to every subscriber of `topic`.
 /// One write per subscriber however many messages it holds, which is what coalescing buys:
-/// a stream is self-delimiting (lines, or TLD frames carrying their own length), so the
+/// a stream is self-delimiting (lines, or TOLD frames carrying their own length), so the
 /// subscriber splits it exactly as if each had arrived alone.
 fn deliver(topic: []const u8, data: []const u8, count: u64) !void {
     // Peers whose write failed, reported after the lock is released.
@@ -3892,7 +3892,7 @@ pub fn subscribePatternRun(
     return startPattern(pattern, .{ .messages = handler }, context, rescan_ms);
 }
 
-/// `subscribePattern` for TLD frames: the same discovery, delivering to a `FrameHandler`
+/// `subscribePattern` for TOLD frames: the same discovery, delivering to a `FrameHandler`
 /// rather than to raw bytes. Everything said about the plain one applies here too.
 pub fn subscribePatternFramesRun(
     pattern: []const u8,
@@ -4028,7 +4028,7 @@ pub fn subscribeRun(topic: []const u8, handler: Qnnt.MessageHandler, context: ?*
 
 /// The largest frame this node will accept, and the largest it will publish.
 ///
-/// A declared TLD length is 8 attacker-controlled bytes, so a receiver has to cap what one
+/// A declared TOLD length is 8 attacker-controlled bytes, so a receiver has to cap what one
 /// frame may ask it to buffer. The cap stays; what changed is that it applies to BOTH ends.
 /// A 1 MiB limit on the subscriber with no limit at all on the publisher meant a producer
 /// could emit frames that every subscriber refused -- and refusing is not graceful here: the
@@ -4079,12 +4079,12 @@ pub fn handlerStackBytesFn() usize {
     return handler_stack_bytes.load(.monotonic);
 }
 
-// As `subscribeLoop`, but the stream carries TLD frames instead of newline-delimited
-// text. TLD frames are self-delimiting, so this needs no delimiter and imposes no
+// As `subscribeLoop`, but the stream carries TOLD frames instead of newline-delimited
+// text. TOLD frames are self-delimiting, so this needs no delimiter and imposes no
 // restriction on payload bytes.
 //
 // A topic is one or the other, not both: the framing is a property of the stream, so a
-// producer publishing TLD must be read with `subscribeFrames`, and a producer
+// producer publishing TOLD must be read with `subscribeFrames`, and a producer
 // publishing text lines with `subscribe`.
 fn subscribeFramesLoop(token: *TopicToken, handler: Qnnt.FrameHandler, context: ?*anyopaque) void {
     const topic = token.topic;
@@ -4112,7 +4112,7 @@ fn subscribeFramesLoop(token: *TopicToken, handler: Qnnt.FrameHandler, context: 
         defer untrackSocketFor(token, stream.socket);
 
         var where_buf: [128]u8 = undefined;
-        std.debug.print("subscribed to {s} @ {s} (tld)\n", .{ topic, describeDialed(&where_buf, &resolved, dialed.local) });
+        std.debug.print("subscribed to {s} @ {s} (told)\n", .{ topic, describeDialed(&where_buf, &resolved, dialed.local) });
 
         var peer_buf: [64]u8 = undefined;
         const peer = dialedPeer(&peer_buf, &resolved, dialed.local);
@@ -4125,12 +4125,12 @@ fn subscribeFramesLoop(token: *TopicToken, handler: Qnnt.FrameHandler, context: 
         var rbuf: [64 * 1024]u8 = undefined;
         var reader = stream.reader(io, &rbuf);
         while (true) {
-            const frame = Tld.readFrame(&reader.interface, allocator, &frame_buf, maxFrameBytes()) catch |err| {
+            const frame = Told.readFrame(&reader.interface, allocator, &frame_buf, maxFrameBytes()) catch |err| {
                 // EndOfStream is the publisher going away, which is routine. Anything
                 // else means the stream is not what we think it is, and silence there
                 // would leave a mismatched producer looking like a dead one.
                 if (err != error.EndOfStream) {
-                    std.debug.print("tld read error on {s}: {}\n", .{ topic, err });
+                    std.debug.print("told read error on {s}: {}\n", .{ topic, err });
                 }
                 break;
             };
@@ -4253,13 +4253,13 @@ fn queuePush(topic: []const u8, msg: []const u8, _: ?*anyopaque) void {
 }
 
 /// Which reader a queued subscription uses. Framing is a property of the stream, not of
-/// the delivery mode, so the queue has to be told: a TLD producer read as text would be
+/// the delivery mode, so the queue has to be told: a TOLD producer read as text would be
 /// chopped at every 0x0A byte inside a payload, which is not a hypothetical — it is what
 /// happens the first time a buffer holds a newline.
 pub const QueueMode = enum { text, frames };
 
 /// Subscribe to `topic`, delivering into the shared queue instead of a callback. For
-/// `.frames` the queued bytes are the complete TLD frame, ready to hand to `Tld.decode`.
+/// `.frames` the queued bytes are the complete TOLD frame, ready to hand to `Told.decode`.
 pub fn subscribeQueueRun(topic: []const u8, mode: QueueMode) bool {
     if (!queueReserveDefault()) return false;
     return switch (mode) {
@@ -4279,7 +4279,7 @@ pub fn subscribePatternQueueRun(pattern: []const u8, mode: QueueMode, rescan_ms:
     };
 }
 
-fn queuePushFrame(topic: []const u8, frame: Tld.Frame, context: ?*anyopaque) void {
+fn queuePushFrame(topic: []const u8, frame: Told.Frame, context: ?*anyopaque) void {
     // Queue the whole frame, prefix included, so a consumer can decode it as it stands.
     queuePush(topic, frame.raw, context);
 }
@@ -4366,12 +4366,12 @@ fn queueDeinit() void {
 
 pub fn subscribeFramesRun(topic: []const u8, handler: Qnnt.FrameHandler, context: ?*anyopaque) bool {
     const token = createTopicToken(topic, .subscriber) orelse {
-        std.debug.print("error tracking tld subscriber {s}\n", .{topic});
+        std.debug.print("error tracking told subscriber {s}\n", .{topic});
         return false;
     };
 
     if (!spawnWorkerFor(token, subscribeFramesLoop, .{ token, handler, context })) {
-        std.debug.print("error spawning tld subscriber thread for {s}\n", .{topic});
+        std.debug.print("error spawning told subscriber thread for {s}\n", .{topic});
         detachTopicTokenPtr(token);
         destroyTopicToken(token);
         return false;
@@ -4427,7 +4427,7 @@ pub fn installShutdownHandlers() void {
 //
 // The declarations below are `pub` for one reason: `federation.zig` needs them, and Zig
 // has no narrower way to share state between two files of one module. They are internals,
-// not API — a library user should reach for `Qnnt` and `Tld` and nothing else here.
+// not API — a library user should reach for `Qnnt` and `Told` and nothing else here.
 //
 // Keeping them listed in one comment rather than scattering `pub` silently through the
 // file makes the coupling countable, which is the point: federation touches the directory
@@ -4541,8 +4541,8 @@ pub fn publisherRun(topic: []const u8, source: ?Qnnt.SourceHandler, period_us: ?
 // `EntryKind` so the two cannot be confused; see the note there for why a collision that
 // merely deadlocked would be the worst outcome.
 //
-// FRAMING is a 4-byte big-endian length and then the bytes. Deliberately not TLD: a
-// payload here is opaque to qnnt, and very often IS a TLD frame, so imposing TLD would
+// FRAMING is a 4-byte big-endian length and then the bytes. Deliberately not TOLD: a
+// payload here is opaque to qnnt, and very often IS a TOLD frame, so imposing TOLD would
 // mean either double-encoding or forbidding raw bytes. A reply prefixes its payload with
 // one status byte, so "the handler refused" is distinguishable from "the handler returned
 // nothing", which a bare length cannot express.
@@ -4648,7 +4648,7 @@ fn receiveFrame(sock: *const net.Socket, buf: *std.ArrayList(u8), deadline_us: u
 
     const len = std.mem.readInt(u32, &header, .big);
     // The length is 4 attacker-controlled bytes, so it is checked before it is trusted as
-    // an allocation size -- the same rule `readFrame` follows for TLD.
+    // an allocation size -- the same rule `readFrame` follows for TOLD.
     if (len > maxFrameBytes()) return error.TooLarge;
 
     buf.clearRetainingCapacity();

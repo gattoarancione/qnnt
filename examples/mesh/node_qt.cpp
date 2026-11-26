@@ -27,19 +27,19 @@ constexpr int kIntervalMs = 200;
 } // namespace
 
 enum class Mode : qint32 { idle = 0, running = 1, faulted = 2 };
-TLD_ADD_ENUM(Mode)
+TOLD_ADD_ENUM(Mode)
 
 struct Reading {
     quint8 channel{};
     double value{};
     bool valid{};
-    TLD_DEFINE_MAP(channel, value, valid)
+    TOLD_DEFINE_MAP(channel, value, valid)
 };
 
 struct Origin {
     double x{};
     double y{};
-    TLD_DEFINE_MAP(x, y)
+    TOLD_DEFINE_MAP(x, y)
 };
 
 struct Sample {
@@ -51,7 +51,7 @@ struct Sample {
     QByteArray blob;
     Origin origin;
     QList<Reading> readings;
-    TLD_DEFINE_MAP(seq, source, mode, count, temp, blob, origin, readings)
+    TOLD_DEFINE_MAP(seq, source, mode, count, temp, blob, origin, readings)
 };
 
 static Sample expected(quint64 seq, const QString& source) {
@@ -154,7 +154,7 @@ public Q_SLOTS:
                     if (got.readings[i].valid != want.readings[i].valid) bad = true;
                 }
             }
-        } catch (const qnnt::tld::Error&) {
+        } catch (const told::Error&) {
             bad = true;
         }
 

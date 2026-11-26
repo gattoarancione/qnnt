@@ -59,7 +59,7 @@
 const std = @import("std");
 const qnnt_mod = @import("qnnt");
 const qnnt = qnnt_mod.Qnnt;
-const tld = qnnt_mod.Tld;
+const told = qnnt_mod.Told;
 const https = @import("https");
 const hub = @import("hub");
 const ws = @import("ws");
@@ -259,10 +259,10 @@ var token: []const u8 = "";
 // -- subscriber --------------------------------------------------------------------------
 
 /// Queue a command and return. No I/O here: this runs on qnnt's subscriber thread.
-fn onLight(topic: []const u8, frame: tld.Frame, context: ?*anyopaque) void {
+fn onLight(topic: []const u8, frame: told.Frame, context: ?*anyopaque) void {
     _ = topic;
     _ = context;
-    const cmd = tld.unpack(LightCommand, frame, null) catch {
+    const cmd = told.unpack(LightCommand, frame, null) catch {
         shared.mutex.lockUncancelable(bridge_io);
         shared.commands_refused += 1;
         shared.mutex.unlock(bridge_io);
@@ -384,7 +384,7 @@ fn publishState(event: []const u8, d: hub.Device) !void {
         .identified = known.known,
         .device = merged,
     };
-    try tld.packTo(allocator, &publish_buf, out);
+    try told.packTo(allocator, &publish_buf, out);
     try qnnt.publish(topic_state, publish_buf.items);
 }
 
@@ -399,7 +399,7 @@ fn publishInventory(inv: hub.Inventory) !void {
         .count = @intCast(rows.len),
         .devices = rows,
     };
-    try tld.packTo(allocator, &publish_buf, out);
+    try told.packTo(allocator, &publish_buf, out);
     try qnnt.publish(topic_inventory, publish_buf.items);
 }
 
@@ -425,7 +425,7 @@ fn publishStatus() !void {
     };
     shared.mutex.unlock(bridge_io);
 
-    try tld.packTo(allocator, &publish_buf, out);
+    try told.packTo(allocator, &publish_buf, out);
     try qnnt.publish(topic_status, publish_buf.items);
 }
 
@@ -599,10 +599,10 @@ fn pairingThread() void {
 }
 
 /// A pairing request from a controller. Starts the exchange, or cancels one.
-fn onPair(topic: []const u8, frame: tld.Frame, context: ?*anyopaque) void {
+fn onPair(topic: []const u8, frame: told.Frame, context: ?*anyopaque) void {
     _ = topic;
     _ = context;
-    const request = tld.unpack(frames.PairRequest, frame, null) catch return;
+    const request = told.unpack(frames.PairRequest, frame, null) catch return;
 
     if (request.cancel) {
         shared.mutex.lockUncancelable(bridge_io);
@@ -1114,8 +1114,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         std.debug.print("dirigera-bridge: could not register the published topics\n", .{});
         return;
     }
-    // Frame delivery, because commands are TLD objects. A text subscription would wait for
-    // a newline that binary TLD never contains, and the handler would never run -- the bug
+    // Frame delivery, because commands are TOLD objects. A text subscription would wait for
+    // a newline that binary TOLD never contains, and the handler would never run -- the bug
     // that cost an afternoon on the UGV bridge.
     if (!qnnt.subscribeFrames(topic_light, onLight, null)) {
         std.debug.print("dirigera-bridge: could not subscribe to {s}\n", .{topic_light});

@@ -13,8 +13,8 @@
 //! Still a library-wide choice rather than one the host supplies; handing it over
 //! belongs with the core C ABI, where a caller has an allocator to pass in.
 //!
-//! `tld_alloc.zig` is a copy of this policy, kept separate so the codec carves out into
-//! its own project without importing anything from qnnt. Change the choice here and check
+//! TOLD (deps/told) has its own copy of this policy in `told_alloc.zig`, since the codec is
+//! a project of its own and imports nothing from qnnt. Change the choice here and check
 //! whether it should follow there; the two do not track each other.
 
 const std = @import("std");

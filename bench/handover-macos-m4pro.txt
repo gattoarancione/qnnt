@@ -1,0 +1,24 @@
+# shmbench handover 2 -- Apple M4 Pro, macOS, 2026-11-26
+threshold 65536 B, quiet window 0.25 s, 2.0 s per run, flat out
+load   subs mode     | msg/s each  cpu%    p99 us |   up down grow   max pause | errors
+step      1 unix     |    1579366   197       4.1 |    0    0    0       0.0us | 0
+step      1 ringzero |    2637350   194    8388.6 |    0    0    0       0.0us | 0
+step      1 auto     |    1780336   191     131.1 |    1    1    0     205.0us | 0
+step      4 unix     |     388305   305      16.4 |    0    0    0       0.0us | 0
+step      4 ringzero |    2427788   435   16777.2 |    0    0    0       0.0us | 0
+step      4 auto     |     859557   394   16777.2 |    1    1    0     279.0us | 0
+mixed     1 unix     |     560760   196     262.1 |    0    0    0       0.0us | 0
+mixed     1 ringzero |    1720447   162    1048.6 |    0    0    0       0.0us | 0
+mixed     1 auto     |    1732204   165    1048.6 |    1    0    0      15.0us | 0
+mixed     4 unix     |     123537   249     262.1 |    0    0    0       0.0us | 0
+mixed     4 ringzero |    1256068   467    2097.2 |    0    0    0       0.0us | 0
+mixed     4 auto     |    1320514   469    2097.2 |    1    0    0      23.0us | 0
+grow      1 unix     |     702199   197      65.5 |    0    0    0       0.0us | 0
+grow      1 ringzero |    1296846   174    2097.2 |    0    0    0       0.0us | 0
+grow      1 auto     |     874541   193      65.5 |    2    1    1     105.0us | 0
+grow      4 unix     |     146111   303      65.5 |    0    0    0       0.0us | 0
+grow      4 ringzero |     335940   428    4194.3 |    0    0    0       0.0us | 0
+grow      4 auto     |     321746   422     262.1 |    2    1    1     146.0us | 0
+--- stress: snapshot every 50 ms, quiet window 20 ms
+auto     1 sub  2000      256 B  each got    1999.9/s  total   0.00 GB/s  missed 0 torn 0 errors 0  cpu    8%  latency p50 <16.4us p99 <1048.6us  handovers up 200 down 199
+auto     4 sub  2000      256 B  each got    1999.9/s  total   0.00 GB/s  missed 0 torn 0 errors 0  cpu   20%  latency p50 <32.8us p99 <1048.6us  handovers up 200 down 199

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Exercises the Python package end to end. Run via `zig build python-demo`.
 
-Takes an optional path to the shared library, which is how the build step points it at a
-freshly compiled one.
+Takes optional paths to libqnnt_c and libtold, which is how the build step points it at
+freshly compiled ones.
 """
 
 import os
@@ -12,10 +12,12 @@ from pathlib import Path
 
 if len(sys.argv) > 1:
     os.environ["QNNT_LIBRARY"] = sys.argv[1]
+if len(sys.argv) > 2:
+    os.environ["TOLD_LIBRARY"] = sys.argv[2]
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import qnnt
-from qnnt import tld
+from qnnt import told
 
 failures = 0
 
@@ -29,9 +31,9 @@ def check(name, ok, detail=""):
         print(f"  FAIL  {name}  {detail}")
 
 
-print(f"qnnt python demo (TLD wire format v{qnnt.version()})")
+print(f"qnnt python demo (TOLD wire format v{qnnt.version()})")
 
-print("\nTLD round-trips through Python natives:")
+print("\nTOLD round-trips through Python natives:")
 cases = [
     None, True, False, 0, 15, 16, 300, -1, -300, 2**40, -(2**40),
     1.5, -0.0, "hello", "héllo wörld", "", b"", b"\x00\xff\x0a",
@@ -39,9 +41,9 @@ cases = [
     {"seq": 4242, "live": True, "name": "node", "raw": b"\x0a\xff\x00", "tags": [1, 2.5, None]},
 ]
 for value in cases:
-    encoded = tld.dumps(value)
-    tld.validate(encoded)
-    decoded = tld.loads(encoded)
+    encoded = told.dumps(value)
+    told.validate(encoded)
+    decoded = told.loads(encoded)
     same = decoded == value
     if isinstance(value, float) and value == 0.0:
         # -0.0 == 0.0, so compare the sign bit explicitly: the encoder must not collapse it.
@@ -52,29 +54,29 @@ for value in cases:
     check(f"{value!r:.40}", same, f"{len(encoded)}B" + ("" if same else f" -> {decoded!r}"))
 
 # A small frame carries its length in the header nibble, so one byte is already enough.
-tiny = tld.dumps({"a": 1})
-check("frame_size from the header alone", tld.frame_size(tiny[:1]) == len(tiny), f"{len(tiny)}B")
+tiny = told.dumps({"a": 1})
+check("frame_size from the header alone", told.frame_size(tiny[:1]) == len(tiny), f"{len(tiny)}B")
 
 # Only an extended length field can be incomplete: this one needs 1 header + 2 length bytes.
-big = tld.dumps(b"x" * 300)
+big = told.dumps(b"x" * 300)
 check("frame_size is None while the length field is short",
-      tld.frame_size(big[:1]) is None and tld.frame_size(big[:2]) is None)
+      told.frame_size(big[:1]) is None and told.frame_size(big[:2]) is None)
 check("frame_size once the length field is whole",
-      tld.frame_size(big[:3]) == len(big), f"{len(big)}B")
+      told.frame_size(big[:3]) == len(big), f"{len(big)}B")
 
 print("\nrejections:")
 try:
-    tld.dumps({1: "int key"})
+    told.dumps({1: "int key"})
     check("int object key rejected", False)
 except TypeError as err:
     check("int object key rejected", True, str(err))
 try:
-    tld.loads(bytes([0xD0]))
+    told.loads(bytes([0xD0]))
     check("reserved nibble rejected", False)
-except tld.TldError as err:
+except told.ToldError as err:
     check("reserved nibble rejected", True, err.status_name)
 try:
-    tld.dumps(object())
+    told.dumps(object())
     check("unsupported type rejected", False)
 except TypeError:
     check("unsupported type rejected", True)
@@ -181,7 +183,7 @@ with qnnt.Node(registry_port=DEMO_PORT, queue_capacity=8192, local_sockets=False
 
 # ---------------------------------------------------------------- struct mapping
 #
-# The counterpart of the TLD_DEFINE_MAP macros in C++ and of tld.pack/unpack in Zig. The
+# The counterpart of the TOLD_DEFINE_MAP macros in C++ and of told.pack/unpack in Zig. The
 # golden frame at the end is the one that matters: it was produced by the Zig mapping, and
 # this side has to both read it and reproduce it exactly, or a Python producer and a Zig
 # consumer have quietly diverged.
@@ -225,33 +227,33 @@ CANONICAL = Sample(99, 'sensor-a', Mode.faulted,
                    [Reading(1, 3.5, True), Reading(2, -0.25, False)],
                    bytes([0x00, 0xFF, 0x0A]), None, Point(1.5, -2.5))
 
-packed = tld.pack(CANONICAL)
-check('a dataclass round trips', tld.unpack(Sample, packed) == CANONICAL,
+packed = told.pack(CANONICAL)
+check('a dataclass round trips', told.unpack(Sample, packed) == CANONICAL,
       f"{len(packed)} bytes")
 
 # A field the frame omits falls back to the dataclass default; an unknown key is ignored.
-lenient = tld.dumps({'channel': 4, 'value': 1.5, 'added_later': 'ignored'})
+lenient = told.dumps({'channel': 4, 'value': 1.5, 'added_later': 'ignored'})
 check('unknown keys ignored, defaults applied',
-      tld.unpack(Reading, lenient) == Reading(4, 1.5, True))
+      told.unpack(Reading, lenient) == Reading(4, 1.5, True))
 
 try:
-    tld.unpack(Reading, tld.dumps({'channel': 4}))
+    told.unpack(Reading, told.dumps({'channel': 4}))
     check('a missing field without a default is refused', False)
-except tld.TldError as err:
+except told.ToldError as err:
     # str(err), not err.args[1]: Error collapses status, message and context into one
     # message, so args has a single element.
     check('a missing field without a default is refused', True, str(err))
 
 # Enums travel as their value, and a name is accepted too, as in Zig.
 check('enum by value and by name',
-      tld.unpack(Mode, tld.dumps(2)) is Mode.faulted
-      and tld.unpack(Mode, tld.dumps('running')) is Mode.running)
+      told.unpack(Mode, told.dumps(2)) is Mode.faulted
+      and told.unpack(Mode, told.dumps('running')) is Mode.running)
 
-golden_path = Path(__file__).resolve().parent.parent / 'lib' / 'testdata' / 'interop.tld'
+golden_path = Path(__file__).resolve().parent.parent / 'deps' / 'told' / 'src' / 'testdata' / 'interop.tld'
 if golden_path.exists():
     golden = golden_path.read_bytes()
     check('the golden frame from Zig decodes here',
-          tld.unpack(Sample, golden) == CANONICAL)
+          told.unpack(Sample, golden) == CANONICAL)
     check('and Python re-encodes it byte for byte', packed == golden,
           f"{len(packed)} vs {len(golden)} bytes")
 else:

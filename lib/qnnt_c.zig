@@ -1,8 +1,8 @@
 //! C ABI for the qnnt node: lifecycle, publishing, and both subscription modes.
 //!
-//! Includes the TLD codec's exports too, so one library carries the whole surface;
-//! `libqnnt_tld` remains available for callers who only want the codec and none of the
-//! threads or sockets.
+//! The TOLD codec's own C functions are not here: they are libtold's, built from the
+//! deps/told submodule, and a C caller links both. This library takes only TOLD's frame
+//! layout, so a frame callback can hand out the same told_frame libtold decodes into.
 //!
 //! Two subscription modes are offered because they suit different callers:
 //!
@@ -18,12 +18,7 @@
 const std = @import("std");
 const qnnt = @import("qnnt.zig");
 const allocator = @import("alloc.zig").allocator;
-const tld_abi = @import("tld_abi.zig");
-
-comptime {
-    // Pull the codec's exports into this library as well.
-    _ = @import("tld_c.zig");
-}
+const told_abi = @import("told_abi");
 
 const Status = enum(c_int) {
     ok = 0,
@@ -419,7 +414,7 @@ export fn qnnt_subscribe_pattern(
     return if (qnnt.subscribePatternRun(name, messageTrampoline, box, rescan_ms)) .ok else .failed;
 }
 
-/// Invoked with a decoded TLD frame. The frame borrows the subscriber's buffer and is
+/// Invoked with a decoded TOLD frame. The frame borrows the subscriber's buffer and is
 /// valid only for the call.
 const FrameFn = *const fn (
     topic: [*]const u8,
@@ -428,16 +423,16 @@ const FrameFn = *const fn (
     user: ?*anyopaque,
 ) callconv(.c) void;
 
-/// The same struct the TLD library hands out, from the one file that declares it -- rather
-/// than a third copy kept in step by a comment. See lib/tld_abi.zig.
-const CFrame = tld_abi.Frame;
+/// The same struct libtold hands out, from the one file that declares it -- rather than a
+/// copy kept in step by a comment. See deps/told/src/told_abi.zig.
+const CFrame = told_abi.Frame;
 
 const FrameBox = struct {
     callback: FrameFn,
     user: ?*anyopaque,
 };
 
-fn frameTrampoline(topic: []const u8, frame: qnnt.Tld.Frame, context: ?*anyopaque) void {
+fn frameTrampoline(topic: []const u8, frame: qnnt.Told.Frame, context: ?*anyopaque) void {
     const box: *const FrameBox = @ptrCast(@alignCast(context orelse return));
     const c_frame: CFrame = .{
         .type = @intFromEnum(frame.type),

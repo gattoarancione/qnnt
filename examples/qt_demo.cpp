@@ -17,7 +17,7 @@ struct Telemetry {
     QList<double> samples;
     QByteArray blob;
     int mode{};
-    TLD_DEFINE_MAP(name, samples, blob, mode)
+    TOLD_DEFINE_MAP(name, samples, blob, mode)
 };
 
 class Probe : public QObject {

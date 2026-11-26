@@ -1,0 +1,22 @@
+# qnnt 3602037 ReleaseFast, Unix socket vs TCP -- Engicam SmarCore i.MX8M Plus, 4x Cortex-A53 up to 1.6 GHz (ondemand), 1.9 GB, kernel 6.1.36, 2026-11-26
+== throughput, node-3 unpaced -> node-4
+payload  via       frames/s       MB/s  errors
+64       unix        203004       18.5       0
+64       tcp         266934       24.3       0
+64       unix        203167       18.5       0
+64       tcp         270612       24.6       0
+1024     unix        127555      134.3       0
+1024     tcp         181047      190.6       0
+1024     unix        128203      135.0       0
+1024     tcp         180993      190.6       0
+16384    unix         13403      220.0       0
+16384    tcp          13372      219.5       0
+16384    unix         13381      219.6       0
+16384    tcp          13319      218.6       0
+262144   unix           927      243.0       0
+262144   tcp            871      228.3       0
+262144   unix           926      242.7       0
+262144   tcp            870      228.1       0
+== round trip, node-6 1 kHz 64 B -> node-5 echo
+QNNT_LOCAL_SOCKETS=1: @ unix:// node-6 rtt us over 3723 trips: min 30 mean 239 p50 384 p90 384 p99 704 max 708 | sent 4672 back 3723 lost 0 corrupt 0
+QNNT_LOCAL_SOCKETS=0: @ tcp:// node-6 rtt us over 3669 trips: min 59 mean 300 p50 448 p90 512 p99 768 max 1018 | sent 4615 back 3669 lost 0 corrupt 0

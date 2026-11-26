@@ -9,7 +9,7 @@
  */
 
 #include "qnnt.h"
-#include "qnnt_tld.h"
+#include "told.h"
 
 #include <math.h>
 #include <stdbool.h>
@@ -37,23 +37,23 @@ typedef struct {
     bool valid;
 } reading;
 
-static const qnnt_tld_field reading_fields[] = {
-    QNNT_TLD_FIELD(reading, channel, QNNT_TLD_F_U8),
-    QNNT_TLD_FIELD(reading, value, QNNT_TLD_F_F64),
-    QNNT_TLD_FIELD(reading, valid, QNNT_TLD_F_BOOL),
+static const told_field reading_fields[] = {
+    TOLD_FIELD(reading, channel, TOLD_F_U8),
+    TOLD_FIELD(reading, value, TOLD_F_F64),
+    TOLD_FIELD(reading, valid, TOLD_F_BOOL),
 };
-static const qnnt_tld_desc reading_desc = QNNT_TLD_DESC("Reading", reading_fields, 1);
+static const told_desc reading_desc = TOLD_DESC("Reading", reading_fields, 1);
 
 typedef struct {
     double x;
     double y;
 } mesh_origin;
 
-static const qnnt_tld_field origin_fields[] = {
-    QNNT_TLD_FIELD(mesh_origin, x, QNNT_TLD_F_F64),
-    QNNT_TLD_FIELD(mesh_origin, y, QNNT_TLD_F_F64),
+static const told_field origin_fields[] = {
+    TOLD_FIELD(mesh_origin, x, TOLD_F_F64),
+    TOLD_FIELD(mesh_origin, y, TOLD_F_F64),
 };
-static const qnnt_tld_desc origin_desc = QNNT_TLD_DESC("Origin", origin_fields, 1);
+static const told_desc origin_desc = TOLD_DESC("Origin", origin_fields, 1);
 
 typedef struct {
     uint64_t seq;
@@ -68,18 +68,18 @@ typedef struct {
 } sample;
 
 /* The blob's length is a C implementation detail -- no other language has a field for it,
- * and none is sent: QNNT_TLD_FIELD_BYTES names the member that holds it. */
-static const qnnt_tld_field sample_fields[] = {
-    QNNT_TLD_FIELD(sample, seq, QNNT_TLD_F_U64),
-    QNNT_TLD_FIELD_STRING(sample, source),
-    QNNT_TLD_FIELD(sample, mode, QNNT_TLD_F_I32),
-    QNNT_TLD_FIELD(sample, count, QNNT_TLD_F_I32),
-    QNNT_TLD_FIELD(sample, temp, QNNT_TLD_F_F32),
-    QNNT_TLD_FIELD_BYTES(sample, blob, blob_len),
-    QNNT_TLD_FIELD_STRUCT(sample, origin, &origin_desc),
-    QNNT_TLD_FIELD_ARRAY_STRUCT(sample, readings, &reading_desc),
+ * and none is sent: TOLD_FIELD_BYTES names the member that holds it. */
+static const told_field sample_fields[] = {
+    TOLD_FIELD(sample, seq, TOLD_F_U64),
+    TOLD_FIELD_STRING(sample, source),
+    TOLD_FIELD(sample, mode, TOLD_F_I32),
+    TOLD_FIELD(sample, count, TOLD_F_I32),
+    TOLD_FIELD(sample, temp, TOLD_F_F32),
+    TOLD_FIELD_BYTES(sample, blob, blob_len),
+    TOLD_FIELD_STRUCT(sample, origin, &origin_desc),
+    TOLD_FIELD_ARRAY_STRUCT(sample, readings, &reading_desc),
 };
-static const qnnt_tld_desc sample_desc = QNNT_TLD_DESC("Sample", sample_fields, 1);
+static const told_desc sample_desc = TOLD_DESC("Sample", sample_fields, 1);
 
 static sample expected(uint64_t seq, const char *source) {
     sample s;
@@ -133,7 +133,7 @@ typedef struct {
 static peer_state states[PEER_COUNT];
 
 /* One subscriber thread per topic, so each slot has a single writer. */
-static void on_frame(const char *topic, size_t topic_len, const qnnt_tld_frame *frame,
+static void on_frame(const char *topic, size_t topic_len, const told_frame *frame,
                      void *user) {
     (void)topic;
     (void)topic_len;
@@ -143,7 +143,7 @@ static void on_frame(const char *topic, size_t topic_len, const qnnt_tld_frame *
     memset(&got, 0, sizeof got);
     bool bad = false;
 
-    if (qnnt_tld_unpack_struct(frame, &sample_desc, &got) != QNNT_TLD_OK) {
+    if (told_unpack_struct(frame, &sample_desc, &got) != TOLD_OK) {
         bad = true;
     } else {
         const sample want = expected(got.seq, peer->name);
@@ -172,7 +172,7 @@ static void on_frame(const char *topic, size_t topic_len, const qnnt_tld_frame *
     if (bad) peer->problems += 1;
 }
 
-static qnnt_tld_encoder *encoder = NULL;
+static told_encoder *encoder = NULL;
 static uint64_t out_seq = 0;
 
 /* The scheduler starts ticking when qnnt_publisher_start is called, which is before the
@@ -193,20 +193,20 @@ static const uint8_t *source_fn(const char *topic, size_t topic_len, size_t *out
     }
 
     out_seq += 1;
-    qnnt_tld_encoder_reset(encoder);
+    told_encoder_reset(encoder);
     const sample s = expected(out_seq, ME);
-    if (qnnt_tld_pack_struct(encoder, &sample_desc, &s) != QNNT_TLD_OK) {
+    if (told_pack_struct(encoder, &sample_desc, &s) != TOLD_OK) {
         *out_len = 0;
         return NULL;
     }
-    return qnnt_tld_encoder_bytes(encoder, out_len);
+    return told_encoder_bytes(encoder, out_len);
 }
 
 int main(int argc, char **argv) {
     const long run_ms = argc > 1 ? strtol(argv[1], NULL, 10) : 9000;
     const unsigned long need = argc > 2 ? strtoul(argv[2], NULL, 10) : 5;
 
-    encoder = qnnt_tld_encoder_create();
+    encoder = told_encoder_create();
     if (encoder == NULL) return 1;
 
     qnnt_configure_from_environment();
@@ -267,6 +267,6 @@ int main(int argc, char **argv) {
     printf("%s: %s\n", ME, failed ? "FAILED" : "all peers verified");
     fflush(stdout);
     qnnt_deinit();
-    qnnt_tld_encoder_destroy(encoder);
+    told_encoder_destroy(encoder);
     return failed ? 1 : 0;
 }

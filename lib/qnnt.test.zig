@@ -8,7 +8,7 @@
 const std = @import("std");
 const testing = std.testing;
 const qnnt = @import("./qnnt.zig").Qnnt;
-const tld = @import("./qnnt.zig").Tld;
+const told = @import("./qnnt.zig").Told;
 const QueuedMessage = @import("./qnnt.zig").QueuedMessage;
 const fed = @import("./federation.zig");
 
@@ -28,7 +28,7 @@ fn source(_: []const u8, _: ?*anyopaque) ?[]const u8 {
 
 fn onMessage(_: []const u8, _: []const u8, _: ?*anyopaque) void {}
 
-fn onFrame(_: []const u8, _: tld.Frame, _: ?*anyopaque) void {}
+fn onFrame(_: []const u8, _: told.Frame, _: ?*anyopaque) void {}
 
 test "start and stop with no workers beyond the registry" {
     try startNode();

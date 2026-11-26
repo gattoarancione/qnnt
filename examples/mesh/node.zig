@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const qnnt = @import("qnnt").Qnnt;
-const tld = @import("qnnt").Tld;
+const told = @import("qnnt").Told;
 
 const allocator = std.heap.page_allocator;
 
@@ -31,7 +31,7 @@ const Sample = struct {
     mode: Mode,
     count: i32,
     temp: f32,
-    blob: tld.Bytes,
+    blob: told.Bytes,
     origin: Origin,
     readings: [3]Reading,
 };
@@ -88,12 +88,12 @@ fn peerPresent(name: []const u8) bool {
 
 /// One subscriber thread per topic, so each slot is touched by exactly one thread; the
 /// atomics are for main's benefit when it reads them at the end.
-fn onFrame(_: []const u8, frame: tld.Frame, context: ?*anyopaque) void {
+fn onFrame(_: []const u8, frame: told.Frame, context: ?*anyopaque) void {
     const peer: *Peer = @ptrCast(@alignCast(context.?));
 
     // No allocator: strings borrow from the frame, which is alive for this call and is all
     // the comparisons below need.
-    const got = tld.unpack(Sample, frame, null) catch {
+    const got = told.unpack(Sample, frame, null) catch {
         _ = peer.problems.fetchAdd(1, .monotonic);
         return;
     };
@@ -131,7 +131,7 @@ var gate_open = std.atomic.Value(bool).init(false);
 fn produce(_: []const u8, _: ?*anyopaque) ?[]const u8 {
     if (!gate_open.load(.monotonic)) return null;
     next_seq += 1;
-    tld.packTo(allocator, &out_frame, expected(next_seq, me)) catch return null;
+    told.packTo(allocator, &out_frame, expected(next_seq, me)) catch return null;
     return out_frame.items;
 }
 

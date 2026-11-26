@@ -8,7 +8,7 @@
 //!
 //!   examples/lidar/fake_rs16.zig   emits this format over UDP
 //!   this module                    receives and parses it
-//!   examples/lidar/sensor.zig      publishes the result as TLD
+//!   examples/lidar/sensor.zig      publishes the result as TOLD
 //!
 //! Fidelity, stated plainly. The packet structure is faithful: 1248 bytes as 42-byte
 //! header, 12 blocks of 100 bytes, 6-byte tail; each block a 0xFFEE flag, a big-endian

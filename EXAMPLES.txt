@@ -8,8 +8,8 @@ them, chosen by its first argument, so the same five roles exist three times ove
     role 0   publish test/topic-a at 100 Hz and test/topic-b at 20 Hz
     role 1   publish test/topic-c at 1 kHz, and subscribe to test/topic-a
     role 2   subscribe to test/topic-b and test/topic-c (no publishing)
-    role 3   TLD load generator on test/bench   [period_us] [payload_bytes]
-    role 4   TLD benchmark subscriber on test/bench   [report_ms]
+    role 3   TOLD load generator on test/bench   [period_us] [payload_bytes]
+    role 4   TOLD benchmark subscriber on test/bench   [report_ms]
 
 Topics and rates are identical across the languages, so any mix interoperates: a C
 role 0 feeding a Python role 2 is the same system as five Zig nodes.
@@ -30,8 +30,10 @@ That produces everything the examples need:
 
     zig-out/bin/node-c          the C program
     zig-out/bin/node-cpp        the C++ program
-    zig-out/lib/libqnnt_c.*     the shared library the Python package loads
-    zig-out/include/            qnnt.h, qnnt_tld.h, qnnt_tld.hpp
+    zig-out/lib/libqnnt_c.*     the node's C library
+    zig-out/lib/libtold.*       the TOLD codec's C library, built from deps/told; C and C++
+                                programs link both, and Python's `told` package loads it
+    zig-out/include/            qnnt.h, told.h, told.hpp
 
 For the benchmark roles (3 and 4) build optimised instead, or the numbers measure
 a debug build:
@@ -123,7 +125,7 @@ retries, so nothing has to be brought up first.
 
 
 --------------------------------------------------------------------------------
- 4. The TLD benchmark (two or three terminals)
+ 4. The TOLD benchmark (two or three terminals)
 --------------------------------------------------------------------------------
 
 One publisher, any number of subscribers, in any languages.
@@ -526,8 +528,6 @@ Everything else `zig build` can do:
 
     zig build test         all tests, plus every example compiled and the
                            self-checking demos run
-    zig build c-demo       TLD codec through the C ABI
-    zig build cpp-demo     TLD codec through the C++ wrapper
     zig build node-demo    a whole node in C, both delivery modes at once
     zig build python-demo  the Python package against the built library
     zig build wheel        build a Python wheel with the library bundled
@@ -581,12 +581,12 @@ See BENCHMARK.txt B.5 and B.7.
 Packing structs, and porting from msgpack
 -----------------------------------------
 
-TLD can carry a struct or class directly, the way MSGPACK::pack does, in all four
-languages. Run the examples:
+TOLD can carry a struct or class directly, the way MSGPACK::pack does, in all four
+languages. The examples live with the codec, in the TOLD repository (deps/told):
 
-    zig build tld-map        C++: TLD_* macros and the msgpack-shaped calls
-    zig build tld-map-c      C: a descriptor table
-    zig build test           includes both, plus the Zig and Python checks
+    cd deps/told && zig build told-map-cpp   C++: TOLD_* macros and the msgpack-shaped calls
+    cd deps/told && zig build told-map-c     C: a descriptor table
+    cd deps/told && zig build test           the codec's whole suite, in all four languages
 
 C++ lists its members once, as msgpack requires:
 
@@ -594,52 +594,52 @@ C++ lists its members once, as msgpack requires:
         std::uint8_t channel;
         double value;
         bool valid;
-        TLD_DEFINE_MAP(channel, value, valid)     // object, field names as keys
+        TOLD_DEFINE_MAP(channel, value, valid)     // object, field names as keys
     };
     struct Point {
         double x, y;
-        TLD_DEFINE(x, y)                          // array, positional and smaller
+        TOLD_DEFINE(x, y)                          // array, positional and smaller
     };
 
-    std::vector<std::uint8_t> bytes = qnnt::tld::pack(reading);
-    Reading back = qnnt::tld::unpack<Reading>(bytes);
+    std::vector<std::uint8_t> bytes = told::pack(reading);
+    Reading back = told::unpack<Reading>(bytes);
 
 Zig needs no declaration at all -- @typeInfo already knows the fields:
 
-    const got = try tld.unpackFrom(Sample, bytes, arena);   // arena owns the strings
-    try tld.packTo(allocator, &buf, sample);
+    const got = try told.unpackFrom(Sample, bytes, arena);   // arena owns the strings
+    try told.packTo(allocator, &buf, sample);
 
 Python uses a dataclass and its annotations:
 
-    data = qnnt.tld.pack(reading)                 # dataclass, Enum, dict, list...
-    back = qnnt.tld.unpack(Reading, data)
+    data = qnnt.told.pack(reading)                 # dataclass, Enum, dict, list...
+    back = qnnt.told.unpack(Reading, data)
 
 C describes the struct once as a table, since it has neither templates nor reflection:
 
-    static const qnnt_tld_field reading_fields[] = {
-        QNNT_TLD_FIELD(reading, channel, QNNT_TLD_F_U8),
-        QNNT_TLD_FIELD(reading, value,   QNNT_TLD_F_F64),
-        QNNT_TLD_FIELD(reading, valid,   QNNT_TLD_F_BOOL),
+    static const told_field reading_fields[] = {
+        TOLD_FIELD(reading, channel, TOLD_F_U8),
+        TOLD_FIELD(reading, value,   TOLD_F_F64),
+        TOLD_FIELD(reading, valid,   TOLD_F_BOOL),
     };
-    static const qnnt_tld_desc reading_desc = QNNT_TLD_DESC("reading", reading_fields, 1);
+    static const told_desc reading_desc = TOLD_DESC("reading", reading_fields, 1);
 
-    qnnt_tld_pack_struct(enc, &reading_desc, &value);
-    qnnt_tld_unpack_struct_bytes(bytes, len, &reading_desc, &out);
+    told_pack_struct(enc, &reading_desc, &value);
+    told_unpack_struct_bytes(bytes, len, &reading_desc, &out);
 
 porting from msgpack
 
-    MSGPACK_DEFINE(a, b)          ->  TLD_DEFINE(a, b)
-    MSGPACK_DEFINE_ARRAY(a, b)    ->  TLD_DEFINE_ARRAY(a, b)
-    MSGPACK_DEFINE_MAP(a, b)      ->  TLD_DEFINE_MAP(a, b)
-    MSGPACK_ADD_ENUM(E)           ->  TLD_ADD_ENUM(E)        optional: enums already work
-    MSGPACK_BASE(B)               ->  TLD_BASE(B)
-    MSGPACK_NVP("k", m)           ->  TLD_NVP("k", m)
-    MSGPACK::pack(ss, obj)        ->  qnnt::tld::pack(ss, obj)
-    MSGPACK::unpack(p, n)         ->  qnnt::tld::unpack(p, n)     .get().as<T>() unchanged
+    MSGPACK_DEFINE(a, b)          ->  TOLD_DEFINE(a, b)
+    MSGPACK_DEFINE_ARRAY(a, b)    ->  TOLD_DEFINE_ARRAY(a, b)
+    MSGPACK_DEFINE_MAP(a, b)      ->  TOLD_DEFINE_MAP(a, b)
+    MSGPACK_ADD_ENUM(E)           ->  TOLD_ADD_ENUM(E)        optional: enums already work
+    MSGPACK_BASE(B)               ->  TOLD_BASE(B)
+    MSGPACK_NVP("k", m)           ->  TOLD_NVP("k", m)
+    MSGPACK::pack(ss, obj)        ->  told::pack(ss, obj)
+    MSGPACK::unpack(p, n)         ->  told::unpack(p, n)     .get().as<T>() unchanged
 
-TLD_ADD_ENUM is a checked no-op: any enum, scoped or not, packs as its underlying integer
+TOLD_ADD_ENUM is a checked no-op: any enum, scoped or not, packs as its underlying integer
 without being declared, unlike msgpack which refuses an undeclared one. The macro exists so
-a ported file keeps compiling with the line left in. The QNNT_TLD_ prefixed spellings are
+a ported file keeps compiling with the line left in. The TOLD_ prefixed spellings are
 identical, for headers that would rather not take an unprefixed macro name.
 
 what the mapping does
@@ -651,17 +651,17 @@ what the mapping does
     Python also accept a name on the way in;
   * a non-negative integer takes the unsigned encoding whatever the declared type, which is
     a byte shorter for small values and makes all four languages emit the same bytes;
-  * `[]const u8` in Zig and std::string in C++ mean text; tld.Bytes and
+  * `[]const u8` in Zig and std::string in C++ mean text; told.Bytes and
     std::vector<std::uint8_t> mean a binary buffer;
-  * TLD_DEFINE_MAP costs the key bytes and tolerates reordering; TLD_DEFINE is smaller and
+  * TOLD_DEFINE_MAP costs the key bytes and tolerates reordering; TOLD_DEFINE is smaller and
     positional, so both ends must agree on the order. The same trade as msgpack's pair.
 
 C cannot express a dynamically sized member, so strings are fixed char[N], buffers are a
 fixed array plus a length member, and arrays are fixed length. Anything genuinely dynamic
 uses the encoder and iterator API directly, which has no such limit.
 
-lib/testdata/interop.tld is one frame of the schema in examples/tld_map.cpp, and every
-language is tested against it: Zig, C++ and Python each decode it AND re-encode it
+TOLD's src/testdata/interop.tld is one frame of the schema in its examples/told_map.cpp,
+and every language is tested against it: Zig, C++ and Python each decode it AND re-encode it
 byte-for-byte, and C decodes it through its descriptor table. That file is the guarantee
 that a struct packed in one language is readable in the others -- if a change breaks it,
 `zig build test` fails rather than a peer written in another language failing later.
@@ -677,7 +677,7 @@ is:
     zig build qt-demo -Dqt=/Users/you/Qt/6.10.3/macos
 
 It runs moc over the header and over examples/qt_demo.cpp, links the C ABI, and exercises
-the whole path: start a node, publish text and TLD frames, receive both as signals on the
+the whole path: start a node, publish text and TOLD frames, receive both as signals on the
 Qt thread, unpack a struct with QString and QList members, stop.
 
 Two design points worth knowing before reviewing it:
@@ -689,8 +689,8 @@ Two design points worth knowing before reviewing it:
     through a queued connection, so every slot runs on the receiving object's thread with a
     QByteArray it owns. That also turns one FFI crossing into a batch.
 
-The header carries TLD adaptors for QString, QByteArray, QList, QMap and QHash, so a Qt
-model class can be packed by the TLD_DEFINE_MAP macros directly.
+The header carries TOLD adaptors for QString, QByteArray, QList, QMap and QHash, so a Qt
+model class can be packed by the TOLD_DEFINE_MAP macros directly.
 
 What it does NOT declare, because the library cannot do it yet: request/reply
 (addResponder, request, requestAvailable), per-topic teardown (removePublisher,
@@ -737,7 +737,7 @@ replay, so those early samples are simply gone; each node therefore requires con
 wherever it attached, not from 1. A gap *inside* a run is a failure.
 
 The five declarations of the struct are independent -- a Zig struct, a C descriptor table,
-two C++ classes with TLD_DEFINE_MAP (one using std::string and std::vector, one using
+two C++ classes with TOLD_DEFINE_MAP (one using std::string and std::vector, one using
 QString and QList), and a Python dataclass. Nothing is generated from anything else; they
 meet on the wire. The schema avoids optionals, maps and dynamic strings precisely because C
 cannot express them, and a schema only four of the five could carry would not be a common
@@ -960,8 +960,8 @@ byte-exact:
     qnnt-cat --max 4 --raw test/bench > cap.bin     # 124 bytes, four frames
     qnnt-cat --publish --raw test/replay < cap.bin  # byte-identical on the far side
 
-It round-trips with no side-channel because a TLD frame carries its own length --
-`tld.frameSize` returns null while the bytes so far are only a prefix of one -- so a file of
+It round-trips with no side-channel because a TOLD frame carries its own length --
+`told.frameSize` returns null while the bytes so far are only a prefix of one -- so a file of
 concatenated frames needs no index. `--hex` round-trips too, and stays hand-editable:
 whitespace between pairs is ignored.
 
@@ -974,7 +974,7 @@ allows -- a 2 Hz stream comes back in under a millisecond. And it does not recor
 topic each message came from, so a capture over a glob merges several topics into one
 stream that cannot be separated again.
 
-`--dump` wraps each message in a small TLD envelope that carries both, and `--restore`
+`--dump` wraps each message in a small TOLD envelope that carries both, and `--restore`
 reads it back:
 
     { "t": <arrival time, microseconds>, "topic": "<name>", "data": <the payload> }
@@ -1012,7 +1012,7 @@ at 1.0 rather than passing through a float, so a dump taken without it carries t
 times it claims to.
 
 An envelope rather than a format of its own, because then a capture is still a stream of
-TLD frames: `frameSize` splits it, `qnnt-cat --hex` reads it, and any language with a TLD
+TOLD frames: `frameSize` splits it, `qnnt-cat --hex` reads it, and any language with a TOLD
 decoder can too. The timestamp is when the capturing process received the message, which is
 what reproduces the pace actually observed -- a publish time inside someone's payload is
 their schema's business, not the envelope's.
@@ -1025,9 +1025,9 @@ worked.
 
 Four things about it are decisions rather than accidents:
 
-  * TLD or text is chosen when SUBSCRIBING, not when printing, so it cannot be guessed from
-    a topic name -- hence `--text` rather than a heuristic. A TLD frame is length-prefixed
-    and its payload contains 0x0A freely; a text topic is newline-delimited. Read a TLD
+  * TOLD or text is chosen when SUBSCRIBING, not when printing, so it cannot be guessed from
+    a topic name -- hence `--text` rather than a heuristic. A TOLD frame is length-prefixed
+    and its payload contains 0x0A freely; a text topic is newline-delimited. Read a TOLD
     topic as text and the newlines inside frames split and join them into garbage.
   * globs read but do not write. A glob matches against the registry's list of topics that
     EXIST, and publishing is how a topic comes to exist, so a wildcard under `--publish` is
@@ -1143,7 +1143,7 @@ side by side:
     shm.zig         the handoff: a ring of frame slots in shared memory
     zed.zig        the driver: read, validate, calibrate
     frame.zig       the model-independent vocabulary and the deprojection
-    camera.zig      the qnnt node: TLD, three topics
+    camera.zig      the qnnt node: TOLD, three topics
     viewer.cpp      Qt/QML: the mono image and depth, colourised
 
     zig build zed -Dqt=/path/to/Qt/6.10.3/macos
@@ -1188,7 +1188,7 @@ would have lock-stepped the camera to the reader through a 64 KB buffer -- throt
 sensor, which real hardware cannot do. Measured through shared memory: 120 frames a second
 of 6.2 MB frames, 746 MB/s, zero loss.
 
-Supporting 1080p meant fixing a library bug worth knowing about independently. The TLD
+Supporting 1080p meant fixing a library bug worth knowing about independently. The TOLD
 subscriber capped a frame at 1 MiB while the publisher had no limit at all, so a producer
 could emit frames every subscriber refused -- and refusal is not graceful: the read loop
 breaks and reconnects into the same frame forever, while the producer sees nothing wrong.
@@ -1366,7 +1366,7 @@ WHAT A DAY WITH REAL HARDWARE ACTUALLY FOUND. Four defects, none of which a
 simulator would have shown, and two of them were mine misreading the evidence:
 
   * Commands never arrived at all. The subscription used text delivery, which waits
-    for a newline delimiter that binary TLD never contains -- so the handler was
+    for a newline delimiter that binary TOLD never contains -- so the handler was
     never called and nothing reported why. The bridge now counts and prints
     undecodable commands rather than swallowing them.
   * Both loops hung indefinitely. std.http.Client has no read deadline, so when a
@@ -1981,7 +1981,7 @@ WHAT IS CHECKED, and each of these is a bug that actually happened or nearly did
 
 THE CROSS-LANGUAGE CHECK is the one nothing else makes. The station's structs and
 the bridge's must agree field by field, and a mismatch is silent on both sides:
-TLD ignores a key the receiving struct does not declare, and the TLD_DEFINE_MAP
+TOLD ignores a key the receiving struct does not declare, and the TOLD_DEFINE_MAP
 macros leave a member the frame did not carry exactly as its constructor left it.
 The result is plausible data -- a light that reports itself uncontrollable, a
 sensor with no room -- not an error.
@@ -2257,7 +2257,7 @@ Three of its decisions are worth knowing.
 Its own topic matches its own pattern, so the station appears in its own gateway list --
 marked, because a reader who did not know that would think a gateway had duplicated.
 
-Watching it needs no special tool either. The frames are TLD on ordinary topics:
+Watching it needs no special tool either. The frames are TOLD on ordinary topics:
 
     qnnt-ls --tree
     qnnt-cat 'can/powertrain/*'          # every host's view of one bus
@@ -2311,7 +2311,7 @@ that does not need a kernel:
     docker/can.sh shell alpha
 
 `wire` runs examples/can/wire_check.py in place of the gateways. It speaks exactly the same
-topics and publishes exactly the same TLD frames, so it exercises the topic layout, the glob
+topics and publishes exactly the same TOLD frames, so it exercises the topic layout, the glob
 subscription, the federated directory and the frame format -- everything except the socket.
 It is also a cross-language check on that format: the frames are packed by Python against
 the field names in frame.zig, so a rename on either side shows up as a gateway that receives
@@ -2358,7 +2358,7 @@ renamed on either side fails a test instead of drawing a frame with identifier 0
 
 That last layer found a hole in the C API rather than in itself. An empty payload -- a
 legal CAN frame with DLC 0, and every remote request -- could not be encoded from C++:
-`std::vector<T>::data()` on an empty vector may return null, and the TLD writers rejected a
+`std::vector<T>::data()` on an empty vector may return null, and the TOLD writers rejected a
 null pointer outright instead of reading (null, 0) as the empty buffer it means in C. It
 threw, and in the station an uncaught exception took the window down. The three writers now
 accept it.

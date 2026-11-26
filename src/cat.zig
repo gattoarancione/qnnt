@@ -12,8 +12,8 @@
 //! the payload. That is the whole reason this is its own command rather than a flag on
 //! qnnt-ls: one of them writes data, the other writes a report about data.
 //!
-//! Capture and replay round-trip without a side-channel because a TLD frame carries its own
-//! length -- `tld.frameSize` finds the boundary -- so a file of concatenated frames needs no
+//! Capture and replay round-trip without a side-channel because a TOLD frame carries its own
+//! length -- `told.frameSize` finds the boundary -- so a file of concatenated frames needs no
 //! index and no separators. Text topics are newline-delimited and self-describing the same
 //! way, under --text.
 //!
@@ -24,7 +24,7 @@
 const std = @import("std");
 const root = @import("qnnt");
 const qnnt = root.Qnnt;
-const tld = root.Tld;
+const told = root.Told;
 const stdout = @import("stdout");
 
 const allocator = std.heap.page_allocator;
@@ -38,7 +38,7 @@ const max_pattern = 32;
 /// payload and nothing else: perfect fidelity for one topic, but a capture over a glob merges
 /// several topics into one stream with no way to tell them apart, and nothing records when
 /// anything arrived, so a replay runs as fast as the pipe allows. `dump` wraps each message
-/// in a small TLD envelope carrying the arrival time and the topic, which costs a few bytes
+/// in a small TOLD envelope carrying the arrival time and the topic, which costs a few bytes
 /// and buys back both -- and `--restore` is the only thing that reads it.
 const Format = enum { decoded, hex, raw, dump };
 
@@ -103,11 +103,11 @@ fn countMessage() bool {
     return true;
 }
 
-/// One captured message as a TLD object: {t, topic, data}.
+/// One captured message as a TOLD object: {t, topic, data}.
 ///
-/// A TLD frame rather than a format of its own, because then a capture is still a stream of
-/// TLD frames -- `frameSize` splits it, `qnnt-cat --hex` reads it, and any language with a
-/// TLD decoder can too. The timestamp is when this process received the message, which is
+/// A TOLD frame rather than a format of its own, because then a capture is still a stream of
+/// TOLD frames -- `frameSize` splits it, `qnnt-cat --hex` reads it, and any language with a
+/// TOLD decoder can too. The timestamp is when this process received the message, which is
 /// what reproduces the pace actually observed; a publish time inside someone's payload is
 /// their schema's business, not the envelope's.
 fn writeEnvelope(topic: []const u8, bytes: []const u8) void {
@@ -119,7 +119,7 @@ fn writeEnvelope(topic: []const u8, bytes: []const u8) void {
     const base = dump_base_us.load(.monotonic);
     const stamp = base + scaleInterval(now -| base, opt_throttle);
 
-    var enc = tld.Encoder.init(allocator, &frame);
+    var enc = told.Encoder.init(allocator, &frame);
     const obj = enc.beginObject();
     enc.writeKey("t") catch return;
     enc.writeUint(stamp) catch return;
@@ -132,7 +132,7 @@ fn writeEnvelope(topic: []const u8, bytes: []const u8) void {
     writeOut(frame.items);
 }
 
-fn emit(topic: []const u8, bytes: []const u8, frame: ?tld.Frame) void {
+fn emit(topic: []const u8, bytes: []const u8, frame: ?told.Frame) void {
     if (opt_format == .dump) {
         writeEnvelope(topic, bytes);
         return;
@@ -172,7 +172,7 @@ fn emit(topic: []const u8, bytes: []const u8, frame: ?tld.Frame) void {
     writeOut(line.items);
 }
 
-fn onFrame(topic: []const u8, frame: tld.Frame, _: ?*anyopaque) void {
+fn onFrame(topic: []const u8, frame: told.Frame, _: ?*anyopaque) void {
     if (!countMessage()) return;
     emit(topic, frame.raw, frame);
 }
@@ -185,9 +185,9 @@ fn onText(topic: []const u8, msg: []const u8, _: ?*anyopaque) void {
 /// A frame to text. The depth bound is what keeps a deeply nested payload from recursing
 /// this process through its stack -- the frame arrives from the network and its shape is
 /// not this tool's to trust.
-fn stringifyFrame(frame: tld.Frame) ?[]u8 {
+fn stringifyFrame(frame: told.Frame) ?[]u8 {
     var out: std.ArrayList(u8) = .empty;
-    tld.stringify(frame, allocator, &out, 32) catch {
+    told.stringify(frame, allocator, &out, 32) catch {
         out.deinit(allocator);
         return null;
     };
@@ -371,7 +371,7 @@ fn runPublish(list: [][]const u8, wait_ms: u64, throttle: f64) void {
     }
 }
 
-/// Replay a stream of concatenated TLD frames. `frameSize` returns null when the bytes so
+/// Replay a stream of concatenated TOLD frames. `frameSize` returns null when the bytes so
 /// far are a prefix of a frame rather than a whole one, which is exactly the "need more"
 /// signal a stream needs -- so no length index, no separators, and a file produced by
 /// `--raw` goes back in without transformation.
@@ -385,8 +385,8 @@ fn replayFrames(list: [][]const u8, reader: *std.Io.Reader) void {
     while (!qnnt.stopRequested()) {
         // Drain every complete frame the buffer already holds before reading more.
         while (true) {
-            const size = tld.frameSize(pending.items) catch {
-                std.debug.print("qnnt-cat: stdin is not a stream of TLD frames\n", .{});
+            const size = told.frameSize(pending.items) catch {
+                std.debug.print("qnnt-cat: stdin is not a stream of TOLD frames\n", .{});
                 return;
             } orelse break;
             if (size > pending.items.len) break;
@@ -438,13 +438,13 @@ fn replayDump(override: [][]const u8, reader: *std.Io.Reader, throttle: f64, wai
 
     while (!qnnt.stopRequested()) {
         while (true) {
-            const size = tld.frameSize(pending.items) catch {
-                std.debug.print("qnnt-cat: stdin is not a stream of TLD frames\n", .{});
+            const size = told.frameSize(pending.items) catch {
+                std.debug.print("qnnt-cat: stdin is not a stream of TOLD frames\n", .{});
                 return;
             } orelse break;
             if (size > pending.items.len) break;
 
-            const frame = tld.validate(pending.items[0..size], 32) catch {
+            const frame = told.validate(pending.items[0..size], 32) catch {
                 std.debug.print("qnnt-cat: a frame in the capture did not decode\n", .{});
                 return;
             };
@@ -529,7 +529,7 @@ const Envelope = struct { t: u64, topic: []const u8, data: []const u8 };
 /// Read one {t, topic, data} envelope, or null if this frame is not one. Null is a
 /// legitimate answer rather than an error: it is how a --raw capture fed to --restore is
 /// recognised and reported instead of being replayed as nonsense.
-fn readEnvelope(frame: tld.Frame) ?Envelope {
+fn readEnvelope(frame: told.Frame) ?Envelope {
     if (frame.type != .object) return null;
 
     var t: ?u64 = null;
@@ -589,7 +589,7 @@ fn usage() void {
         \\                  quarter as long (four times faster), 0.25 makes it four times
         \\                  longer. On --dump it scales the intervals recorded, on --restore
         \\                  the intervals waited, and the two compose. Default 1.0.
-        \\  --text          newline-delimited instead of TLD-framed, for line topics
+        \\  --text          newline-delimited instead of TOLD-framed, for line topics
         \\  --time          prefix each line with the time (not with --raw)
         \\  --max <n>       stop after n messages
         \\  --rescan <ms>   how often to re-match globs while reading (default 1000;
@@ -812,7 +812,7 @@ test "a frame stream splits on its own lengths, with no separators" {
     for (0..3) |i| {
         var one: std.ArrayList(u8) = .empty;
         defer one.deinit(testing.allocator);
-        var enc = tld.Encoder.init(testing.allocator, &one);
+        var enc = told.Encoder.init(testing.allocator, &one);
         const obj = enc.beginObject();
         try enc.writeKey("seq");
         try enc.writeUint(i);
@@ -824,9 +824,9 @@ test "a frame stream splits on its own lengths, with no separators" {
     var at: usize = 0;
     var found: usize = 0;
     while (at < stream.items.len) {
-        const size = (try tld.frameSize(stream.items[at..])) orelse break;
+        const size = (try told.frameSize(stream.items[at..])) orelse break;
         try testing.expectEqual(sizes[found], size);
-        const frame = try tld.validate(stream.items[at..][0..size], 32);
+        const frame = try told.validate(stream.items[at..][0..size], 32);
         try testing.expectEqual(size, frame.size());
         at += size;
         found += 1;
@@ -836,9 +836,9 @@ test "a frame stream splits on its own lengths, with no separators" {
 
     // A prefix of a frame reports "not yet", which is what lets the replay loop wait for
     // more bytes instead of mistaking a short read for corruption.
-    try testing.expect((try tld.frameSize(stream.items[0..1])) != null); // header known
+    try testing.expect((try told.frameSize(stream.items[0..1])) != null); // header known
     const partial = stream.items[0 .. sizes[0] - 1];
-    const size = try tld.frameSize(partial);
+    const size = try told.frameSize(partial);
     try testing.expect(size == null or size.? > partial.len);
 }
 
@@ -846,7 +846,7 @@ test "an envelope carries the time and topic back out again" {
     var frame: std.ArrayList(u8) = .empty;
     defer frame.deinit(testing.allocator);
 
-    var enc = tld.Encoder.init(testing.allocator, &frame);
+    var enc = told.Encoder.init(testing.allocator, &frame);
     const obj = enc.beginObject();
     try enc.writeKey("t");
     try enc.writeUint(1788463155061346);
@@ -856,7 +856,7 @@ test "an envelope carries the time and topic back out again" {
     try enc.writeBuffer(&.{ 0xde, 0xad, 0xbe, 0xef });
     try enc.end(obj);
 
-    const env = readEnvelope(try tld.validate(frame.items, 32)) orelse
+    const env = readEnvelope(try told.validate(frame.items, 32)) orelse
         return error.ShouldHaveReadEnvelope;
     try testing.expectEqual(@as(u64, 1788463155061346), env.t);
     try testing.expectEqualStrings("lidar/helios32", env.topic);
@@ -870,7 +870,7 @@ test "a plain frame is not mistaken for an envelope" {
     var frame: std.ArrayList(u8) = .empty;
     defer frame.deinit(testing.allocator);
 
-    var enc = tld.Encoder.init(testing.allocator, &frame);
+    var enc = told.Encoder.init(testing.allocator, &frame);
     const obj = enc.beginObject();
     try enc.writeKey("seq");
     try enc.writeUint(7);
@@ -878,13 +878,13 @@ test "a plain frame is not mistaken for an envelope" {
     try enc.writeUint(999);
     try enc.end(obj);
 
-    try testing.expect(readEnvelope(try tld.validate(frame.items, 32)) == null);
+    try testing.expect(readEnvelope(try told.validate(frame.items, 32)) == null);
 
     // A scalar frame is not one either.
     frame.clearRetainingCapacity();
-    var enc2 = tld.Encoder.init(testing.allocator, &frame);
+    var enc2 = told.Encoder.init(testing.allocator, &frame);
     try enc2.writeUint(42);
-    try testing.expect(readEnvelope(try tld.validate(frame.items, 32)) == null);
+    try testing.expect(readEnvelope(try told.validate(frame.items, 32)) == null);
 }
 
 test "envelopes concatenate into a stream that splits on its own lengths" {
@@ -896,7 +896,7 @@ test "envelopes concatenate into a stream that splits on its own lengths" {
     for (0..3) |i| {
         var one: std.ArrayList(u8) = .empty;
         defer one.deinit(testing.allocator);
-        var enc = tld.Encoder.init(testing.allocator, &one);
+        var enc = told.Encoder.init(testing.allocator, &one);
         const obj = enc.beginObject();
         try enc.writeKey("t");
         try enc.writeUint(1000 + i * 500);
@@ -912,8 +912,8 @@ test "envelopes concatenate into a stream that splits on its own lengths" {
     var seen_t: [3]u64 = undefined;
     var n: usize = 0;
     while (at < stream.items.len) {
-        const size = (try tld.frameSize(stream.items[at..])) orelse break;
-        const env = readEnvelope(try tld.validate(stream.items[at..][0..size], 32)).?;
+        const size = (try told.frameSize(stream.items[at..])) orelse break;
+        const env = readEnvelope(try told.validate(stream.items[at..][0..size], 32)).?;
         seen_t[n] = env.t;
         n += 1;
         at += size;

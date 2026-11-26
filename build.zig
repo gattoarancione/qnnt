@@ -36,6 +36,13 @@ pub fn build(b: *Build) void {
             .link_libc = true,
     });
 
+    // The TOLD codec, a git submodule at deps/told (`git submodule update --init`). It began
+    // as qnnt's TLD and is a project of its own now; qnnt uses its Zig module directly, its
+    // frame layout for the C callbacks, and its C library for everything else.
+    const told_dep = b.dependency("told", .{ .target = target, .optimize = optimize });
+    const told_include = told_dep.path("include");
+    qnnt_lib_mod.addImport("told", told_dep.module("told"));
+
     // Glob matching and the '/'-segment tree, shared by the console tools so qnnt-ls and
     // qnnt-cat cannot disagree about what a pattern means -- what one lists must be what
     // the other subscribes to.
@@ -359,30 +366,33 @@ pub fn build(b: *Build) void {
     }
 
 
-    // The TLD codec's C ABI, built both ways: static for C/C++ callers that link, shared
-    // for anything that loads it at runtime (ctypes/cffi will want the latter). Its root
-    // is only the codec, so the shared object pulls in no threads and no sockets.
-    const tld_c_mod = b.createModule(.{
-        .root_source_file = b.path("lib/tld_c.zig"),
+    // TOLD's C ABI, built here from the submodule's source, both ways: static for C/C++
+    // callers that link, shared for anything that loads it at runtime -- Python's `told`
+    // package does. qnnt's own C library leaves these exports to it (see below), as TOLD's
+    // build intends for a library that hands TOLD frames to its callers.
+    const told_c_mod = b.createModule(.{
+        .root_source_file = told_dep.path("src/told_c.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    var tld_c_static: *Build.Step.Compile = undefined;
+    var told_static: *Build.Step.Compile = undefined;
+    var told_dynamic: *Build.Step.Compile = undefined;
     for ([_]std.builtin.LinkMode{ .static, .dynamic }) |linkage| {
         const lib = b.addLibrary(.{
             .linkage = linkage,
-            .name = "qnnt_tld",
-            .root_module = tld_c_mod,
+            .name = "told",
+            .root_module = told_c_mod,
         });
-        lib.installHeader(b.path("include/qnnt_tld.h"), "qnnt_tld.h");
-        lib.installHeader(b.path("include/qnnt_tld.hpp"), "qnnt_tld.hpp");
+        lib.installHeader(told_dep.path("include/told.h"), "told.h");
+        lib.installHeader(told_dep.path("include/told.hpp"), "told.hpp");
         b.installArtifact(lib);
-        if (linkage == .static) tld_c_static = lib;
+        if (linkage == .static) told_static = lib else told_dynamic = lib;
     }
 
-    // The full node C ABI: lifecycle, publishing, both subscription modes, and the TLD
-    // exports folded in so one library carries the whole surface.
+    // The full node C ABI: lifecycle, publishing and both subscription modes. A frame
+    // callback hands out a told_frame, so this takes TOLD's frame layout (`told_abi`) and
+    // nothing more: the told_* functions are libtold's, and C callers link both.
     const qnnt_c_mod = b.createModule(.{
         .root_source_file = b.path("lib/qnnt_c.zig"),
         .target = target,
@@ -390,6 +400,8 @@ pub fn build(b: *Build) void {
         // Same reason as qnnt_lib_mod above: getenv and pthreads.
         .link_libc = true,
     });
+    qnnt_c_mod.addImport("told_abi", told_dep.module("told_abi"));
+    qnnt_c_mod.addImport("told", told_dep.module("told"));
 
     var qnnt_c_static: *Build.Step.Compile = undefined;
     var qnnt_c_dynamic: *Build.Step.Compile = undefined;
@@ -400,8 +412,8 @@ pub fn build(b: *Build) void {
             .root_module = qnnt_c_mod,
         });
         lib.installHeader(b.path("include/qnnt.h"), "qnnt.h");
-        lib.installHeader(b.path("include/qnnt_tld.h"), "qnnt_tld.h");
-        lib.installHeader(b.path("include/qnnt_tld.hpp"), "qnnt_tld.hpp");
+        lib.installHeader(told_dep.path("include/told.h"), "told.h");
+        lib.installHeader(told_dep.path("include/told.hpp"), "told.hpp");
         b.installArtifact(lib);
         if (linkage == .static) qnnt_c_static = lib else qnnt_c_dynamic = lib;
     }
@@ -479,7 +491,7 @@ pub fn build(b: *Build) void {
     b.installArtifact(fake_helios);
     lidar_step.dependOn(&b.addInstallArtifact(fake_helios, .{}).step);
 
-    // The bridge: driver in, TLD topic out.
+    // The bridge: driver in, TOLD topic out.
     const lidar_mod = b.createModule(.{
         .root_source_file = b.path("examples/lidar/sensor.zig"),
         .target = target,
@@ -505,6 +517,8 @@ pub fn build(b: *Build) void {
         const moc = b.addSystemCommand(&.{b.pathJoin(&.{ qt_path, "libexec", "moc" })});
         moc.addArgs(&.{"-I"});
         moc.addDirectoryArg(b.path("include"));
+        moc.addArgs(&.{"-I"});
+        moc.addDirectoryArg(told_include);
         moc.addFileArg(b.path("include/qnnt_qt.hpp"));
         moc.addArg("-o");
         const moc_out = moc.addOutputFileArg("moc_qnnt_qt.cpp");
@@ -515,6 +529,8 @@ pub fn build(b: *Build) void {
         const moc_demo = b.addSystemCommand(&.{b.pathJoin(&.{ qt_path, "libexec", "moc" })});
         moc_demo.addArgs(&.{"-I"});
         moc_demo.addDirectoryArg(b.path("include"));
+        moc_demo.addArgs(&.{"-I"});
+        moc_demo.addDirectoryArg(told_include);
         moc_demo.addFileArg(b.path("examples/qt_demo.cpp"));
         moc_demo.addArg("-o");
         const demo_moc_out = moc_demo.addOutputFileArg("qt_demo.moc");
@@ -548,6 +564,8 @@ pub fn build(b: *Build) void {
             qt_mod.linkSystemLibrary("Qt6Core", .{});
         }
         qt_mod.linkLibrary(qnnt_c_static);
+        qt_mod.linkLibrary(told_static);
+        qt_mod.addIncludePath(told_include);
 
         const qt_demo = b.addExecutable(.{ .name = "qt-demo", .root_module = qt_mod });
         b.installArtifact(qt_demo);
@@ -618,6 +636,8 @@ pub fn build(b: *Build) void {
             const ex_moc = b.addSystemCommand(&.{b.pathJoin(&.{ qt_path, "libexec", "moc" })});
             ex_moc.addArgs(&.{"-I"});
             ex_moc.addDirectoryArg(b.path("include"));
+            ex_moc.addArgs(&.{"-I"});
+            ex_moc.addDirectoryArg(told_include);
             ex_moc.addFileArg(b.path(ex.src));
             ex_moc.addArg("-o");
             const ex_moc_out = ex_moc.addOutputFileArg(b.fmt("{s}.moc", .{std.fs.path.stem(ex.src)}));
@@ -654,6 +674,8 @@ pub fn build(b: *Build) void {
                 }
             }
             ex_mod.linkLibrary(qnnt_c_static);
+            ex_mod.linkLibrary(told_static);
+            ex_mod.addIncludePath(told_include);
 
             const exe = b.addExecutable(.{ .name = ex.name, .root_module = ex_mod });
             b.installArtifact(exe);
@@ -732,6 +754,8 @@ pub fn build(b: *Build) void {
         });
         mod.addIncludePath(b.path("include"));
         mod.linkLibrary(qnnt_c_static);
+        mod.linkLibrary(told_static);
+        mod.addIncludePath(told_include);
 
         const exe = b.addExecutable(.{ .name = node.name, .root_module = mod });
         b.installArtifact(exe);
@@ -808,7 +832,6 @@ pub fn build(b: *Build) void {
     // registry port and build steps run in parallel. Each now uses a port of its own
     // (22300 tests, 22301 the C node demo, 22302 Python), so they are independent.
     for ([_][]const u8{
-        "lib/tld.zig",
         "lib/resolve.zig",
         "lib/env.zig",
         "lib/qnnt.zig",
@@ -842,6 +865,10 @@ pub fn build(b: *Build) void {
             .link_libc = true, // threads and getenv, as above
         });
 
+        // The library itself imports TOLD as a module, the way qnnt_lib_mod does.
+        if (std.mem.startsWith(u8, src, "lib/")) {
+            test_mod.addImport("told", told_dep.module("told"));
+        }
         // The tools under src/ reach the library through the `qnnt` module the way any
         // consumer does, so their tests need it wired up; the lib/ files are the library.
         // lib/topics.zig deliberately needs neither -- it touches no network, which is why
@@ -851,7 +878,7 @@ pub fn build(b: *Build) void {
             test_mod.addImport("qnnt", qnnt_lib_mod);
             test_mod.addImport("stdout", stdout_mod);
         }
-        // The CAN wire format is defined in terms of TLD and matched with the library's
+        // The CAN wire format is defined in terms of TOLD and matched with the library's
         // own matcher, so its tests reach the library the way the gateway does.
         if (std.mem.startsWith(u8, src, "examples/can/")) {
             test_mod.linkLibrary(qnnt_lib);
@@ -925,49 +952,6 @@ pub fn build(b: *Build) void {
         }
     }
 
-    // A C program compiled against the header and linked to the static library. This is
-    // the only thing that actually checks the hand-written header against the exports,
-    // so `zig build test` depends on it: a mismatch there is invisible from Zig.
-    const c_demo_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    c_demo_mod.addCSourceFile(.{
-        .file = b.path("examples/tld_demo.c"),
-        .flags = c_flags,
-    });
-    c_demo_mod.addIncludePath(b.path("include"));
-    c_demo_mod.linkLibrary(tld_c_static);
-
-    const c_demo = b.addExecutable(.{ .name = "tld-demo-c", .root_module = c_demo_mod });
-    b.installArtifact(c_demo);
-
-    const run_c_demo = b.addRunArtifact(c_demo);
-    const c_demo_step = b.step("c-demo", "Build and run the C example against the TLD C ABI");
-    c_demo_step.dependOn(&run_c_demo.step);
-
-    // Same for C++: the header-only wrapper is only proven by compiling it.
-    const cpp_demo_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .link_libcpp = true,
-    });
-    cpp_demo_mod.addCSourceFile(.{
-        .file = b.path("examples/tld_demo.cpp"),
-        .flags = cpp_flags,
-    });
-    cpp_demo_mod.addIncludePath(b.path("include"));
-    cpp_demo_mod.linkLibrary(tld_c_static);
-
-    const cpp_demo = b.addExecutable(.{ .name = "tld-demo-cpp", .root_module = cpp_demo_mod });
-    b.installArtifact(cpp_demo);
-
-    const run_cpp_demo = b.addRunArtifact(cpp_demo);
-    const cpp_demo_step = b.step("cpp-demo", "Build and run the C++ example against the wrapper");
-    cpp_demo_step.dependOn(&run_cpp_demo.step);
-
     // The C++ logic the viewers depend on, extracted into headers so it can be tested with
     // no Qt, no hub and no robot. Deliberately not behind -Dqt=: anything testable only
     // through the Qt executables would in practice never run, which is how this side of
@@ -982,64 +966,16 @@ pub fn build(b: *Build) void {
         .file = b.path("examples/cpp_logic_test.cpp"),
         .flags = cpp_flags,
     });
-    // The golden-frame checks decode real TLD, so this needs the wrapper and the C library
+    // The golden-frame checks decode real TOLD, so this needs the wrapper and the C library
     // behind it -- but still no Qt.
     cpp_logic_mod.addIncludePath(b.path("include"));
-    cpp_logic_mod.linkLibrary(tld_c_static);
+    cpp_logic_mod.addIncludePath(told_include);
+    cpp_logic_mod.linkLibrary(told_static);
 
     const cpp_logic = b.addExecutable(.{ .name = "cpp-logic-test", .root_module = cpp_logic_mod });
     const run_cpp_logic = b.addRunArtifact(cpp_logic);
     const cpp_logic_step = b.step("cpp-logic", "Run the Qt-free C++ logic checks");
     cpp_logic_step.dependOn(&run_cpp_logic.step);
-
-    // The struct mapping in C++: TLD_* macros, the msgpack-shaped calls, and the check
-    // that this side agrees byte-for-byte with the Zig and Python mappings on one golden
-    // frame. That agreement is the only thing standing between a C++ producer and a Zig
-    // consumer, so it belongs in `test`.
-    const tld_map_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .link_libcpp = true,
-    });
-    tld_map_mod.addCSourceFile(.{
-        .file = b.path("examples/tld_map.cpp"),
-        .flags = cpp_flags,
-    });
-    tld_map_mod.addIncludePath(b.path("include"));
-    tld_map_mod.linkLibrary(tld_c_static);
-
-    const tld_map = b.addExecutable(.{ .name = "tld-map-cpp", .root_module = tld_map_mod });
-    b.installArtifact(tld_map);
-
-    const run_tld_map = b.addRunArtifact(tld_map);
-    // Reads lib/testdata/interop.tld by a relative path, so it must run from the root.
-    run_tld_map.setCwd(b.path("."));
-    const tld_map_step = b.step("tld-map", "Build and run the C++ struct-mapping example");
-    tld_map_step.dependOn(&run_tld_map.step);
-
-    // And the same mapping from C, where the schema is a descriptor table rather than a
-    // macro. It reads the same golden frame, so all four languages are pinned to one
-    // artifact.
-    const tld_map_c_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    tld_map_c_mod.addCSourceFile(.{
-        .file = b.path("examples/tld_map.c"),
-        .flags = c_flags,
-    });
-    tld_map_c_mod.addIncludePath(b.path("include"));
-    tld_map_c_mod.linkLibrary(tld_c_static);
-
-    const tld_map_c = b.addExecutable(.{ .name = "tld-map-c", .root_module = tld_map_c_mod });
-    b.installArtifact(tld_map_c);
-
-    const run_tld_map_c = b.addRunArtifact(tld_map_c);
-    run_tld_map_c.setCwd(b.path("."));
-    const tld_map_c_step = b.step("tld-map-c", "Build and run the C struct-mapping example");
-    tld_map_c_step.dependOn(&run_tld_map_c.step);
 
     // A whole node driven from C: schedule a publisher, consume the same topic through a
     // callback and through the queue at once.
@@ -1054,6 +990,8 @@ pub fn build(b: *Build) void {
     });
     node_demo_mod.addIncludePath(b.path("include"));
     node_demo_mod.linkLibrary(qnnt_c_static);
+    node_demo_mod.linkLibrary(told_static);
+    node_demo_mod.addIncludePath(told_include);
 
     const node_demo = b.addExecutable(.{ .name = "node-demo-c", .root_module = node_demo_mod });
     b.installArtifact(node_demo);
@@ -1066,6 +1004,7 @@ pub fn build(b: *Build) void {
     // passed as an argument so the script never has to guess which build it is testing.
     const python_demo = b.addSystemCommand(&.{ "python3", "python/demo.py" });
     python_demo.addFileArg(qnnt_c_dynamic.getEmittedBin());
+    python_demo.addFileArg(told_dynamic.getEmittedBin());
     const python_step = b.step("python-demo", "Run the Python package against the built library");
     python_step.dependOn(&python_demo.step);
 
@@ -1075,6 +1014,13 @@ pub fn build(b: *Build) void {
     const bundle = b.addUpdateSourceFiles();
     bundle.addCopyFileToSource(qnnt_c_dynamic.getEmittedBin(), b.fmt("python/qnnt/_lib/{s}", .{
         qnnt_c_dynamic.out_filename,
+    }));
+    // TOLD's Python package rides in the same wheel, with libtold where it looks for it.
+    // Generated like the library copy above: python/told/ is not authored here.
+    bundle.addCopyFileToSource(told_dep.path("python/told/__init__.py"), "python/told/__init__.py");
+    bundle.addCopyFileToSource(told_dep.path("python/told/_lib.py"), "python/told/_lib.py");
+    bundle.addCopyFileToSource(told_dynamic.getEmittedBin(), b.fmt("python/told/_lib/{s}", .{
+        told_dynamic.out_filename,
     }));
 
     const wheel = b.addSystemCommand(&.{
@@ -1122,6 +1068,8 @@ pub fn build(b: *Build) void {
         });
         mod.addIncludePath(b.path("include"));
         mod.linkLibrary(qnnt_c_static);
+        mod.linkLibrary(told_static);
+        mod.addIncludePath(told_include);
 
         const exe = b.addExecutable(.{ .name = lang.name, .root_module = mod });
         b.installArtifact(exe);
@@ -1135,16 +1083,13 @@ pub fn build(b: *Build) void {
         test_step.dependOn(&exe.step);
     }
 
-    test_step.dependOn(&run_c_demo.step);
-    test_step.dependOn(&run_cpp_demo.step);
     test_step.dependOn(&run_cpp_logic.step);
     test_step.dependOn(&run_node_demo.step);
-    test_step.dependOn(&run_tld_map.step);
-    test_step.dependOn(&run_tld_map_c.step);
     test_step.dependOn(&python_demo.step);
 
-    // `zig build test`. The TLD module is standalone and tested on its own; qnnt.zig
-    // pulls in the network stack, so its tests run as a separate module.
+    // `zig build test`. TOLD is tested in its own repository, demos and struct-mapping
+    // examples included; qnnt.zig pulls in the network stack, so its tests run as a
+    // separate module.
 
 
 

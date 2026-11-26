@@ -29,6 +29,9 @@ bindings, the Zig examples and the whole test suite, on macOS and Linux, with no
 installed. `build.zig.zon` declares it, so an older compiler is told rather than left to
 produce errors.
 
+The TOLD codec is a git submodule, so clone with `--recursive`, or run
+`git submodule update --init` in an existing checkout. Without it nothing builds.
+
 Everything below is needed only for the part of the tree that names it. A missing one
 never breaks the rest of the build.
 
@@ -44,8 +47,8 @@ never breaks the rest of the build.
 
 ### On macOS SDK 27, patch Zig's bundled `float.h` first
 
-Every `-lc++` link fails on a Mac whose SDK is 27 or newer, which takes the four C++ steps
-(`node-cpp`, `tld-demo-cpp`, `tld-map-cpp`, `cpp-logic-test`) down with it:
+Every `-lc++` link fails on a Mac whose SDK is 27 or newer, which takes the C++ steps
+(`node-cpp`, `cpp-logic-test`) down with it:
 
 ```
 error: sub-compilation of libcxx failed
@@ -123,7 +126,7 @@ zig build cat -- test/topic-a   # read it
 ## Features
 
 - Publish/subscribe with no broker and no central process
-- **Text** (newline-delimited) or **TLD frames** (arbitrary bytes) per topic
+- **Text** (newline-delimited) or **TOLD frames** (arbitrary bytes) per topic
 - **Glob subscriptions** — `subscribePattern("bus/*")` joins matching topics as they appear
 - **Callback or queue** delivery; the queue is what the managed-runtime bindings use
 - **Per-topic teardown** — `removePublisher` / `removeSubscriber` stop one topic, node stays up
@@ -135,11 +138,13 @@ zig build cat -- test/topic-a   # read it
 - Realtime options on Linux: `SCHED_FIFO` priority, `mlockall`
 - One implementation: every binding calls the same Zig core
 
-## TLD, and what it is for
+## TOLD, and what it is for
 
-**TLD (Type-Length-Data)** is the binary format qnnt uses for structured payloads. A
-frame is one header byte — high nibble type, low nibble modifier — then an optional
-length and the data.
+**[TOLD](https://github.com/gattoarancione/told)** (Typo-Length Data) is the binary format
+qnnt uses for structured payloads. It began here as qnnt's TLD and is now a project of its
+own, with its own specification and roadmap; qnnt takes it as the `deps/told` submodule. A
+frame is one header byte — high nibble type, low nibble modifier — then an optional length
+and the data.
 
 It exists because a topic carrying arbitrary bytes cannot be newline-delimited: a CAN
 payload or a depth frame contains `0x0A` as freely as any other byte. So framing is a
@@ -148,15 +153,21 @@ property of the **topic**, chosen when subscribing:
 | | Use |
 |---|---|
 | `subscribe` | newline-delimited text |
-| `subscribeFrames` | TLD frames — length-prefixed, any bytes |
+| `subscribeFrames` | TOLD frames — length-prefixed, any bytes |
 
 Decoding is **zero-copy and allocation-free**: `decode` returns a frame borrowing your
-bytes, and containers are walked with iterators. `lib/tld.zig` has no dependency on the
-rest of qnnt and can be used on its own.
+bytes, and containers are walked with iterators. Zig code gets it as `Qnnt.Told`; C and
+C++ include `told.h` / `told.hpp` and link `libtold` beside `libqnnt_c`; Python uses the
+`told` package, bundled in qnnt's wheel.
 
-Structs map to TLD by name in every language — `TLD_DEFINE_MAP(a, b, c)` in C++,
-`@typeInfo` in Zig, dicts in Python. Cross-language agreement is pinned by **golden
-frames** in `testdata/`: bytes packed by Zig, unpacked and checked by the other side, so
+Every node on a bus must speak the same TOLD version. qnnt follows TOLD 1.1, whose floats
+omit their trailing zero bytes, and a node built on qnnt's old TLD (TOLD 1.0) rejects such
+a frame — so upgrade all nodes together.
+
+Structs map to TOLD by name in every language — `TOLD_DEFINE_MAP(a, b, c)` in C++,
+`@typeInfo` in Zig, dataclasses in Python. Cross-language agreement is pinned by **golden
+frames**: TOLD's own `src/testdata/interop.tld`, and qnnt's example frames in
+`examples/*/testdata/`, bytes packed by Zig and unpacked and checked by the other side, so
 a renamed field fails a test instead of silently arriving as a default.
 
 ## The four languages
@@ -171,7 +182,7 @@ Same core, same wire, same `QNNT_*` variables.
 | subscribe (frames) | `subscribeFrames` | `qnnt_subscribe_frames` | `addSubscriber(…, Frames)` | `subscribe(…, frames=True)` |
 | subscribe (glob) | `subscribePattern` | `qnnt_subscribe_pattern` | `addSubscriberPattern` | `subscribe_pattern` |
 | receive | handler callback | callback or `qnnt_poll` | `messageAvailable` signal | `poll()` / `stream()` |
-| pack a struct | `tld.packTo` | encoder calls | `publishPacked` | `publish_object` |
+| pack a struct | `told.packTo` | encoder calls | `publishPacked` | `publish_object` |
 | match a topic | `qnnt.topics.globMatch` | `qnnt_topic_matches` | `qnnt_topic_matches` | `topic_matches` |
 | config | `configureFromEnvironment` | `qnnt_configure_from_environment` | `configureFromEnvironment` | automatic |
 
@@ -191,7 +202,7 @@ qnnt-ls --tree                # grouped by '/' segment, for eyes
 qnnt-ls 'lidar/*'             # globs. QUOTE THEM.
 qnnt-ls --subs test/topic-a   # who is subscribed, as the registry reports it
 
-qnnt-cat test/topic-a         # TLD frames to stdout
+qnnt-cat test/topic-a         # TOLD frames to stdout
 qnnt-cat --text 'bus/*'       # text topics, several at once
 qnnt-cat --dump 'can/*' > cap # capture with times and topics
 qnnt-cat --restore < cap      # replay at the recorded pace
@@ -234,7 +245,7 @@ All optional, all read by `configureFromEnvironment()` — an explicit call, nev
 | `QNNT_PEERS` | `host[:port],…` to dial; names are resolved through libc |
 | `QNNT_RT_PRIORITY` | `SCHED_FIFO` priority for workers (Linux) |
 | `QNNT_LOCK_MEMORY` | `1` to pin pages with `mlockall` (Linux) |
-| `QNNT_MAX_FRAME_BYTES` | Largest TLD frame published or accepted (default 16 MiB) |
+| `QNNT_MAX_FRAME_BYTES` | Largest TOLD frame published or accepted (default 16 MiB) |
 | `QNNT_HANDLER_STACK_BYTES` | Stack for per-connection and per-request threads (default 16 MiB; at least 128 KiB, rounded up to a page). For small targets |
 | `QNNT_LOCAL_SOCKETS` | `1` (default) or `0` — same-host traffic over Unix sockets, remote over TCP |
 | `QNNT_SOCKET_DIR` | Where those sockets go (default `/tmp/qnnt-<uid>`, created `0700`) |
@@ -311,9 +322,10 @@ docker/can.sh                       # the CAN gateway mesh on real vcan interfac
 ## Layout
 
 ```
-lib/          the library: qnnt.zig, federation.zig, tld.zig, topics.zig, env.zig
+lib/          the library: qnnt.zig, federation.zig, topics.zig, env.zig
+deps/told/    the TOLD codec, a git submodule
 src/          the tools: qnnt-ls, qnnt-cat
-include/      qnnt.h, qnnt_tld.h, qnnt_tld.hpp, qnnt_qt.hpp
+include/      qnnt.h, qnnt_qt.hpp (told.h and told.hpp come from deps/told/include)
 python/       the Python package
 examples/     see the table above
 docker/       multi-host harnesses

@@ -1,0 +1,24 @@
+# shmbench handover 2 -- colima Linux VM, 4 vCPU aarch64, kernel 6.8, 2026-11-26
+threshold 65536 B, quiet window 0.25 s, 2.0 s per run, flat out
+load   subs mode     | msg/s each  cpu%    p99 us |   up down grow   max pause | errors
+step      1 unix     |     919489   147      16.4 |    0    0    0       0.0us | 0
+step      1 ringzero |    1132775   161      16.4 |    0    0    0       0.0us | 0
+step      1 auto     |     937586   144      16.4 |    1    1    0     183.3us | 0
+step      4 unix     |     114217   188      32.8 |    0    0    0       0.0us | 0
+step      4 ringzero |     109655   183      65.5 |    0    0    0       0.0us | 0
+step      4 auto     |     116036   180      65.5 |    1    1    0     844.7us | 0
+mixed     1 unix     |      85098   121     262.1 |    0    0    0       0.0us | 0
+mixed     1 ringzero |     101569   108     131.1 |    0    0    0       0.0us | 0
+mixed     1 auto     |     101969   108     131.1 |    1    0    0      15.0us | 0
+mixed     4 unix     |      30626   146    2097.2 |    0    0    0       0.0us | 0
+mixed     4 ringzero |      82125   139    2097.2 |    0    0    0       0.0us | 0
+mixed     4 auto     |      96959   134     262.1 |    1    0    0      27.0us | 0
+grow      1 unix     |     173323   132      65.5 |    0    0    0       0.0us | 0
+grow      1 ringzero |     202806   123      32.8 |    0    0    0       0.0us | 0
+grow      1 auto     |     174974   125      32.8 |    2    1    1     157.6us | 0
+grow      4 unix     |      43989   183    1048.6 |    0    0    0       0.0us | 0
+grow      4 ringzero |      52341   161    4194.3 |    0    0    0       0.0us | 0
+grow      4 auto     |      44144   162    1048.6 |    2    1    1     294.6us | 0
+--- stress: snapshot every 50 ms, quiet window 20 ms
+auto     1 sub  2000      256 B  each got    1999.2/s  total   0.00 GB/s  missed 0 torn 0 errors 0  cpu   14%  latency p50 <32.8us p99 <524.3us  handovers up 200 down 199
+auto     4 sub  2000      256 B  each got    1999.2/s  total   0.00 GB/s  missed 0 torn 0 errors 0  cpu   24%  latency p50 <65.5us p99 <1048.6us  handovers up 200 down 199

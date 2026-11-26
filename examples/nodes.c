@@ -4,8 +4,8 @@
  *   ./node-c 0                    publish test/topic-a @100Hz and test/topic-b @20Hz
  *   ./node-c 1                    publish test/topic-c @1kHz, subscribe test/topic-a
  *   ./node-c 2                    subscribe test/topic-b and test/topic-c
- *   ./node-c 3 [period_us] [size] TLD load generator on test/bench
- *   ./node-c 4 [report_ms]        TLD benchmark subscriber on test/bench
+ *   ./node-c 3 [period_us] [size] TOLD load generator on test/bench
+ *   ./node-c 4 [report_ms]        TOLD benchmark subscriber on test/bench
  *
  * Topics and rates match the Zig nodes, so any mix interoperates: a C role 0 feeding a
  * Python role 2 is the same system as five Zig nodes.
@@ -122,9 +122,9 @@ static int role2(void) {
     return 0;
 }
 
-/* --- role 3: TLD load generator ---------------------------------------------- */
+/* --- role 3: TOLD load generator ---------------------------------------------- */
 
-static qnnt_tld_encoder *bench_enc;
+static told_encoder *bench_enc;
 static uint8_t *bench_payload;
 static size_t bench_payload_len;
 static uint64_t bench_seq;
@@ -133,32 +133,32 @@ static atomic_ullong bench_sent, bench_bytes;
 static const uint8_t *bench_source(const char *t, size_t tl, size_t *len, void *u) {
     (void)t; (void)tl; (void)u;
 
-    qnnt_tld_encoder_reset(bench_enc);
+    told_encoder_reset(bench_enc);
     size_t obj;
-    if (qnnt_tld_begin_object(bench_enc, &obj) != QNNT_TLD_OK) return NULL;
-    qnnt_tld_write_string(bench_enc, (const uint8_t *)"seq", 3);
-    qnnt_tld_write_u64(bench_enc, ++bench_seq);
-    qnnt_tld_write_string(bench_enc, (const uint8_t *)"t", 1);
-    qnnt_tld_write_u64(bench_enc, (uint64_t)qnnt_now_micros());
-    qnnt_tld_write_string(bench_enc, (const uint8_t *)"data", 4);
-    qnnt_tld_write_buffer(bench_enc, bench_payload, bench_payload_len);
-    if (qnnt_tld_end_object(bench_enc, obj) != QNNT_TLD_OK) return NULL;
+    if (told_begin_object(bench_enc, &obj) != TOLD_OK) return NULL;
+    told_write_string(bench_enc, (const uint8_t *)"seq", 3);
+    told_write_u64(bench_enc, ++bench_seq);
+    told_write_string(bench_enc, (const uint8_t *)"t", 1);
+    told_write_u64(bench_enc, (uint64_t)qnnt_now_micros());
+    told_write_string(bench_enc, (const uint8_t *)"data", 4);
+    told_write_buffer(bench_enc, bench_payload, bench_payload_len);
+    if (told_end_object(bench_enc, obj) != TOLD_OK) return NULL;
 
-    const uint8_t *bytes = qnnt_tld_encoder_bytes(bench_enc, len);
+    const uint8_t *bytes = told_encoder_bytes(bench_enc, len);
     atomic_fetch_add(&bench_sent, 1);
     atomic_fetch_add(&bench_bytes, *len);
     return bytes;
 }
 
 static int role3(uint64_t period_us, size_t payload_bytes) {
-    bench_enc = qnnt_tld_encoder_create();
+    bench_enc = told_encoder_create();
     if (!bench_enc) return 1;
 
     bench_payload = malloc(payload_bytes ? payload_bytes : 1);
     if (!bench_payload) return 1;
     bench_payload_len = payload_bytes;
     /* Cycles every byte value, so 0x0A and 0xFF are in there: a benchmark that only moved
-     * text would not be exercising what TLD framing is for. */
+     * text would not be exercising what TOLD framing is for. */
     for (size_t i = 0; i < payload_bytes; i++) bench_payload[i] = (uint8_t)i;
 
     size_t frame_len = 0;
@@ -191,7 +191,7 @@ static int role3(uint64_t period_us, size_t payload_bytes) {
     return 0;
 }
 
-/* --- role 4: TLD benchmark subscriber ---------------------------------------- */
+/* --- role 4: TOLD benchmark subscriber ---------------------------------------- */
 
 #define BUCKET_US 4
 #define BUCKETS 4096
@@ -235,27 +235,27 @@ static void report(uint64_t now_us) {
     st.window_start_us = now_us;
 }
 
-static void on_bench_frame(const char *topic, size_t topic_len, const qnnt_tld_frame *frame,
+static void on_bench_frame(const char *topic, size_t topic_len, const told_frame *frame,
                            void *user) {
     (void)topic; (void)topic_len; (void)user;
 
     uint64_t sent_us = 0, seq = 0, payload_len = 0;
-    qnnt_tld_iter it;
-    if (qnnt_tld_object_iter(frame, &it) != QNNT_TLD_OK) { st.errors++; return; }
+    told_iter it;
+    if (told_object_iter(frame, &it) != TOLD_OK) { st.errors++; return; }
     for (;;) {
-        const uint8_t *key; size_t key_len; qnnt_tld_frame value; bool have;
-        if (qnnt_tld_object_next(&it, &key, &key_len, &value, &have) != QNNT_TLD_OK) {
+        const uint8_t *key; size_t key_len; told_frame value; bool have;
+        if (told_object_next(&it, &key, &key_len, &value, &have) != TOLD_OK) {
             st.errors++;
             return;
         }
         if (!have) break;
         if (key_len == 3 && memcmp(key, "seq", 3) == 0) {
-            qnnt_tld_as_u64(&value, &seq);
+            told_as_u64(&value, &seq);
         } else if (key_len == 1 && key[0] == 't') {
-            qnnt_tld_as_u64(&value, &sent_us);
+            told_as_u64(&value, &sent_us);
         } else if (key_len == 4 && memcmp(key, "data", 4) == 0) {
             const uint8_t *p; size_t l;
-            if (qnnt_tld_as_buffer(&value, &p, &l) == QNNT_TLD_OK) {
+            if (told_as_buffer(&value, &p, &l) == TOLD_OK) {
                 payload_len = l;
                 for (size_t i = 0; i < l; i++) {
                     if (p[i] != (uint8_t)i) { st.bad_payload++; break; }

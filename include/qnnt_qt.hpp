@@ -8,7 +8,7 @@
  *
  * STATUS: proposal, but a working one. Compiled with Qt 6.10.3 on macOS (moc over this
  * header and over the example), linked against the qnnt C ABI, and run: it starts a node,
- * publishes on two topics, receives both a text stream and TLD frames as signals on the Qt
+ * publishes on two topics, receives both a text stream and TOLD frames as signals on the Qt
  * thread, and unpacks a struct carrying QString, QList<double> and QByteArray members.
  *
  *     zig build qt-demo -Dqt=/path/to/Qt/6.10.3/macos     (examples/qt_demo.cpp)
@@ -32,15 +32,15 @@
  *    That choice also removes a per-message FFI crossing -- one poll returns a batch --
  *    which is why the queue exists.
  *
- * Build: needs Qt Core, the qnnt C ABI (include/qnnt.h) and the TLD C++ header
- * (include/qnnt_tld.hpp). Run moc over this file; with CMake, AUTOMOC handles it.
+ * Build: needs Qt Core, the qnnt C ABI (include/qnnt.h) and the TOLD C++ header
+ * (include/told.hpp). Run moc over this file; with CMake, AUTOMOC handles it.
  */
 
 #ifndef QNNT_QT_HPP
 #define QNNT_QT_HPP
 
 #include "qnnt.h"
-#include "qnnt_tld.hpp"
+#include "told.hpp"
 
 #include <QByteArray>
 #include <QHash>
@@ -57,16 +57,16 @@
 #include <optional>
 #include <vector>
 
-/* ---------------------------------------------------------------- Qt types in TLD
+/* ---------------------------------------------------------------- Qt types in TOLD
  *
  * So a Qt model class can carry QString and QList members and still be packed by the
- * macros from qnnt_tld.hpp:
+ * macros from told.hpp:
  *
  *     struct Telemetry {
  *         QString name;
  *         QList<double> samples;
  *         QByteArray blob;
- *         TLD_DEFINE_MAP(name, samples, blob)
+ *         TOLD_DEFINE_MAP(name, samples, blob)
  *     };
  *
  * QString goes out as UTF-8 in a STRING frame, so a Zig or Python peer reads it as a
@@ -75,7 +75,7 @@
  */
 
 template <>
-struct qnnt::tld::Adaptor<QString> {
+struct told::Adaptor<QString> {
     static void pack(Encoder& enc, const QString& value) {
         const QByteArray utf8 = value.toUtf8();
         enc.writeString(std::string_view{utf8.constData(), static_cast<std::size_t>(utf8.size())});
@@ -94,7 +94,7 @@ struct qnnt::tld::Adaptor<QString> {
 };
 
 template <>
-struct qnnt::tld::Adaptor<QByteArray> {
+struct told::Adaptor<QByteArray> {
     static void pack(Encoder& enc, const QByteArray& value) {
         enc.writeBuffer(Bytes{reinterpret_cast<const std::uint8_t*>(value.constData()),
                               static_cast<std::size_t>(value.size())});
@@ -112,7 +112,7 @@ struct qnnt::tld::Adaptor<QByteArray> {
 };
 
 template <class T>
-struct qnnt::tld::Adaptor<QList<T>> {
+struct told::Adaptor<QList<T>> {
     static void pack(Encoder& enc, const QList<T>& value) {
         auto scope = enc.beginArray();
         for (const T& item : value) packValue(enc, item);
@@ -129,7 +129,7 @@ struct qnnt::tld::Adaptor<QList<T>> {
 };
 
 template <class V>
-struct qnnt::tld::Adaptor<QMap<QString, V>> {
+struct told::Adaptor<QMap<QString, V>> {
     static void pack(Encoder& enc, const QMap<QString, V>& value) {
         auto scope = enc.beginObject();
         for (auto it = value.cbegin(); it != value.cend(); ++it) {
@@ -151,7 +151,7 @@ struct qnnt::tld::Adaptor<QMap<QString, V>> {
 };
 
 template <class V>
-struct qnnt::tld::Adaptor<QHash<QString, V>> {
+struct told::Adaptor<QHash<QString, V>> {
     static void pack(Encoder& enc, const QHash<QString, V>& value) {
         auto scope = enc.beginObject();
         for (auto it = value.cbegin(); it != value.cend(); ++it) {
@@ -190,7 +190,7 @@ class QnntPoller; // below
  *     node->addSubscriber("test/topic-b");
  *     node->publish("test/topic-a", QByteArray("hello\n"));
  *
- * Note the trailing newline. A topic is either a newline-delimited text stream or a TLD
+ * Note the trailing newline. A topic is either a newline-delimited text stream or a TOLD
  * frame stream, and that is a property of the topic rather than of a call: publish text
  * with a delimiter, or publish frames and let subscribers read them as Delivery::Frames.
  * The template publish() below always produces a frame, so it needs no delimiter.
@@ -204,7 +204,7 @@ public:
     /// match what the publisher writes.
     enum class Delivery {
         Text,  ///< newline-delimited; `data` is one line, delimiter included
-        Frames ///< TLD; `data` is one whole frame, ready for qnnt::tld::unpack
+        Frames ///< TOLD; `data` is one whole frame, ready for told::unpack
     };
     Q_ENUM(Delivery)
 
@@ -268,11 +268,11 @@ public:
     bool publish(const QString& topic, const QByteArray& data);
     bool publish(const QString& topic, const char* data, int size);
 
-    /// Pack any TLD-mapped type and publish it as one frame -- the replacement for the old
+    /// Pack any TOLD-mapped type and publish it as one frame -- the replacement for the old
     /// pub<T>() and its msgpack::pack. Subscribers read the topic as Delivery::Frames.
     template <class T>
     bool publishPacked(const QString& topic, const T& value) {
-        const std::vector<std::uint8_t> bytes = qnnt::tld::pack(value);
+        const std::vector<std::uint8_t> bytes = told::pack(value);
         return publish(topic, reinterpret_cast<const char*>(bytes.data()),
                        static_cast<int>(bytes.size()));
     }
@@ -353,11 +353,11 @@ public:
     /// Nothing blocks, which is what makes this the one to call from a GUI.
     quint64 requestBegin(const QString& procedure, const QByteArray& data, int timeoutMs = 5000);
 
-    /// requestBegin() with a TLD-mapped type as the payload -- the counterpart of
+    /// requestBegin() with a TOLD-mapped type as the payload -- the counterpart of
     /// publishPacked(). Decode the reply with unpacked<T>().
     template <class T>
     quint64 requestBeginPacked(const QString& procedure, const T& value, int timeoutMs = 5000) {
-        const auto bytes = qnnt::tld::pack(value);
+        const auto bytes = told::pack(value);
         return requestBegin(procedure,
                             QByteArray(reinterpret_cast<const char*>(bytes.data()),
                                        static_cast<qsizetype>(bytes.size())),
@@ -374,12 +374,12 @@ public:
     /// messageAvailable()/frameAvailable() handler -- see removePublisher().
     bool removeSubscriber(const QString& topic);
 
-    /// Decode a frame from frameAvailable() into a TLD-mapped type -- the replacement for
-    /// the old getUnpacked<T>(). Throws qnnt::tld::Error on a malformed frame.
+    /// Decode a frame from frameAvailable() into a TOLD-mapped type -- the replacement for
+    /// the old getUnpacked<T>(). Throws told::Error on a malformed frame.
     template <class T>
     static T unpacked(const QByteArray& frame) {
-        return qnnt::tld::unpack<T>(
-            qnnt::tld::Bytes{reinterpret_cast<const std::uint8_t*>(frame.constData()),
+        return told::unpack<T>(
+            told::Bytes{reinterpret_cast<const std::uint8_t*>(frame.constData()),
                              static_cast<std::size_t>(frame.size())});
     }
 
@@ -404,7 +404,7 @@ Q_SIGNALS:
     /// One newline-delimited message, delimiter included, on a Delivery::Text topic.
     void messageAvailable(const QString& topic, const QByteArray& data);
 
-    /// One whole TLD frame on a Delivery::Frames topic. Pass it to unpacked<T>().
+    /// One whole TOLD frame on a Delivery::Frames topic. Pass it to unpacked<T>().
     void frameAvailable(const QString& topic, const QByteArray& frame);
 
     /// A request started with requestBegin() has completed. `status` is a qnnt_rpc_status;
@@ -1053,8 +1053,8 @@ inline quint64 QnntNode::droppedCount() const { return qnnt_queue_dropped(); }
  *     for the case where this host is reachable at an address it cannot discover itself,
  *     and even that is usually unnecessary -- a peer substitutes the address it reached
  *     you on.
- *   * msgpack becomes TLD. MSGPACK_DEFINE_MAP becomes TLD_DEFINE_MAP, MSGPACK::pack
- *     becomes qnnt::tld::pack, and the Qt adaptors at the top of this file cover QString,
+ *   * msgpack becomes TOLD. MSGPACK_DEFINE_MAP becomes TOLD_DEFINE_MAP, MSGPACK::pack
+ *     becomes told::pack, and the Qt adaptors at the top of this file cover QString,
  *     QByteArray, QList, QMap and QHash. See the porting table in EXAMPLES.txt.
  */
 

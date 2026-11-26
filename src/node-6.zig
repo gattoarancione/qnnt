@@ -15,7 +15,7 @@
 
 const std = @import("std");
 const qnnt = @import("qnnt").Qnnt;
-const tld = @import("qnnt").Tld;
+const told = @import("qnnt").Told;
 
 const allocator = std.heap.page_allocator;
 
@@ -99,7 +99,7 @@ fn report(now_us: u64) void {
 }
 
 /// Runs on the subscriber thread; owns every statistic above except the publishing ones.
-fn onEcho(_: []const u8, f: tld.Frame, _: ?*anyopaque) void {
+fn onEcho(_: []const u8, f: told.Frame, _: ?*anyopaque) void {
     var sent_us: u64 = 0;
     var got_id: u64 = 0;
     var ok = false;
@@ -190,7 +190,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // late as possible before the frame goes out.
     while (!qnnt.stopRequested()) {
         frame.clearRetainingCapacity();
-        var enc = tld.Encoder.init(allocator, &frame);
+        var enc = told.Encoder.init(allocator, &frame);
 
         seq += 1;
         const obj = enc.beginObject();

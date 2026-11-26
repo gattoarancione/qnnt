@@ -1,4 +1,4 @@
-/* A complete qnnt node in C: publish TLD frames on a schedule, consume them two ways. */
+/* A complete qnnt node in C: publish TOLD frames on a schedule, consume them two ways. */
 #include <qnnt.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -34,44 +34,44 @@ static void on_bus(const char *topic, size_t topic_len, const uint8_t *data, siz
 }
 
 /* The source encodes into a long-lived encoder, so its bytes outlive the call. */
-static qnnt_tld_encoder *g_enc;
+static told_encoder *g_enc;
 static uint64_t g_seq;
 
 static const uint8_t *source(const char *topic, size_t topic_len, size_t *out_len, void *user) {
     (void)topic; (void)topic_len;
     unsigned long long *sent = user;
 
-    qnnt_tld_encoder_reset(g_enc);
+    told_encoder_reset(g_enc);
     size_t obj;
-    if (qnnt_tld_begin_object(g_enc, &obj) != QNNT_TLD_OK) return NULL;
-    qnnt_tld_write_string(g_enc, (const uint8_t *)"seq", 3);
-    qnnt_tld_write_u64(g_enc, ++g_seq);
-    qnnt_tld_write_string(g_enc, (const uint8_t *)"payload", 7);
+    if (told_begin_object(g_enc, &obj) != TOLD_OK) return NULL;
+    told_write_string(g_enc, (const uint8_t *)"seq", 3);
+    told_write_u64(g_enc, ++g_seq);
+    told_write_string(g_enc, (const uint8_t *)"payload", 7);
     /* Bytes hostile to line framing, on purpose. */
     const uint8_t raw[] = {0x0A, 0xFF, 0x00};
-    qnnt_tld_write_buffer(g_enc, raw, sizeof raw);
-    if (qnnt_tld_end_object(g_enc, obj) != QNNT_TLD_OK) return NULL;
+    told_write_buffer(g_enc, raw, sizeof raw);
+    if (told_end_object(g_enc, obj) != TOLD_OK) return NULL;
 
     (*sent)++;
-    return qnnt_tld_encoder_bytes(g_enc, out_len);
+    return told_encoder_bytes(g_enc, out_len);
 }
 
 /* Callback mode: runs on a library thread, so keep it to atomics. */
 static atomic_ullong g_callback_frames;
 static atomic_ullong g_callback_seq_sum;
 
-static void on_frame(const char *topic, size_t topic_len, const qnnt_tld_frame *frame, void *user) {
+static void on_frame(const char *topic, size_t topic_len, const told_frame *frame, void *user) {
     (void)topic; (void)topic_len; (void)user;
 
-    qnnt_tld_iter it;
-    if (qnnt_tld_object_iter(frame, &it) != QNNT_TLD_OK) return;
+    told_iter it;
+    if (told_object_iter(frame, &it) != TOLD_OK) return;
     for (;;) {
-        const uint8_t *key; size_t key_len; qnnt_tld_frame value; bool have;
-        if (qnnt_tld_object_next(&it, &key, &key_len, &value, &have) != QNNT_TLD_OK) return;
+        const uint8_t *key; size_t key_len; told_frame value; bool have;
+        if (told_object_next(&it, &key, &key_len, &value, &have) != TOLD_OK) return;
         if (!have) break;
         if (key_len == 3 && memcmp(key, "seq", 3) == 0) {
             uint64_t n;
-            if (qnnt_tld_as_u64(&value, &n) == QNNT_TLD_OK)
+            if (told_as_u64(&value, &n) == TOLD_OK)
                 atomic_fetch_add(&g_callback_seq_sum, n);
         }
     }
@@ -81,7 +81,7 @@ static void on_frame(const char *topic, size_t topic_len, const qnnt_tld_frame *
 int main(void) {
     unsigned long long sent = 0;
 
-    g_enc = qnnt_tld_encoder_create();
+    g_enc = told_encoder_create();
     if (!g_enc) { printf("FAIL: encoder\n"); return 1; }
 
     /* Our own registry, so this demo is independent of anything else running. */
@@ -143,9 +143,9 @@ int main(void) {
                 printf("FAIL: wrong topic on a queued message\n");
                 return 1;
             }
-            /* The queued bytes are a real TLD frame; decode to prove the copy is intact. */
-            qnnt_tld_frame frame;
-            if (qnnt_tld_decode(batch[j].data, batch[j].data_len, &frame) != QNNT_TLD_OK) {
+            /* The queued bytes are a real TOLD frame; decode to prove the copy is intact. */
+            told_frame frame;
+            if (told_decode(batch[j].data, batch[j].data_len, &frame) != TOLD_OK) {
                 printf("FAIL: queued payload did not decode\n");
                 return 1;
             }
@@ -219,7 +219,7 @@ int main(void) {
     #undef MATCHES
 
     qnnt_deinit();
-    qnnt_tld_encoder_destroy(g_enc);
+    told_encoder_destroy(g_enc);
     printf("OK\n");
     return 0;
 }

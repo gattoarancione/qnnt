@@ -21,13 +21,13 @@
 //!
 //! MISSES ARE ONLY MEASURABLE WHEN THE PAYLOAD COUNTS. qnnt delivers every frame on a
 //! connection or drops the connection, so frames go missing only across a reconnect, and
-//! nothing on the wire says how many. A TLD object with an unsigned sequence field --
+//! nothing on the wire says how many. A TOLD object with an unsigned sequence field --
 //! `seq`, or whatever --seq names -- says exactly: a jump from 41 to 45 is three misses.
 //! A topic without one shows `-` for misses, which means unknown, not zero. A sequence
 //! going backwards is counted as a reset, not as misses: that is a publisher restarting.
 //!
-//! FRAMING IS NOT RECORDED ANYWHERE, so it has to be chosen: TLD frames by default, --text
-//! for newline-delimited topics. A text topic read as TLD does not fail cleanly -- "ciao!\n"
+//! FRAMING IS NOT RECORDED ANYWHERE, so it has to be chosen: TOLD frames by default, --text
+//! for newline-delimited topics. A text topic read as TOLD does not fail cleanly -- "ciao!\n"
 //! happens to parse as several tiny frames -- so the figures would be nonsense presented as
 //! numbers. A topic whose bytes are all printable and carry newlines is flagged `text?`
 //! instead, with a notice saying to measure it with --text.
@@ -35,7 +35,7 @@
 const std = @import("std");
 const root = @import("qnnt");
 const qnnt = root.Qnnt;
-const tld = root.Tld;
+const told = root.Told;
 const stdout = @import("stdout");
 
 const allocator = std.heap.page_allocator;
@@ -159,8 +159,8 @@ fn judgeSeq(last: ?u64, seq: u64) SeqVerdict {
     return .reset;
 }
 
-/// The unsigned `key` field of a top-level TLD object, or null if the frame has none.
-fn seqField(frame: tld.Frame, key: []const u8) ?u64 {
+/// The unsigned `key` field of a top-level TOLD object, or null if the frame has none.
+fn seqField(frame: told.Frame, key: []const u8) ?u64 {
     if (frame.type != .object) return null;
     var it = frame.objectIterator() catch return null;
     while (it.next() catch return null) |pair| {
@@ -188,9 +188,9 @@ const Slot = struct {
     /// Connections that broke over the whole run.
     breaks: u32 = 0,
 
-    /// Whether a topic read as TLD looks like newline-delimited text instead. Two ways to
+    /// Whether a topic read as TOLD looks like newline-delimited text instead. Two ways to
     /// tell: enough printable frames with newlines in them, or -- when the text happens to
-    /// trip the TLD reader, which drops the connection -- a stream that keeps breaking
+    /// trip the TOLD reader, which drops the connection -- a stream that keeps breaking
     /// while nothing it delivered was binary.
     fn looksLikeText(s: *const Slot) bool {
         if (s.saw_binary or s.printable_frames == 0) return false;
@@ -199,13 +199,13 @@ const Slot = struct {
     }
 };
 
-/// Frames seen before a topic read as TLD is judged to be text in disguise.
+/// Frames seen before a topic read as TOLD is judged to be text in disguise.
 const text_sniff_frames = 20;
-/// Or broken connections, for text that the TLD reader rejects after a frame or two.
+/// Or broken connections, for text that the TOLD reader rejects after a frame or two.
 const text_sniff_breaks = 2;
 
 /// A frame's bytes are what text would be: printable ASCII and the whitespace a line
-/// carries. Real TLD rarely is -- a header byte, a length or a number is usually not.
+/// carries. Real TOLD rarely is -- a header byte, a length or a number is usually not.
 fn isPrintable(bytes: []const u8) bool {
     for (bytes) |c| {
         if (!(c == '\t' or c == '\n' or c == '\r' or (c >= 0x20 and c < 0x7f))) return false;
@@ -296,13 +296,13 @@ fn noticeText(slot: *Slot) void {
     if (opt_text or slot.text_noticed or !slot.looksLikeText()) return;
     slot.text_noticed = true;
     if (!opt_quiet) std.debug.print(
-        "qnnt-perf: {s} looks like newline-delimited text, so its TLD figures are " ++
+        "qnnt-perf: {s} looks like newline-delimited text, so its TOLD figures are " ++
             "meaningless -- measure it with --text\n",
         .{slot.name},
     );
 }
 
-fn onFrame(topic: []const u8, frame: tld.Frame, _: ?*anyopaque) void {
+fn onFrame(topic: []const u8, frame: told.Frame, _: ?*anyopaque) void {
     const seq = if (opt_seq_key) |key| seqField(frame, key) else null;
     record(topic, frame.raw.len, seq, frame.raw);
 }
@@ -592,12 +592,12 @@ fn tsvRow(out: *std.ArrayList(u8), scope: []const u8, elapsed_s: f64, r: Row) vo
 
 // -- the run -----------------------------------------------------------------------------
 
-/// What the figures were read as. `text?` is a TLD read that looks like text in disguise.
+/// What the figures were read as. `text?` is a TOLD read that looks like text in disguise.
 fn framingOf(s: *Slot) []const u8 {
     if (opt_text) return "text";
     s.mutex.lockUncancelable(root.io);
     defer s.mutex.unlock(root.io);
-    return if (s.looksLikeText()) "text?" else "tld";
+    return if (s.looksLikeText()) "text?" else "told";
 }
 
 fn subscribeAll(patterns: []const []const u8) void {
@@ -627,9 +627,9 @@ fn usage() void {
         \\
         \\  --interval <ms>   how often to report (default 1000)
         \\  --duration <s>    stop after this long and print the summary (default: until ^C)
-        \\  --seq <field>     the TLD object field that counts frames, for misses (default seq)
+        \\  --seq <field>     the TOLD object field that counts frames, for misses (default seq)
         \\  --no-seq          do not look for one; misses are reported as unknown
-        \\  --text            newline-delimited topics instead of TLD frames
+        \\  --text            newline-delimited topics instead of TOLD frames
         \\  --rescan <ms>     how often to re-match globs (default 1000; 0 matches once)
         \\  --pretty          the live table on stderr, even when stdout is piped
         \\  --tsv             tab-separated records on stdout, even at a terminal
@@ -644,8 +644,8 @@ fn usage() void {
         \\Base units throughout, and '-' for a figure that is not known. Misses need a
         \\sequence field in the payload: without one they cannot be counted, and show '-'.
         \\
-        \\Framing is not recorded anywhere, so pick it: TLD by default, --text for line
-        \\topics. A text topic read as TLD is flagged 'text?' rather than measured as frames.
+        \\Framing is not recorded anywhere, so pick it: TOLD by default, --text for line
+        \\topics. A text topic read as TOLD is flagged 'text?' rather than measured as frames.
         \\
     , .{});
 }
@@ -863,25 +863,25 @@ test "a sequence counts what is missing, and a step back is a reset" {
     try testing.expectEqual(SeqVerdict.next, judgeSeq(std.math.maxInt(u64), 0));
 }
 
-test "the seq field is read from a TLD object, and only from one" {
+test "the seq field is read from a TOLD object, and only from one" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
-    var enc = tld.Encoder.init(testing.allocator, &buf);
+    var enc = told.Encoder.init(testing.allocator, &buf);
     const obj = enc.beginObject();
     try enc.writeKey("t");
     try enc.writeUint(99);
     try enc.writeKey("seq");
     try enc.writeUint(42);
     try enc.end(obj);
-    const frame = try tld.validate(buf.items, 32);
+    const frame = try told.validate(buf.items, 32);
     try testing.expectEqual(@as(?u64, 42), seqField(frame, "seq"));
     try testing.expectEqual(@as(?u64, 99), seqField(frame, "t"));
     try testing.expect(seqField(frame, "nope") == null);
 
     buf.clearRetainingCapacity();
-    var enc2 = tld.Encoder.init(testing.allocator, &buf);
+    var enc2 = told.Encoder.init(testing.allocator, &buf);
     try enc2.writeUint(42); // a bare number is not a sequenced frame
-    try testing.expect(seqField(try tld.validate(buf.items, 32), "seq") == null);
+    try testing.expect(seqField(try told.validate(buf.items, 32), "seq") == null);
 }
 
 test "figures turn into rates, sizes and bandwidth" {
@@ -889,7 +889,7 @@ test "figures turn into rates, sizes and bandwidth" {
     f.addFrame(100, null); // the first frame has no gap before it
     f.addFrame(300, 10_000);
     f.addFrame(200, 20_000);
-    const r = rowOf("t", &f, 1_000_000, .{}, "tld");
+    const r = rowOf("t", &f, 1_000_000, .{}, "told");
 
     try testing.expectEqual(@as(u64, 3), r.frames);
     try testing.expectApproxEqAbs(@as(f64, 3.0), r.hz_avg, 1e-9);
@@ -903,7 +903,7 @@ test "figures turn into rates, sizes and bandwidth" {
     try testing.expect(r.misses == null);
 
     // An interval with nothing in it has no rates to speak of, and says so.
-    const quiet = rowOf("t", &Figures{}, 1_000_000, .{}, "tld");
+    const quiet = rowOf("t", &Figures{}, 1_000_000, .{}, "told");
     try testing.expect(quiet.hz_min == null and quiet.hz_med == null and quiet.size_avg == null);
     try testing.expectEqual(@as(f64, 0), quiet.hz_avg);
 }
@@ -958,15 +958,15 @@ test "a record has every column, in base units, with dashes for unknowns" {
     defer out.deinit(allocator);
     var f: Figures = .{};
     f.addFrame(100, null);
-    tsvRow(&out, "interval", 1.0, rowOf("test/x", &f, 1_000_000, .{}, "tld"));
+    tsvRow(&out, "interval", 1.0, rowOf("test/x", &f, 1_000_000, .{}, "told"));
 
     const header_fields = std.mem.count(u8, tsv_header, "\t") + 1;
     try testing.expectEqual(header_fields, std.mem.count(u8, out.items, "\t") + 1);
     try testing.expect(std.mem.startsWith(u8, out.items, "interval\t1.000\ttest/x\t1\t-\t-\t1.000\t-\t100\t"));
-    try testing.expect(std.mem.endsWith(u8, out.items, "\t-\t-\t0\t-\t-\ttld\n"));
+    try testing.expect(std.mem.endsWith(u8, out.items, "\t-\t-\t0\t-\t-\ttold\n"));
 }
 
-test "text read as TLD is recognised, and real TLD is not" {
+test "text read as TOLD is recognised, and real TOLD is not" {
     try testing.expect(isPrintable("ciao!\n"));
     try testing.expect(!isPrintable(&.{ 0x41, 0x00, 0x0a }));
 
@@ -975,7 +975,7 @@ test "text read as TLD is recognised, and real TLD is not" {
     text.saw_newline = true;
     try testing.expect(text.looksLikeText());
 
-    // Printable but never a newline: a TLD topic of short strings could be that, and is
+    // Printable but never a newline: a TOLD topic of short strings could be that, and is
     // not called text on so little.
     var strings: Slot = .{ .name = "s" };
     strings.printable_frames = 1000;

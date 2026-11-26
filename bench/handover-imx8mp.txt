@@ -1,0 +1,24 @@
+# shmbench handover 2 -- Engicam SmarCore i.MX8M Plus, 4x Cortex-A53 up to 1.6 GHz (ondemand), 1.9 GB, kernel 6.1.36, 2026-11-26
+threshold 65536 B, quiet window 0.25 s, 2.0 s per run, flat out
+load   subs mode     | msg/s each  cpu%    p99 us |   up down grow   max pause | errors
+step      1 unix     |     174080   175      32.8 |    0    0    0       0.0us | 0
+step      1 ringzero |     195845   169      32.8 |    0    0    0       0.0us | 0
+step      1 auto     |     167592   163      32.8 |    1    1    0   11388.4us | 0
+step      4 unix     |      29232   206    8388.6 |    0    0    0       0.0us | 0
+step      4 ringzero |      30382   202    8388.6 |    0    0    0       0.0us | 0
+step      4 auto     |      27567   184    8388.6 |    1    1    0    3032.2us | 0
+mixed     1 unix     |      10886   159    4194.3 |    0    0    0       0.0us | 0
+mixed     1 ringzero |      16928   133    4194.3 |    0    0    0       0.0us | 0
+mixed     1 auto     |      16824   133    4194.3 |    1    0    0      84.8us | 0
+mixed     4 unix     |       4460   223    8388.6 |    0    0    0       0.0us | 0
+mixed     4 ringzero |      15291   223    8388.6 |    0    0    0       0.0us | 0
+mixed     4 auto     |      15099   220    8388.6 |    1    0    0     147.8us | 0
+grow      1 unix     |      37690   161     524.3 |    0    0    0       0.0us | 0
+grow      1 ringzero |      31884   142     524.3 |    0    0    0       0.0us | 0
+grow      1 auto     |      37908   148     524.3 |    2    1    1    3586.8us | 0
+grow      4 unix     |      10055   229    8388.6 |    0    0    0       0.0us | 0
+grow      4 ringzero |      10310   174    8388.6 |    0    0    0       0.0us | 0
+grow      4 auto     |      10717   211    8388.6 |    2    1    1    3126.5us | 0
+--- stress: snapshot every 50 ms, quiet window 20 ms
+auto     1 sub  2000      256 B  each got    1997.1/s  total   0.00 GB/s  missed 0 torn 0 errors 0  cpu   42%  latency p50 <32.8us p99 <4194.3us  handovers up 200 down 199
+auto     4 sub  2000      256 B  each got    1997.2/s  total   0.00 GB/s  missed 0 torn 0 errors 0  cpu   67%  latency p50 <65.5us p99 <4194.3us  handovers up 200 down 199

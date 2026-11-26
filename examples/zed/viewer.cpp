@@ -6,7 +6,7 @@
 //   ./zig-out/bin/camera-viewer          # terminal 3, from the project root
 //
 // The same split the LiDAR viewer demonstrates: the camera is a Zig node, the display is
-// QML, and neither knows the other's language -- only the topic and the TLD schema. It
+// QML, and neither knows the other's language -- only the topic and the TOLD schema. It
 // subscribes to camera/zedx/depth and camera/zedx/calibration and knows nothing about ZED
 // X, GMSL2 or the ZED SDK; a different depth camera with its own driver would show up here
 // unchanged.
@@ -283,17 +283,17 @@ private:
         // Waiting is right: a frame drawn against a guessed range is a picture of nothing.
         if (!m_have_calibration) return;
 
-        const qnnt::tld::Frame frame = qnnt::tld::decode(qnnt::tld::Bytes{
+        const told::Frame frame = told::decode(told::Bytes{
             reinterpret_cast<const std::uint8_t*>(payload.constData()),
             static_cast<std::size_t>(payload.size())});
 
         int w = 0;
         int h = 0;
         int missed = 0;
-        qnnt::tld::Bytes depth{};
-        qnnt::tld::Bytes mono{};
+        told::Bytes depth{};
+        told::Bytes mono{};
 
-        for (const qnnt::tld::Field& field : frame.object()) {
+        for (const told::Field& field : frame.object()) {
             if (field.key == "width") {
                 w = static_cast<int>(field.value.asUint());
             } else if (field.key == "height") {
@@ -354,7 +354,7 @@ private:
     }
 
     void readCalibration(const QByteArray& payload) {
-        const qnnt::tld::Frame frame = qnnt::tld::decode(qnnt::tld::Bytes{
+        const told::Frame frame = told::decode(told::Bytes{
             reinterpret_cast<const std::uint8_t*>(payload.constData()),
             static_cast<std::size_t>(payload.size())});
 
@@ -363,7 +363,7 @@ private:
         double baseline = 0;
         bool from_device = false;
 
-        for (const qnnt::tld::Field& field : frame.object()) {
+        for (const told::Field& field : frame.object()) {
             if (field.key == "fx") {
                 fx = field.value.asFloat();
             } else if (field.key == "fy") {

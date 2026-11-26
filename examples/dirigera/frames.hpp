@@ -1,7 +1,7 @@
 // What travels on the bridge's topics, as the station reads it.
 //
 // The counterpart of examples/dirigera/frames.zig, and the two must agree FIELD BY FIELD.
-// Neither side errors when they do not: TLD ignores a key the receiving struct does not
+// Neither side errors when they do not: TOLD ignores a key the receiving struct does not
 // declare, and the macros below leave a member the frame did not carry exactly as its
 // constructor left it. A renamed field therefore produces plausible data -- a light that
 // reports itself uncontrollable, a sensor with no room -- rather than a failure.
@@ -12,7 +12,7 @@
 #ifndef QNNT_DIRIGERA_FRAMES_HPP
 #define QNNT_DIRIGERA_FRAMES_HPP
 
-#include "qnnt_tld.hpp"
+#include "told.hpp"
 
 #include <cstdint>
 #include <optional>
@@ -21,7 +21,7 @@
 
 namespace dirigera {
 
-/// Mirrors DeviceFrame in examples/dirigera/bridge.zig. TLD matches on field names, so the
+/// Mirrors DeviceFrame in examples/dirigera/bridge.zig. TOLD matches on field names, so the
 /// two have to agree; the optionals are genuinely optional -- a motion sensor has no
 /// brightness, and null says so rather than a zero the consumer must know to disbelieve.
 struct DeviceFrame {
@@ -44,7 +44,7 @@ struct DeviceFrame {
     std::optional<std::uint16_t> temperature_min;
     std::optional<std::uint16_t> temperature_max;
     std::string relation;
-    TLD_DEFINE_MAP(id, type, name, room, model, reachable, is_on, light_level,
+    TOLD_DEFINE_MAP(id, type, name, room, model, reachable, is_on, light_level,
                    color_temperature, battery, is_detected, illuminance, controllable,
                    can_set_on, can_set_level, can_set_temperature, temperature_min,
                    temperature_max, relation)
@@ -55,7 +55,7 @@ struct InventoryFrame {
     std::string hub;
     std::uint32_t count{};
     std::vector<DeviceFrame> devices;
-    TLD_DEFINE_MAP(t_us, hub, count, devices)
+    TOLD_DEFINE_MAP(t_us, hub, count, devices)
 };
 
 struct StateFrame {
@@ -64,7 +64,7 @@ struct StateFrame {
     std::string event;
     bool identified{};
     DeviceFrame device;
-    TLD_DEFINE_MAP(seq, t_us, event, identified, device)
+    TOLD_DEFINE_MAP(seq, t_us, event, identified, device)
 };
 
 struct StatusFrame {
@@ -88,7 +88,7 @@ struct StatusFrame {
     bool pairing{};
     /// The last thing that exchange said, meant for whoever is standing at the hub.
     std::string pair_detail;
-    TLD_DEFINE_MAP(t_us, hub, firmware, api_link, event_link, devices, events_received,
+    TOLD_DEFINE_MAP(t_us, hub, firmware, api_link, event_link, devices, events_received,
                    events_unparsed, dropped_fragments, commands_sent, commands_failed,
                    commands_refused, reconnects, paired, pairing, pair_detail)
 };
@@ -97,7 +97,7 @@ struct StatusFrame {
 struct PairRequest {
     std::string name{"qnnt-bridge"};
     bool cancel{};
-    TLD_DEFINE_MAP(name, cancel)
+    TOLD_DEFINE_MAP(name, cancel)
 };
 
 /// What goes on the command topic. Optional throughout, so dimming a light does not also
@@ -107,7 +107,7 @@ struct LightCommand {
     std::optional<bool> on;
     std::optional<std::uint8_t> level;
     std::optional<std::uint16_t> kelvin;
-    TLD_DEFINE_MAP(id, on, level, kelvin)
+    TOLD_DEFINE_MAP(id, on, level, kelvin)
 };
 
 } // namespace dirigera

@@ -53,7 +53,7 @@ only some of the five could express would not be a common schema. That means:
     somewhere to put that length;
   * no optional fields, no maps.
 
-Everything else about the mapping is uniform: field names are on the wire (TLD_DEFINE_MAP
+Everything else about the mapping is uniform: field names are on the wire (TOLD_DEFINE_MAP
 and its equivalents), enums travel as integers, non-negative integers take the unsigned
 encoding, and a string is a STRING frame while bytes are a BUFFER frame.
 

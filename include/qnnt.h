@@ -1,7 +1,7 @@
 /*
  * qnnt -- C interface to the node: lifecycle, publishing, and subscriptions.
  *
- * Hand-written and kept in step with lib/qnnt_c.zig by hand. The TLD codec has its own
+ * Hand-written and kept in step with lib/qnnt_c.zig by hand. The TOLD codec has its own
  * header, included below; linking libqnnt_c gives you both.
  *
  * Lifetimes and ownership, once:
@@ -21,7 +21,7 @@
 #ifndef QNNT_H
 #define QNNT_H
 
-#include "qnnt_tld.h"
+#include "told.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -354,11 +354,11 @@ qnnt_status qnnt_subscribe_pattern(const char *pattern, size_t pattern_len,
                                    qnnt_message_fn callback, void *user,
                                    uint64_t rescan_ms);
 
-/* Invoked with a decoded TLD frame, valid only for this call. */
+/* Invoked with a decoded TOLD frame, valid only for this call. */
 typedef void (*qnnt_frame_fn)(const char *topic, size_t topic_len,
-                              const qnnt_tld_frame *frame, void *user);
+                              const told_frame *frame, void *user);
 
-/* TLD-framed stream. Framing is a property of the topic: a producer publishing TLD must
+/* TOLD-framed stream. Framing is a property of the topic: a producer publishing TOLD must
  * be read with this, and one publishing text lines with qnnt_subscribe. */
 qnnt_status qnnt_subscribe_frames(const char *topic, size_t topic_len,
                                   qnnt_frame_fn callback, void *user);
@@ -520,10 +520,10 @@ qnnt_status qnnt_queue_reserve(size_t capacity);
 uint64_t qnnt_queue_dropped(void);
 
 /* Which reader the queued subscription uses. Framing belongs to the stream, not to the
- * delivery mode: a TLD producer read as text is chopped at every 0x0A inside a payload. */
+ * delivery mode: a TOLD producer read as text is chopped at every 0x0A inside a payload. */
 typedef enum {
     QNNT_QUEUE_TEXT = 0,  /* newline-delimited, like qnnt_subscribe */
-    QNNT_QUEUE_FRAMES = 1 /* TLD; queued bytes are a whole frame, ready for qnnt_tld_decode */
+    QNNT_QUEUE_FRAMES = 1 /* TOLD; queued bytes are a whole frame, ready for told_decode */
 } qnnt_queue_mode;
 
 qnnt_status qnnt_subscribe_queue(const char *topic, size_t topic_len, qnnt_queue_mode mode);

@@ -4,8 +4,8 @@
     zig build mesh && bash examples/mesh/run.sh
 
 Publishes mesh/python and subscribes to the other four topics. The dataclasses below are
-the whole schema declaration: field names and annotations are enough for tld.pack and
-tld.unpack, so nothing is generated from the C++ or Zig side.
+the whole schema declaration: field names and annotations are enough for told.pack and
+told.unpack, so nothing is generated from the C++ or Zig side.
 """
 
 import os

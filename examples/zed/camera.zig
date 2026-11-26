@@ -33,7 +33,7 @@
 const std = @import("std");
 const qnnt_mod = @import("qnnt");
 const qnnt = qnnt_mod.Qnnt;
-const tld = qnnt_mod.Tld;
+const told = qnnt_mod.Told;
 const frame = @import("frame");
 const zed = @import("zed");
 const shm = @import("shm");
@@ -59,9 +59,9 @@ const DepthFrame = struct {
     /// frames rather than receiving damaged ones -- this is that count.
     missed: u64,
     /// width*height little-endian u16 millimetres.
-    depth: tld.Bytes,
+    depth: told.Bytes,
     /// width*height luminance bytes.
-    mono: tld.Bytes,
+    mono: told.Bytes,
 };
 
 const CloudFrame = struct {
@@ -74,7 +74,7 @@ const CloudFrame = struct {
     step: u16,
     scale: u16,
     /// `points` x (f32 x, f32 y, f32 z little-endian, u8 intensity) = 13 bytes each.
-    xyzi: tld.Bytes,
+    xyzi: told.Bytes,
 };
 
 const CalibrationFrame = struct {
@@ -198,7 +198,7 @@ fn publishDepth(
         .mono = .{ .data = mono_wire[0..n] },
     };
 
-    try tld.packTo(allocator, &depth_buf, out);
+    try told.packTo(allocator, &depth_buf, out);
     try qnnt.publish(topic_depth, depth_buf.items);
 }
 
@@ -244,7 +244,7 @@ fn publishCloud(
         .xyzi = .{ .data = point_wire[0..at] },
     };
 
-    try tld.packTo(allocator, &cloud_buf, out);
+    try told.packTo(allocator, &cloud_buf, out);
     try qnnt.publish(topic_cloud, cloud_buf.items);
     return count;
 }
@@ -265,7 +265,7 @@ fn publishCalibration(intr: frame.Intrinsics, scale: u16, has_sensors: bool) !vo
         .from_device = intr.from_device,
         .has_sensors = has_sensors,
     };
-    try tld.packTo(allocator, &calib_buf, out);
+    try told.packTo(allocator, &calib_buf, out);
     try qnnt.publish(topic_calib, calib_buf.items);
 }
 
@@ -279,7 +279,7 @@ fn publishSensors(s: zed.Sensors, model: []const u8) !void {
         .pressure_hpa = s.pressure_hpa,
         .temperature_c = s.temperature_c,
     };
-    try tld.packTo(allocator, &sensors_buf, out);
+    try told.packTo(allocator, &sensors_buf, out);
     try qnnt.publish(topic_sensors, sensors_buf.items);
 }
 
@@ -404,7 +404,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // 6.2 MB. Checked before a single frame is published, because discovering it per frame
     // means one refusal per frame with nothing getting through in between.
     const published_pixels = @as(usize, cam_w / scale) * (cam_h / scale);
-    const est_frame = published_pixels * 3 + 256; // planes plus TLD keys and headers
+    const est_frame = published_pixels * 3 + 256; // planes plus TOLD keys and headers
     if (est_frame > qnnt.maxFrameBytes()) {
         std.debug.print(
             "camera-sensor: at scale {d} a published frame is about {d} bytes, past this " ++

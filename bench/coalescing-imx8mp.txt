@@ -1,0 +1,13 @@
+# shmbench flat out, publisher-side coalescing (SHMB_BATCH=32) -- Engicam SmarCore i.MX8M Plus, 4x Cortex-A53 up to 1.6 GHz (ondemand), 1.9 GB, kernel 6.1.36, 2026-11-26
+flat out, msgs/s per subscriber (2 s each)
+size   subs       unix        tcp   unix batch32    tcp batch32
+64     1    285751.2/s 470325.9/s    2528890.5/s    2662842.5/s
+64     4     44244.9/s  18086.1/s     770749.7/s    1198577.8/s
+1024   1    180699.7/s 232665.3/s     488694.9/s     443341.2/s
+1024   4     39229.8/s  59929.1/s     287735.2/s     201849.0/s
+4096   1     86852.4/s  96699.8/s     128937.8/s     119972.9/s
+4096   4     24506.2/s  32313.4/s      65506.6/s      51669.1/s
+
+# qnnt node-3 -> node-4 at 64 B, publisher profile (perf record, 2 s):
+#   Unix: buffer alloc/free 13.8%, wake-up path 7.5%; subscriber 90% CPU, 12,500 context switches/s, 3.2 KB per read
+#   TCP:  buffer alloc/free 1.0%,  wake-up path 0.3%; subscriber 38% CPU, 730 context switches/s, 7.5 KB per read

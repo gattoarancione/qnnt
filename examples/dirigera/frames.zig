@@ -2,8 +2,8 @@
 //!
 //! Its own module for one reason: these definitions have a counterpart in C++
 //! (examples/dirigera/frames.hpp) and the two must agree FIELD BY FIELD. A mismatched name
-//! is not a compile error on either side and not an error at runtime either -- TLD ignores
-//! a key the receiving struct does not declare, and `qnnt_tld.hpp` leaves a member the
+//! is not a compile error on either side and not an error at runtime either -- TOLD ignores
+//! a key the receiving struct does not declare, and `told.hpp` leaves a member the
 //! frame did not carry exactly as its constructor left it. The result is plausible data:
 //! a light that reports itself uncontrollable, a sensor with no room.
 //!
@@ -17,10 +17,10 @@
 
 const std = @import("std");
 const qnnt_mod = @import("qnnt");
-const tld = qnnt_mod.Tld;
+const told = qnnt_mod.Told;
 
 /// One device's state. Optionals are genuinely optional: a motion sensor has no
-/// `light_level`, and TLD carries the absence rather than a zero that a consumer would have
+/// `light_level`, and TOLD carries the absence rather than a zero that a consumer would have
 /// to know to disbelieve.
 pub const DeviceFrame = struct {
     id: []const u8,
@@ -196,7 +196,7 @@ test "the canonical device still packs to the golden bytes" {
     // point, so nothing overwrites the file on its own.
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
-    try tld.packTo(testing.allocator, &buf, canonical_device);
+    try told.packTo(testing.allocator, &buf, canonical_device);
 
     if (std.c.getenv("QNNT_WRITE_GOLDEN") != null) {
         std.debug.print("device_frame.tld = {x}\n", .{buf.items});
@@ -207,7 +207,7 @@ test "the canonical device still packs to the golden bytes" {
 test "the canonical light command still packs to the golden bytes" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
-    try tld.packTo(testing.allocator, &buf, canonical_command);
+    try told.packTo(testing.allocator, &buf, canonical_command);
 
     if (std.c.getenv("QNNT_WRITE_GOLDEN") != null) {
         std.debug.print("light_command.tld = {x}\n", .{buf.items});
@@ -219,7 +219,7 @@ test "a golden frame unpacks back to the canonical values" {
     // The other direction, so the goldens are known to be readable and not merely stable.
     // No allocator: every field here is a scalar or a string, so the strings can point
     // straight into the embedded bytes instead of being copied and then leaked.
-    const back = try tld.unpackFrom(DeviceFrame, golden_device, null);
+    const back = try told.unpackFrom(DeviceFrame, golden_device, null);
     try testing.expectEqualStrings(canonical_device.id, back.id);
     try testing.expectEqualStrings(canonical_device.name, back.name);
     try testing.expectEqual(canonical_device.light_level, back.light_level);

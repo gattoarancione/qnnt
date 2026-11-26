@@ -22,7 +22,7 @@
 //!
 //! This is the whole point of the split. The MSOP format lives in rs16.zig and helios32.zig, the
 //! transmission lives in fake_rs16.zig or in hardware, and this file does one job: receive
-//! scans from the driver, pack them as TLD, publish them. It contains no knowledge of
+//! scans from the driver, pack them as TOLD, publish them. It contains no knowledge of
 //! RoboSense's wire format and no scene generation -- both moved out.
 //!
 //! To use real hardware instead of the fake, change nothing here. Point the sensor at this
@@ -31,7 +31,7 @@
 const std = @import("std");
 const qnnt_mod = @import("qnnt");
 const qnnt = qnnt_mod.Qnnt;
-const tld = @import("qnnt").Tld;
+const told = @import("qnnt").Told;
 const scan = @import("scan");
 const rs16 = @import("rs16");
 const helios32 = @import("helios32");
@@ -123,7 +123,7 @@ const Block = struct {
     /// bytes. The distance was a u16 until millimetres past 65.535 m had to survive the
     /// trip, which is 2 bytes per sample -- 768 per frame -- for range this example could
     /// not previously carry outdoors.
-    samples: tld.Bytes,
+    samples: told.Bytes,
 };
 
 const Packet = struct {
@@ -183,11 +183,11 @@ fn publishCalibration(cal: scan.Calibration, cal_topic: []const u8) !void {
         .lens_offset_m = cal.lens_offset_m,
         .from_device = cal.from_device,
     };
-    try tld.packTo(allocator, &cal_buf, frame);
+    try told.packTo(allocator, &cal_buf, frame);
     try qnnt.publish(cal_topic, cal_buf.items);
 }
 
-/// Driver output to TLD. The only transformation is endianness -- the driver hands over
+/// Driver output to TOLD. The only transformation is endianness -- the driver hands over
 /// host-order millimetres, and the frame carries little-endian, which is what every
 /// consumer of this topic already expects.
 fn pack(s: scan.Scan, cal: scan.Calibration) ![]const u8 {
@@ -214,7 +214,7 @@ fn pack(s: scan.Scan, cal: scan.Calibration) ![]const u8 {
         .azimuth_step_cdeg = cal.azimuth_step_cdeg,
         .blocks = &block_storage,
     };
-    try tld.packTo(allocator, &frame_buf, packet);
+    try told.packTo(allocator, &frame_buf, packet);
     return frame_buf.items;
 }
 

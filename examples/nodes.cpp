@@ -3,15 +3,15 @@
 //   ./node-cpp 0                    publish test/topic-a @100Hz and test/topic-b @20Hz
 //   ./node-cpp 1                    publish test/topic-c @1kHz, subscribe test/topic-a
 //   ./node-cpp 2                    subscribe test/topic-b and test/topic-c
-//   ./node-cpp 3 [period_us] [size] TLD load generator on test/bench
-//   ./node-cpp 4 [report_ms]        TLD benchmark subscriber on test/bench
+//   ./node-cpp 3 [period_us] [size] TOLD load generator on test/bench
+//   ./node-cpp 4 [report_ms]        TOLD benchmark subscriber on test/bench
 //
-// The node API is used through its C interface -- the C++ wrapper covers the TLD codec,
+// The node API is used through its C interface -- the C++ wrapper covers the TOLD codec,
 // which is where the RAII and range-based iteration earn their keep, and that is what
 // roles 3 and 4 use. Topics and rates match the Zig nodes, so any mix interoperates.
 
 #include <qnnt.h>
-#include <qnnt_tld.hpp>
+#include <told.hpp>
 
 #include <array>
 #include <atomic>
@@ -25,7 +25,6 @@
 #include <string_view>
 #include <vector>
 
-namespace tld = qnnt::tld;
 
 namespace {
 
@@ -132,7 +131,7 @@ int role2() {
 // --- role 3 -------------------------------------------------------------------
 
 struct Generator {
-    tld::Encoder encoder;
+    told::Encoder encoder;
     std::vector<std::uint8_t> payload;
     std::uint64_t seq = 0;
     std::atomic<std::uint64_t> sent{0};
@@ -153,7 +152,7 @@ const std::uint8_t* benchSource(const char*, std::size_t, std::size_t* len, void
         gen.encoder.key("data");
         gen.encoder.writeBuffer(gen.payload);
         obj.close();
-    } catch (const tld::Error&) {
+    } catch (const told::Error&) {
         return nullptr;
     }
 
@@ -255,9 +254,9 @@ struct Stats {
 
 Stats g_stats;
 
-void onBenchFrame(const char*, std::size_t, const qnnt_tld_frame* raw, void*) {
+void onBenchFrame(const char*, std::size_t, const told_frame* raw, void*) {
     auto& st = g_stats;
-    const tld::Frame frame{*raw};
+    const told::Frame frame{*raw};
 
     std::uint64_t sent_us = 0, seq = 0;
     try {
@@ -276,7 +275,7 @@ void onBenchFrame(const char*, std::size_t, const qnnt_tld_frame* raw, void*) {
                 }
             }
         }
-    } catch (const tld::Error&) {
+    } catch (const told::Error&) {
         st.errors++;
         return;
     }

@@ -176,7 +176,7 @@ What a tunnel does not fix, and no tunnel can:
 Not everything is deferred. The parts that process untrusted bytes are written as though
 they are untrusted:
 
-  * TLD decoding is bounded. A frame's declared length is 8 attacker-controlled bytes, so
+  * TOLD decoding is bounded. A frame's declared length is 8 attacker-controlled bytes, so
     readFrame caps what one frame may ask the process to buffer (FrameTooLarge) rather than
     trusting the number. Container nesting is depth-limited in `validate`. A child frame
     overrunning its parent is an error, not a read past the end.

@@ -19,7 +19,7 @@ field of view and which extra sensors exist -- parameters, so they live in a tab
     frame.zig       the model-independent vocabulary and the deprojection
         |
         v
-    camera.zig      the qnnt node: DECIMATES, packs TLD and publishes
+    camera.zig      the qnnt node: DECIMATES, packs TOLD and publishes
         |           "camera/<model>/depth", "/cloud", "/calibration", "/sensors"
         v
     viewer.cpp      Qt/QML: the mono image and depth, colourised
@@ -48,7 +48,7 @@ protocol -- and no amount of it passing tests makes it one.
 What that means in practice:
 
   * everything from the driver's OUTPUT onwards -- frame.zig's vocabulary, the deprojection,
-    the TLD schema, the node, the viewer -- is a faithful analogue of the LiDAR chain and
+    the TOLD schema, the node, the viewer -- is a faithful analogue of the LiDAR chain and
     would be unchanged against a real camera.
   * the fake and the driver's parser are two halves of one invention. A round trip between
     them proves they agree with each other, which is worth having (it catches offsets that
@@ -104,7 +104,7 @@ The published intrinsics are for the PUBLISHED geometry, never the native one. Q
 the frame size cap, which had to be raised and fixed
 ----------------------------------------------------
 
-A 1080p depth-plus-mono frame is 6,220,800 bytes. The library's TLD subscriber capped a
+A 1080p depth-plus-mono frame is 6,220,800 bytes. The library's TOLD subscriber capped a
 frame at 1 MiB, so every native resolution above about 786x444 was refused outright --
 regardless of frame rate, since the cap is per frame.
 

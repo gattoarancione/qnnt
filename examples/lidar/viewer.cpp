@@ -7,7 +7,7 @@
 //   ./zig-out/bin/lidar-viewer '' lidar/helios32 first-person   # open in perspective
 //
 // The split this demonstrates: the sensor is a Zig node, the display is QML, and neither
-// knows the other's language -- only the topic and the TLD schema.
+// knows the other's language -- only the topic and the TOLD schema.
 //
 // Two projections of the same revolution, swapped with V: a top-down orthographic view that
 // drops z, and a pinhole first-person view from a camera beside the sensor. The first is the
@@ -491,14 +491,14 @@ private Q_SLOTS:
         if (m_view == nullptr || !m_have_calibration) return;
 
         try {
-            const qnnt::tld::Frame packet = qnnt::tld::decode(qnnt::tld::Bytes{
+            const told::Frame packet = told::decode(told::Bytes{
                 reinterpret_cast<const std::uint8_t*>(frame.constData()),
                 static_cast<std::size_t>(frame.size())});
 
             // Walked field by field rather than unpacked into a struct: the samples are a
             // buffer this reads in place, so there is nothing to copy and no allocation
             // per frame at 750 frames a second.
-            for (const qnnt::tld::Field& field : packet.object()) {
+            for (const told::Field& field : packet.object()) {
                 if (field.key == "model") {
                     if (m_model.isEmpty()) {
                         m_model = QString::fromUtf8(field.value.asString().data(),
@@ -514,12 +514,12 @@ private Q_SLOTS:
                 } else if (field.key == "azimuth_step_cdeg") {
                     m_azimuth_step_cdeg = static_cast<int>(field.value.asUint());
                 } else if (field.key == "blocks") {
-                    for (const qnnt::tld::Frame& block : field.value.array()) {
+                    for (const told::Frame& block : field.value.array()) {
                         decodeBlock(block);
                     }
                 }
             }
-        } catch (const qnnt::tld::Error& err) {
+        } catch (const told::Error& err) {
             ++m_malformed;
             if (m_malformed == 1) {
                 std::printf("lidar-viewer: malformed frame: %s\n", err.what());
@@ -549,11 +549,11 @@ private Q_SLOTS:
 private:
     void onCalibration(const QByteArray& frame) {
         try {
-            const qnnt::tld::Frame packet = qnnt::tld::decode(qnnt::tld::Bytes{
+            const told::Frame packet = told::decode(told::Bytes{
                 reinterpret_cast<const std::uint8_t*>(frame.constData()),
                 static_cast<std::size_t>(frame.size())});
 
-            for (const qnnt::tld::Field& field : packet.object()) {
+            for (const told::Field& field : packet.object()) {
                 if (field.key == "model") {
                     const std::string_view text = field.value.asString();
                     m_model = QString::fromUtf8(text.data(),
@@ -570,7 +570,7 @@ private:
                     m_angles_from_device = field.value.asBool();
                 } else if (field.key == "elevations_deg") {
                     int i = 0;
-                    for (const qnnt::tld::Frame& angle : field.value.array()) {
+                    for (const told::Frame& angle : field.value.array()) {
                         if (i >= kMaxChannels) break;
                         m_elevations[static_cast<std::size_t>(i++)] =
                             static_cast<float>(angle.asFloat());
@@ -579,7 +579,7 @@ private:
                     m_lens_offset_m = static_cast<double>(field.value.asFloat());
                 } else if (field.key == "azimuth_offsets_deg") {
                     int i = 0;
-                    for (const qnnt::tld::Frame& angle : field.value.array()) {
+                    for (const told::Frame& angle : field.value.array()) {
                         if (i >= kMaxChannels) break;
                         m_azimuth_offsets[static_cast<std::size_t>(i++)] =
                             static_cast<float>(angle.asFloat());
@@ -602,21 +602,21 @@ private:
                 }
                 Q_EMIT statsChanged();
             }
-        } catch (const qnnt::tld::Error&) {
+        } catch (const told::Error&) {
             ++m_malformed;
         }
     }
 
-    void decodeBlock(const qnnt::tld::Frame& block) {
+    void decodeBlock(const told::Frame& block) {
         int azimuth_cdeg = -1;
         // 4 bytes of little-endian millimetres plus 1 of intensity. Named because the
         // length guard below and the reader further down must never disagree: a buffer at
         // the wrong stride still passes a too-small check and renders a plausible, wrong
         // cloud rather than failing.
         constexpr std::size_t kSampleStride = 5;
-        qnnt::tld::Bytes samples{};
+        told::Bytes samples{};
 
-        for (const qnnt::tld::Field& field : block.object()) {
+        for (const told::Field& field : block.object()) {
             if (field.key == "azimuth_cdeg") {
                 azimuth_cdeg = static_cast<int>(field.value.asUint());
             } else if (field.key == "samples") {

@@ -4,8 +4,8 @@
     python3 python/nodes.py 0                    publish test/topic-a @100Hz, test/topic-b @20Hz
     python3 python/nodes.py 1                    publish test/topic-c @1kHz, consume test/topic-a
     python3 python/nodes.py 2                    consume test/topic-b and test/topic-c
-    python3 python/nodes.py 3 [period_us] [size] TLD load generator on test/bench
-    python3 python/nodes.py 4 [report_ms]        TLD benchmark subscriber on test/bench
+    python3 python/nodes.py 3 [period_us] [size] TOLD load generator on test/bench
+    python3 python/nodes.py 4 [report_ms]        TOLD benchmark subscriber on test/bench
 
 Topics and rates match the Zig nodes, so any mix interoperates: a Python role 0 feeding a
 C role 2 is the same system as five Zig nodes.
@@ -30,7 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import qnnt
-from qnnt import tld
+from qnnt import told
 
 TOPIC_A, TOPIC_B, TOPIC_C = "test/topic-a", "test/topic-b", "test/topic-c"
 TOPIC_BENCH = "test/bench"
@@ -122,11 +122,11 @@ def role3(node, args):
     payload_bytes = int(args[1]) if len(args) > 1 else 64
 
     # Cycles every byte value, so 0x0A and 0xFF are present on purpose: a benchmark that
-    # only moved text would not be exercising what TLD framing is for.
+    # only moved text would not be exercising what TOLD framing is for.
     payload = bytes(i & 0xFF for i in range(payload_bytes))
 
     node.publisher(TOPIC_BENCH)
-    frame_len = len(tld.dumps({"seq": 1, "t": node.now_micros(), "data": payload}))
+    frame_len = len(told.dumps({"seq": 1, "t": node.now_micros(), "data": payload}))
     target = "unpaced" if period_us == 0 else f"{period_us}us period ({1e6/period_us:.1f} Hz)"
     print(f"node-py 3: {payload_bytes}B payload, ~{frame_len}B frames, {target}")
 
@@ -143,7 +143,7 @@ def role3(node, args):
         if ticker is not None:
             next(ticker)
         seq += 1
-        frame = tld.dumps({"seq": seq, "t": node.now_micros(), "data": payload})
+        frame = told.dumps({"seq": seq, "t": node.now_micros(), "data": payload})
         node.publish(TOPIC_BENCH, frame)
         sent += 1
         sent_bytes += len(frame)
@@ -174,7 +174,7 @@ def role4(node, args):
         for msg in node.poll(timeout=0.1):
             try:
                 value = msg.value()
-            except tld.TldError:
+            except told.ToldError:
                 errors += 1
                 continue
 

@@ -24,7 +24,7 @@
 //!   QNNT_PEERS             host[:port],... to dial; host may be an address or a name
 //!   QNNT_RT_PRIORITY       SCHED_FIFO priority for worker threads (Linux only)
 //!   QNNT_LOCK_MEMORY       1 to pin pages with mlockall (Linux only)
-//!   QNNT_MAX_FRAME_BYTES   largest TLD frame published or accepted (default 16 MiB)
+//!   QNNT_MAX_FRAME_BYTES   largest TOLD frame published or accepted (default 16 MiB)
 //!   QNNT_HANDLER_STACK_BYTES  stack for per-connection/per-request threads (default:
 //!                          std.Thread's 16 MiB; at least 128 KiB, rounded up to a page)
 //!   QNNT_LOCAL_SOCKETS     1 (default) or 0: same-host traffic over Unix sockets

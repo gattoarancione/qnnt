@@ -6,7 +6,7 @@ it read. Only the first needs a kernel with CAN support -- and on a machine that
 where the design lives: the topic layout, the glob subscription, the federated directory
 that lets a gateway find peers it was never told about, and the frame format itself.
 
-So this speaks exactly the topics examples/can/gateway.zig speaks, publishing the same TLD
+So this speaks exactly the topics examples/can/gateway.zig speaks, publishing the same TOLD
 frames on `can/<bus>/<name>` and joining `can/<bus>/*`, and reports who it heard from. Run
 it in place of the gateways (docker/can.sh wire) and the answer is the same shape: which
 hosts reached which bus.
@@ -82,7 +82,7 @@ def main() -> int:
         seq, end = 0, time.time() + seconds
         while time.time() < end:
             for bus, topic in mine.items():
-                node.publish(topic, qnnt.tld.dumps(
+                node.publish(topic, qnnt.told.dumps(
                     can_frame(tag, seq, int(time.time() * 1e6), fd=bool(seq % 2))))
             seq += 1
             time.sleep(0.02)  # 50 Hz per bus

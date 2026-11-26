@@ -24,7 +24,7 @@
 const std = @import("std");
 const root = @import("qnnt");
 const qnnt = root.Qnnt;
-const tld = root.Tld;
+const told = root.Told;
 const frame = @import("frame");
 const socketcan = @import("socketcan");
 
@@ -99,7 +99,7 @@ fn readerLoop(bus: *Bus) void {
         var stamped = f;
         stamped.us = qnnt.nowMicros();
 
-        tld.packTo(allocator, &buf, stamped) catch continue;
+        told.packTo(allocator, &buf, stamped) catch continue;
         qnnt.publish(bus.topic, buf.items) catch continue;
         _ = bus.published.fetchAdd(1, .monotonic);
     }
@@ -116,7 +116,7 @@ fn readerLoop(bus: *Bus) void {
 /// back to the bus it came from, duplicating every local message; without the socket
 /// behaviour a frame from alpha would be injected at bravo, read back by bravo, republished
 /// as bravo's, injected at alpha, and the mesh would saturate in under a second.
-fn onFrame(topic: []const u8, f: tld.Frame, context: ?*anyopaque) void {
+fn onFrame(topic: []const u8, f: told.Frame, context: ?*anyopaque) void {
     const bus: *Bus = @ptrCast(@alignCast(context orelse return));
 
     const from = frame.nodeOf(topic) orelse return;
@@ -127,7 +127,7 @@ fn onFrame(topic: []const u8, f: tld.Frame, context: ?*anyopaque) void {
 
     // No allocator: the payload borrows the subscriber's buffer, which is valid for exactly
     // this call -- and this call writes it to the socket and returns.
-    const decoded = tld.unpack(frame.Frame, f, null) catch {
+    const decoded = told.unpack(frame.Frame, f, null) catch {
         _ = bus.refused.fetchAdd(1, .monotonic);
         return;
     };
