@@ -196,6 +196,13 @@ Notes that matter:
 - **Glob subscription is a separate call**, never `subscribe` noticing a `*`. It costs a
   registry poll and one connection per match, and nobody who does not ask for it pays.
 - `*` **crosses `/`** here, unlike a shell glob: `lidar/*` matches `lidar/helios32/scan`.
+- **From another Zig package**, add qnnt to `build.zig.zon` (`.qnnt = .{ .path = "../qnnt" }`)
+  and import its module. It arrives with TOLD and qnnt's version already wired, so the
+  package needs neither as a dependency of its own:
+  ```zig
+  const qnnt = b.dependency("qnnt", .{ .target = target, .optimize = optimize }).module("qnnt");
+  exe.root_module.addImport("qnnt", qnnt); // @import("qnnt").Qnnt, @import("qnnt").Told
+  ```
 
 ## Tools
 

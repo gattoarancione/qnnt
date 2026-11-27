@@ -20,7 +20,9 @@ pub fn build(b: *Build) void {
     else
         &.{ "-std=c++20", "-Wall", "-Wextra", "-Werror", "-Wno-atomic-alignment" };
 
-    const qnnt_lib_mod = b.createModule(.{
+    // Public, so a package depending on qnnt gets the library with its TOLD import and
+    // version already wired: b.dependency("qnnt", .{ ... }).module("qnnt").
+    const qnnt_lib_mod = b.addModule("qnnt", .{
         .root_source_file = b.path("lib/qnnt.zig"),
         .target = target,
         .optimize = optimize,
