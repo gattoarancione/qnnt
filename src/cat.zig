@@ -120,7 +120,7 @@ fn writeEnvelope(topic: []const u8, bytes: []const u8) void {
     const stamp = base + scaleInterval(now -| base, opt_throttle);
 
     var enc = told.Encoder.init(allocator, &frame);
-    const obj = enc.beginObject();
+    const obj = enc.beginObject() catch return;
     enc.writeKey("t") catch return;
     enc.writeUint(stamp) catch return;
     enc.writeKey("topic") catch return;
@@ -813,7 +813,7 @@ test "a frame stream splits on its own lengths, with no separators" {
         var one: std.ArrayList(u8) = .empty;
         defer one.deinit(testing.allocator);
         var enc = told.Encoder.init(testing.allocator, &one);
-        const obj = enc.beginObject();
+        const obj = try enc.beginObject();
         try enc.writeKey("seq");
         try enc.writeUint(i);
         try enc.end(obj);
@@ -847,7 +847,7 @@ test "an envelope carries the time and topic back out again" {
     defer frame.deinit(testing.allocator);
 
     var enc = told.Encoder.init(testing.allocator, &frame);
-    const obj = enc.beginObject();
+    const obj = try enc.beginObject();
     try enc.writeKey("t");
     try enc.writeUint(1788463155061346);
     try enc.writeKey("topic");
@@ -871,7 +871,7 @@ test "a plain frame is not mistaken for an envelope" {
     defer frame.deinit(testing.allocator);
 
     var enc = told.Encoder.init(testing.allocator, &frame);
-    const obj = enc.beginObject();
+    const obj = try enc.beginObject();
     try enc.writeKey("seq");
     try enc.writeUint(7);
     try enc.writeKey("t"); // a payload may well have its own "t"
@@ -897,7 +897,7 @@ test "envelopes concatenate into a stream that splits on its own lengths" {
         var one: std.ArrayList(u8) = .empty;
         defer one.deinit(testing.allocator);
         var enc = told.Encoder.init(testing.allocator, &one);
-        const obj = enc.beginObject();
+        const obj = try enc.beginObject();
         try enc.writeKey("t");
         try enc.writeUint(1000 + i * 500);
         try enc.writeKey("topic");

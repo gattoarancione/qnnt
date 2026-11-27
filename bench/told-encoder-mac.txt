@@ -1,0 +1,30 @@
+TOLD encoder: a8a3d81 (1.1) vs 46f80b7 (headers reserved, roadmap #8)
+Apple M4 Pro, macOS, Zig 0.16, ReleaseFast, 27 Nov 2026. Byte output identical in every shape.
+
+TOLD's zig build bench (bench/encode.zig, backported unchanged to a8a3d81), ns per frame, best of 5:
+
+shape                        bytes   old fresh  old reused   new fresh  new reused   reused gain
+small object, 4 fields          34          62          62          60          59         1.0x
+1000 structs in an array     31944       42588       42443       38045       38154         1.1x
+10000 tiny arrays            30003       61244       60813       53915       53747         1.1x
+1 MiB buffer, 3 deep       1048598       58344       58492       58393       12211         4.8x
+4 KiB string, 64 deep         4291        2948        2946        3098         508         5.8x
+
+End to end, qnnt-node-3 (unpaced) -> qnnt-node-4, one host, Unix socket, mean of the last 3 reports.
+base = HEAD with TOLD a8a3d81 and a fresh encoder per frame; cur = TOLD 46f80b7 with one encoder per stream.
+
+64       base  rep1  8042726 frames/s  p50    629 us 
+64       cur   rep1  7945293 frames/s  p50    640 us 
+64       base  rep2  8102402 frames/s  p50    620 us 
+64       cur   rep2  7996903 frames/s  p50    631 us 
+65536    base  rep1    29349 frames/s  p50    267 us 
+65536    cur   rep1    29124 frames/s  p50    267 us 
+65536    base  rep2    29651 frames/s  p50    261 us 
+65536    cur   rep2    29238 frames/s  p50    265 us 
+1048576  base  rep1     3547 frames/s  p50    716 us 
+1048576  cur   rep1     3541 frames/s  p50    805 us 
+1048576  base  rep2     3535 frames/s  p50    787 us 
+1048576  cur   rep2     3571 frames/s  p50    804 us 
+
+No end-to-end change beyond noise: at 1 MiB the saved copy (~45 us) is hidden behind the
+socket and node-4's byte-for-byte check. i.MX8M Plus run pending: board unreachable on 27 Nov.

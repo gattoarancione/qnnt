@@ -867,7 +867,7 @@ test "the seq field is read from a TOLD object, and only from one" {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(testing.allocator);
     var enc = told.Encoder.init(testing.allocator, &buf);
-    const obj = enc.beginObject();
+    const obj = try enc.beginObject();
     try enc.writeKey("t");
     try enc.writeUint(99);
     try enc.writeKey("seq");

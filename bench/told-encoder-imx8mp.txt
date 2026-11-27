@@ -1,0 +1,66 @@
+TOLD encoder: a8a3d81 (1.1) vs 46f80b7 (headers reserved, roadmap #8)
+Engicam SmarCore i.MX8M Plus (4x Cortex-A53), kernel 6.1.36, ondemand governor,
+static aarch64-linux-musl ReleaseFast builds, 27 Nov 2026.
+
+TOLD's bench/encode.zig (backported unchanged to a8a3d81), ns per frame, best of 5, two runs each:
+
+== old run 1
+small object, 4 fields            34            862            859        40
+1000 structs in an array       31944         576301         576152        55
+10000 tiny arrays              30003        1045338        1045786        29
+1 MiB buffer, 3 deep         1048598        3326519        3339501       314
+4 KiB string, 64 deep           4291          61187          61183        70
+== new run 1
+small object, 4 fields            34            837            831        41
+1000 structs in an array       31944         575498         562202        57
+10000 tiny arrays              30003         789716         783427        38
+1 MiB buffer, 3 deep         1048598        3350507         399958      2622
+4 KiB string, 64 deep           4291          63886           8712       493
+== old run 2
+small object, 4 fields            34            862            859        40
+1000 structs in an array       31944         576302         576212        55
+10000 tiny arrays              30003        1045964        1046064        29
+1 MiB buffer, 3 deep         1048598        3323093        3315019       316
+4 KiB string, 64 deep           4291          61188          61187        70
+== new run 2
+small object, 4 fields            34            837            830        41
+1000 structs in an array       31944         575130         561903        57
+10000 tiny arrays              30003         789690         783437        38
+1 MiB buffer, 3 deep         1048598        3314853         407448      2574
+4 KiB string, 64 deep           4291          63883           8712       493
+
+Summary, reused encoder: 1 MiB buffer 3 deep 3.33 ms -> 0.40 ms (8.3x); 4 KiB string 64 deep
+61.2 us -> 8.7 us (7.0x); 10000 tiny arrays 1.33x; 1000 structs 1.02x; small object 1.03x.
+A fresh encoder per frame gains only on the tiny arrays.
+
+End to end, qnnt-node-3 (unpaced) -> qnnt-node-4 on the board, Unix socket, mean of the last 3 reports.
+base = qnnt HEAD 1d3ca7d with TOLD a8a3d81 and a fresh encoder per frame;
+cur = TOLD 46f80b7 with one encoder per stream.
+
+64       base  rep1   563288 frames/s  p50   7533 us 
+64       cur   rep1   562080 frames/s  p50   7529 us 
+64       base  rep2   563862 frames/s  p50   7461 us 
+64       cur   rep2   563369 frames/s  p50   7533 us 
+16384    base  rep1     8941 frames/s  p50   3821 us 
+16384    cur   rep1     8929 frames/s  p50   3845 us 
+16384    base  rep2     8931 frames/s  p50   3843 us 
+16384    cur   rep2     8921 frames/s  p50   3848 us 
+65536    base  rep1     2321 frames/s  p50   4075 us 
+65536    cur   rep1     2327 frames/s  p50   4043 us 
+65536    base  rep2     2320 frames/s  p50   4077 us 
+65536    cur   rep2     2321 frames/s  p50   4056 us 
+1048576  base  rep1      233 frames/s  p50  13459 us 
+1048576  cur   rep1      245 frames/s  p50  11264 us 
+1048576  base  rep2      234 frames/s  p50  13405 us 
+1048576  cur   rep2      246 frames/s  p50  11385 us 
+
+Paced, node-3 at 100 Hz with 1 MiB frames; node-3 CPU over 10 s, from /proc/<pid>/stat:
+
+base rep1 node-3 cpu 21.7%  node-4 100 frames/s p50 6552 gaps 0 
+cur rep1 node-3 cpu 13.5%  node-4 100 frames/s p50 5588 gaps 0 
+base rep2 node-3 cpu 21.7%  node-4 100 frames/s p50 6744 gaps 0 
+cur rep2 node-3 cpu 13.2%  node-4 100 frames/s p50 5568 gaps 0 
+
+1 MiB: publisher CPU -38% (21.7% -> 13.4%), median latency -16%, unpaced rate +5%.
+Up to 64 KiB, no change: the unpaced runs are bound by node-4 and the socket, and a one-level
+object around a small payload cost little to move before.

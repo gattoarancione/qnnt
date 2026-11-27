@@ -188,12 +188,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Publish from here rather than through the scheduler, so the timestamp is written as
     // late as possible before the frame goes out.
+    // One encoder for the whole stream: it reserves each container header at the size the
+    // previous frame needed, so the payload is never moved to make room for it.
+    var enc = told.Encoder.init(allocator, &frame);
     while (!qnnt.stopRequested()) {
         frame.clearRetainingCapacity();
-        var enc = told.Encoder.init(allocator, &frame);
 
         seq += 1;
-        const obj = enc.beginObject();
+        const obj = try enc.beginObject();
         try enc.writeKey("id");
         try enc.writeUint(seq);
         try enc.writeKey("t");

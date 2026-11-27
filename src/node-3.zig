@@ -30,14 +30,16 @@ var sent_bytes = @import("qnnt").Atomic64.Value.init(0);
 var frame: std.ArrayList(u8) = .empty;
 var payload: []u8 = &.{};
 var seq: u64 = 0;
+// Kept across frames so each container header is reserved at the size the previous frame
+// needed, and the payload is never moved to make room for it.
+var enc: told.Encoder = .init(allocator, &frame);
 
 fn benchSource(_: []const u8, _: ?*anyopaque) ?[]const u8 {
     frame.clearRetainingCapacity();
-    var enc = told.Encoder.init(allocator, &frame);
 
     seq += 1;
 
-    const obj = enc.beginObject();
+    const obj = enc.beginObject() catch return null;
     enc.writeKey("seq") catch return null;
     enc.writeUint(seq) catch return null;
     enc.writeKey("t") catch return null;
