@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "qnnt"
-version = "0.2.0"
+version = "0.3.0"
 description = "Python interface to the qnnt pub/sub node and its TOLD wire format"
 requires-python = ">=3.10"
 

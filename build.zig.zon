@@ -3,7 +3,7 @@
     // qnnt's own release version: the one number build.zig hands to the library, and
     // through it to the C ABI and Python. python/pyproject.toml repeats it, as packaging
     // requires a literal; the wheel check confirms the two agree.
-    .version = "0.2.0",
+    .version = "0.3.0",
     .fingerprint = 0x1c980dc35fd520b6,
     // 0.16, not 0.15: the library is written against the `std.Io` rework -- Io.Threaded,
     // Io.Mutex, the Writer/Reader vtables -- and `main` takes std.process.Init.Minimal.
